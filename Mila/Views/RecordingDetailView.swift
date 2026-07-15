@@ -335,6 +335,7 @@ struct RecordingDetailView: View {
                         let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
+                                       recording: recording,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
                                        showSpeaker: hasSpeakers,
                                        useSpeakerColor: hasMultipleSpeakers,
@@ -411,7 +412,8 @@ struct RecordingDetailView: View {
 
     private func copyTranscript() {
         let text = TranscriptFormatter.plainText(segments: recording.segments,
-                                                 fallback: recording.fullText)
+                                                 fallback: recording.fullText,
+                                                 speakerNames: recording.speakerNames)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -558,30 +560,56 @@ private struct AIOverviewBanner: View {
 
 private struct SegmentRow: View {
     let segment: TranscriptSegment
+    let recording: Recording
     let isActive: Bool
     let showSpeaker: Bool
-    /// Whether to color the speaker label per-speaker rather than the
-    /// default tint — set by the caller once it's seen more than one
-    /// distinct speaker across the recording.
     let useSpeakerColor: Bool
-    /// Recording's language so we can render the raw `SPEAKER_00`
-    /// label from pyannote as `Speaker A` / `דובר א׳` in the user's
-    /// language — matching the labels the live view + post-recording
-    /// action items already show.
     let language: String
     let onTap: () -> Void
 
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
+    @EnvironmentObject private var liveDiarizer: LiveSpeakerDiarizer
+    @State private var isEditingSpeaker = false
+    @State private var speakerDraft = ""
+    @State private var showMergeAlert = false
+    @State private var mergeRawID = ""
+    @State private var mergeName = ""
+    @FocusState private var speakerFieldFocused: Bool
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            // Speaker prefix sits TIGHT against the text — fixed-width
-            // columns introduced a gap (~30 pt) between the friendly
-            // label "Speaker A" / "דובר א׳" and the actual content.
-            // `fixedSize` keeps the label at its natural width.
             if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
-                Text(raw.friendlySpeakerLabel(language: language) + ":")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(useSpeakerColor ? raw.speakerColor : Color.accentColor)
-                    .fixedSize(horizontal: true, vertical: false)
+                if isEditingSpeaker {
+                    TextField("Speaker name", text: $speakerDraft)
+                        .font(.body.weight(.semibold))
+                        .textFieldStyle(.roundedBorder)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: 80)
+                        .focused($speakerFieldFocused)
+                        .onSubmit { commitSpeakerName(raw: raw) }
+                        .onExitCommand { cancelSpeakerEdit() }
+                        .onChange(of: speakerFieldFocused) { _, focused in
+                            if !focused { commitSpeakerName(raw: raw) }
+                        }
+                        .popover(isPresented: showSuggestionsBinding) {
+                            SpeakerSuggestionsView(
+                                draft: $speakerDraft,
+                                recording: recording,
+                                onSelect: { name in
+                                    speakerDraft = name
+                                    commitSpeakerName(raw: raw)
+                                }
+                            )
+                        }
+                } else {
+                    Text(recording.displayName(for: raw, language: language) + ":")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(useSpeakerColor ? raw.speakerColor : Color.accentColor)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .onTapGesture { beginSpeakerEdit(raw: raw) }
+                        .help("Click to rename speaker")
+                }
             }
             Text(segment.text)
                 .font(.body)
@@ -597,5 +625,112 @@ private struct SegmentRow: View {
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+        .alert("Merge speakers?", isPresented: $showMergeAlert) {
+            Button("Merge") {
+                let oldName = recording.speakerNames[mergeRawID] ?? ""
+                if !oldName.isEmpty {
+                    profileStore.mergeProfiles(keep: mergeName, absorb: oldName)
+                    store.renameSpeakerGlobally(from: oldName, to: mergeName)
+                }
+                store.renameSpeaker(in: recording, rawID: mergeRawID, to: mergeName)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A speaker named \"\(mergeName)\" already has a voice profile. Merge these speakers? This will combine their voice data for better recognition.")
+        }
+    }
+
+    private var showSuggestionsBinding: Binding<Bool> {
+        Binding(
+            get: { isEditingSpeaker && hasSuggestions },
+            set: { _ in }
+        )
+    }
+
+    private var hasSuggestions: Bool {
+        let usedNames = Set(recording.speakerNames.values)
+        return store.allSpeakerNames.contains { name in
+            !speakerDraft.isEmpty
+            && name.localizedCaseInsensitiveContains(speakerDraft)
+            && name.caseInsensitiveCompare(speakerDraft) != .orderedSame
+            && !usedNames.contains(name)
+        }
+    }
+
+    private func beginSpeakerEdit(raw: String) {
+        speakerDraft = recording.displayName(for: raw, language: language)
+        isEditingSpeaker = true
+        DispatchQueue.main.async { speakerFieldFocused = true }
+    }
+
+    private func commitSpeakerName(raw: String) {
+        guard isEditingSpeaker else { return }
+        let trimmed = speakerDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != recording.displayName(for: raw, language: language) else {
+            isEditingSpeaker = false
+            return
+        }
+
+        // Check if the target name already has a stored voice profile
+        // from a different speaker — if so, prompt to merge.
+        let oldName = recording.speakerNames[raw]
+        if profileStore.profileExists(name: trimmed), oldName != trimmed {
+            // Is there also a profile for the current speaker?
+            if let old = oldName, profileStore.profileExists(name: old) {
+                mergeRawID = raw
+                mergeName = trimmed
+                isEditingSpeaker = false
+                showMergeAlert = true
+                return
+            }
+        }
+
+        applySpeakerRename(raw: raw, name: trimmed)
+        isEditingSpeaker = false
+    }
+
+    private func applySpeakerRename(raw: String, name: String) {
+        store.renameSpeaker(in: recording, rawID: raw, to: name)
+        // Save voice profile if the live diarizer has a centroid for this speaker.
+        if let entry = liveDiarizer.currentProfiles().first(where: { $0.id == raw }) {
+            profileStore.updateProfile(name: name, embedding: entry.centroid, sampleCount: entry.sampleCount)
+        }
+    }
+
+    private func cancelSpeakerEdit() {
+        isEditingSpeaker = false
+    }
+}
+
+private struct SpeakerSuggestionsView: View {
+    @Binding var draft: String
+    let recording: Recording
+    let onSelect: (String) -> Void
+
+    @EnvironmentObject private var store: RecordingStore
+
+    var body: some View {
+        let usedNames = Set(recording.speakerNames.values)
+        let suggestions = store.allSpeakerNames.filter { name in
+            !draft.isEmpty
+            && name.localizedCaseInsensitiveContains(draft)
+            && name.caseInsensitiveCompare(draft) != .orderedSame
+            && !usedNames.contains(name)
+        }
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(suggestions.prefix(5), id: \.self) { name in
+                Button { onSelect(name) } label: {
+                    Text(name)
+                        .font(.callout)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(minWidth: 140)
     }
 }

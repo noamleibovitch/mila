@@ -12,7 +12,7 @@ enum TranscriptFormatter {
     ///
     /// Matches the SRT exporter's prefix format so the clipboard text and
     /// the on-disk `.srt` use the same speaker labels.
-    static func plainText(segments: [TranscriptSegment], fallback: String) -> String {
+    static func plainText(segments: [TranscriptSegment], fallback: String, speakerNames: [String: String] = [:]) -> String {
         guard segments.contains(where: { $0.speaker != nil }) else { return fallback }
 
         var lines: [String] = []
@@ -33,21 +33,22 @@ enum TranscriptFormatter {
             if currentSpeaker == .some(speaker) {
                 buffer += " " + text
             } else {
-                lines.append(format(speaker: currentSpeaker.flatMap { $0 }, text: buffer))
+                lines.append(format(speaker: currentSpeaker.flatMap { $0 }, text: buffer, speakerNames: speakerNames))
                 currentSpeaker = .some(speaker)
                 buffer = text
             }
         }
 
         if !buffer.isEmpty {
-            lines.append(format(speaker: currentSpeaker.flatMap { $0 }, text: buffer))
+            lines.append(format(speaker: currentSpeaker.flatMap { $0 }, text: buffer, speakerNames: speakerNames))
         }
 
         return lines.joined(separator: "\n")
     }
 
-    private static func format(speaker: String?, text: String) -> String {
+    private static func format(speaker: String?, text: String, speakerNames: [String: String] = [:]) -> String {
         guard let speaker else { return text }
-        return "\(speaker): \(text)"
+        let displayName = speakerNames[speaker] ?? speaker
+        return "\(displayName): \(text)"
     }
 }

@@ -1,21 +1,62 @@
-# Mila
+# CLAUDE.md
 
-A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optional speaker diarization via pyannote.audio.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+Mila is a native macOS app (Swift/SwiftUI, macOS 14+) that records, transcribes, and dictates audio locally using whisper.cpp with Metal GPU acceleration. Supports Hebrew (ivrit.ai large-v3) and English (OpenAI large-v3-turbo), optional speaker diarization via pyannote.audio, and Live AI mode via Claude API.
+
+## Build & Development Commands
+
+```bash
+make bootstrap          # One-time: install xcodegen via Homebrew
+make project            # Generate Mila.xcodeproj from project.yml
+make build              # Debug build
+make run                # Build + launch app
+make test               # Run all unit tests (MilaTests + TranscriptionCoreTests)
+make package-test       # Run TranscriptionCore package tests only
+make e2e                # E2E transcription tests (requires ggml-tiny.bin)
+make models             # Download both Whisper models (~4.6 GB)
+make bundle-diarization # Build bundled Python runtime for diarization
+make dmg                # Build release DMG
+make clean              # Remove generated project + build artifacts
+```
+
+**Run a single test class or method** (xcodebuild):
+```bash
+xcodebuild test -project Mila.xcodeproj -scheme Mila -only-testing:MilaTests/SomeTestClass -derivedDataPath build -destination 'platform=macOS'
+xcodebuild test -project Mila.xcodeproj -scheme Mila -only-testing:MilaTests/SomeTestClass/testMethodName -derivedDataPath build -destination 'platform=macOS'
+```
+
+**Requirements:** macOS 14+, Xcode 15.3+ (not just Command Line Tools), Homebrew. Apple Silicon strongly recommended.
 
 ## Architecture
 
-- **Build system:** XcodeGen (`project.yml` is the source of truth, not the .xcodeproj)
+- **Build system:** XcodeGen (`project.yml` is the source of truth, not the .xcodeproj). Never edit `.xcodeproj` directly.
 - **Minimum deployment target:** macOS 14.0, Swift 5.10
-- **Key dependencies:** TranscriptionCore (local Swift package wrapping whisper.cpp), Sparkle (auto-updates)
+- **Key dependencies:** TranscriptionCore (local Swift package wrapping whisper.cpp), Sparkle (auto-updates), Anthropic SDK (LLM features)
+- **Swift concurrency:** `@MainActor` on UI-bound services (`TranscriptionService`, `RecordingStore`, `UpdaterViewModel`). Strict concurrency set to `minimal` in project.yml.
 - **Project layout:**
-  - `Mila/Models/` — data models and settings (`Recording`, `DiarizationSettings`, etc.)
-  - `Mila/Transcription/` — transcription engine, speaker diarizer, exporter
-  - `Mila/Views/` — SwiftUI views (ContentView, SettingsView, SidebarView, etc.)
-  - `Mila/Resources/` — Info.plist, entitlements, bundled diarization models
-  - `Mila/Resources/DiarizationModels/` — bundled pyannote speaker diarization model weights (~31 MB)
-  - `MilaTests/` — unit tests
-  - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
-  - `scripts/` — release/build scripts (make-dmg.sh, etc.)
+  - `Mila/App/` — entry point (`MilaApp.swift`), `AppDelegate`, `UpdaterViewModel`
+  - `Mila/Audio/` — mic recording (`MicrophoneRecorder`), system audio capture (`SystemAudioRecorder` via ScreenCaptureKit), `RecordingSession` (mixes both → mono 16 kHz WAV), live transcription, VAD
+  - `Mila/Transcription/` — `TranscriptionService` (FIFO job queue), `ModelManager`, `RemoteWhisperEngine`, `SpeakerDiarizer` (Python subprocess), exporters
+  - `Mila/Actions/` — LLM integration: `LLMRunner` (Claude API), `LiveAISession` (per-recording), `RecordingSummarizer`, `PostRecordingCoordinator`
+  - `Mila/Dictation/` — global hotkeys (`HotkeyManager`, Carbon API), `DictationController` (mic → transcribe → paste)
+  - `Mila/Models/` — data models and settings (`Recording`, `RecordingStore`, `DiarizationSettings`, etc.)
+  - `Mila/Views/` — SwiftUI views (ContentView, SettingsView, SidebarView, LiveAIRecordingView, etc.)
+  - `Mila/VoiceMemos/` — iPhone Voice Memos iCloud sync and import
+  - `Mila/Resources/` — Info.plist, entitlements, bundled diarization models (~31 MB)
+  - `MilaTests/` — unit tests (53 files)
+  - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp C bindings), SileroVAD, WAVReader, WER calculator, E2E test fixtures
+  - `Packages/WhisperBinary/` — SPM wrapper for pre-built whisper.cpp xcframework (v1.8.4)
+  - `scripts/` — release/build scripts (make-dmg.sh, build-diarization-bundle.sh, etc.)
+
+### Data Flow
+- **Recording:** `MicrophoneRecorder` + `SystemAudioRecorder` → `RecordingSession` → mono 16 kHz WAV file
+- **Transcription:** WAV → `TranscriptionService` (FIFO queue, one job at a time) → `WhisperEngine` (local Metal GPU) or `RemoteWhisperEngine` (HTTP API) → `TranscriptSegment[]`
+- **Diarization (optional):** WAV → `SpeakerDiarizer` (Python subprocess running pyannote.audio) → speaker labels merged into segments
+- **Persistence:** `Recording` metadata → `recordings.json`; transcript → sidecar `.txt`; summary → sidecar `.summary.txt`
+- **Live AI:** Streaming transcript chunks → `LiveAISession` → Claude API → summary + action items (throttled, min 20s between updates)
 
 ## Conventions
 
@@ -73,3 +114,10 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
   that toolchain is not part of this repository. Forks that want notarized
   builds should sign with their own Apple Developer ID and publish their own
   appcast (see `SUFeedURL` / `SUPublicEDKey` in `project.yml`).
+
+## Contributing (PR Workflow)
+
+- Branch from `main`. Run `make build && make test` before opening a PR.
+- **Every bug-fix PR must link to a GitHub issue** (`Closes #N`). Create the issue first if needed. See `.claude/rules/pull-requests.md`.
+- Upstream repo: `https://github.com/island-io/mila.git` — PRs go there.
+- CI runs on `macos-26` runners; all checks must pass.

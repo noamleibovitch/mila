@@ -23,7 +23,8 @@ struct SendToLLMSheet: View {
 
     private var transcript: String {
         TranscriptFormatter.plainText(segments: liveRecording.segments,
-                                      fallback: liveRecording.fullText)
+                                      fallback: liveRecording.fullText,
+                                      speakerNames: liveRecording.speakerNames)
     }
 
     var body: some View {

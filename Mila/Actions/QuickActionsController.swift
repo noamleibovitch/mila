@@ -704,6 +704,20 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
+        // Auto-populate speakerNames for speakers recognised from stored
+        // voice profiles. The live diarizer pool entries that were seeded
+        // from a profile carry `profileName`; map those back to the
+        // recording's speakerNames so the user sees real names immediately.
+        let recognisedSpeakerNames: [String: String] = {
+            guard let diar = liveDiarizer else { return [:] }
+            var names: [String: String] = [:]
+            for entry in diar.currentProfiles() {
+                if let profileName = entry.profileName {
+                    names[entry.id] = profileName
+                }
+            }
+            return names
+        }()
         let finalLiveSegments = liveTranscriber?.segments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -776,6 +790,10 @@ final class QuickActionsController: ObservableObject {
         updated.fullText = hasLiveSegments ? finalFullText : ""
         updated.summary = finalSummary.isEmpty ? nil : finalSummary
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
+        // Auto-assign names from recognised voice profiles.
+        for (rawID, name) in recognisedSpeakerNames {
+            updated.speakerNames[rawID] = name
+        }
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         store.update(updated)
 

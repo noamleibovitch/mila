@@ -316,7 +316,8 @@ final class PostRecordingCoordinator: ObservableObject {
             }
             if rec.status != .pending && rec.status != .running {
                 let text = TranscriptFormatter.plainText(segments: rec.segments,
-                                                         fallback: rec.fullText)
+                                                         fallback: rec.fullText,
+                                                         speakerNames: rec.speakerNames)
                 return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? nil
                     : text

@@ -47,13 +47,14 @@ enum TranscriptExporter {
     /// Format the SRT content for `recording`. Returns empty string when
     /// there's nothing to write (no segments, or every segment is blank).
     static func srtBody(for recording: Recording) -> String {
-        srtBody(for: recording.segments)
+        srtBody(for: recording.segments, speakerNames: recording.speakerNames)
     }
 
     /// Format SRT content for a raw segment list. Returns empty string
     /// when there's nothing to write (no segments, or every segment is
-    /// blank).
-    static func srtBody(for segments: [TranscriptSegment]) -> String {
+    /// blank). When `speakerNames` is provided, custom names replace
+    /// raw `SPEAKER_XX` IDs in the subtitle text.
+    static func srtBody(for segments: [TranscriptSegment], speakerNames: [String: String] = [:]) -> String {
         guard !segments.isEmpty else { return "" }
 
         var entries: [String] = []
@@ -62,7 +63,7 @@ enum TranscriptExporter {
             guard !text.isEmpty else { continue }
 
             let seqNum = entries.count + 1
-            let prefix = seg.speaker.map { $0 + ": " } ?? ""
+            let prefix = seg.speaker.map { (speakerNames[$0] ?? $0) + ": " } ?? ""
             entries.append("\(seqNum)\n\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n\(prefix)\(text)")
         }
         return entries.isEmpty ? "" : entries.joined(separator: "\n\n") + "\n\n"

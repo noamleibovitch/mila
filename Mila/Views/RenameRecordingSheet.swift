@@ -53,7 +53,8 @@ struct RenameRecordingSheet: View {
     /// join when no segments carry speaker info.
     private var transcript: String {
         TranscriptFormatter.plainText(segments: liveRecording.segments,
-                                      fallback: liveRecording.fullText)
+                                      fallback: liveRecording.fullText,
+                                      speakerNames: liveRecording.speakerNames)
     }
     private var transcriptReady: Bool {
         !transcript.isEmpty && liveRecording.status != .running && liveRecording.status != .pending

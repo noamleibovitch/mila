@@ -374,6 +374,50 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Rename a diarized speaker within a single recording. `rawID` is
+    /// the diarizer's `SPEAKER_00`-style label; `name` is the user's
+    /// chosen display name. Passing an empty name removes the override
+    /// so the speaker falls back to the default "Speaker A" label.
+    func renameSpeaker(in recording: Recording, rawID: String, to name: String) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            recordings[idx].speakerNames.removeValue(forKey: rawID)
+        } else {
+            recordings[idx].speakerNames[rawID] = trimmed
+        }
+        persist()
+    }
+
+    /// All custom speaker names the user has assigned across every
+    /// recording, sorted alphabetically. Powers the autocomplete when
+    /// renaming a speaker and the Speakers directory view.
+    var allSpeakerNames: [String] {
+        let names = Set(recordings.flatMap(\.speakerNames.values))
+        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// Rename a speaker globally across all recordings. Every recording
+    /// that has `oldName` in its `speakerNames` values gets updated to
+    /// `newName`. A single `persist()` call flushes all changes at once.
+    func renameSpeakerGlobally(from oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != oldName else { return }
+        var changed = false
+        for idx in recordings.indices {
+            for (rawID, name) in recordings[idx].speakerNames where name == oldName {
+                recordings[idx].speakerNames[rawID] = trimmed
+                changed = true
+            }
+        }
+        if changed { persist() }
+    }
+
+    /// Recordings that contain a specific named speaker.
+    func recordings(forSpeaker name: String) -> [Recording] {
+        recordings.filter { $0.speakerNames.values.contains(name) }
+    }
+
     /// Move a recording into a folder (or unfile it with nil). Auto-creates
     /// the folder so callers can drag into a brand-new name without a
     /// separate `createFolder` round-trip. Dedup is case-insensitive — if
