@@ -281,6 +281,22 @@ struct RecordingDetailView: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if transcription.pendingIDs.contains(recording.id) {
+            ContentUnavailableView {
+                Label("Waiting in queue", systemImage: "clock")
+            } description: {
+                Text("Transcription will start when the recording ahead of it finishes.")
+            }
+        } else if recording.status == .pending || recording.status == .running {
+            VStack(spacing: 12) {
+                Spacer()
+                ProgressView()
+                    .controlSize(.large)
+                Text("Preparing to transcribe…")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
             let placeholder = Self.emptyTranscriptPlaceholder(
                 isActive: transcription.activeRecordingID == recording.id,
@@ -301,6 +317,15 @@ struct RecordingDetailView: View {
             }
         } else {
             VStack(spacing: 0) {
+                if transcription.diarizingRecordingID == recording.id {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Identifying speakers…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                }
                 // Transcript-area copy button, on the right just below the
                 // AI-overview banner's divider. Mirrors the consolidated
                 // copy model: this grabs the transcript; the header button

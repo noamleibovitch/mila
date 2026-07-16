@@ -26,6 +26,18 @@ struct SpeakerProfile: Codable, Identifiable, Hashable {
 final class SpeakerProfileStore: ObservableObject {
     @Published private(set) var profiles: [SpeakerProfile] = []
 
+    /// Tracks which speakers are currently having their voice profiles
+    /// updated (re-diarizing recordings to extract embeddings). Keyed
+    /// by speaker name so the UI can show progress per-speaker and
+    /// survive navigation away and back.
+    @Published var updatingProfiles: [String: ProfileUpdateState] = [:]
+
+    struct ProfileUpdateState {
+        var progress: Double = 0
+        var status: String?
+        var isRunning: Bool = true
+    }
+
     private let fileManager = FileManager.default
     private var storeURL: URL {
         let appSupport = try! fileManager.url(
@@ -154,6 +166,101 @@ final class SpeakerProfileStore: ObservableObject {
     func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int)] {
         profiles.map { p in
             (id: p.name, name: p.name, centroid: p.embedding, sampleCount: p.sampleCount)
+        }
+    }
+
+    // MARK: - Voice Profile Update (with re-diarization)
+
+    /// Re-extract embeddings from all recordings for a speaker, then
+    /// build/update the voice profile. Runs diarization on recordings
+    /// that lack embeddings. Progress is tracked in `updatingProfiles`
+    /// so the UI survives navigation.
+    func updateVoiceProfile(
+        speakerName: String,
+        store: RecordingStore,
+        pythonPath: String
+    ) {
+        guard updatingProfiles[speakerName]?.isRunning != true else { return }
+        updatingProfiles[speakerName] = ProfileUpdateState()
+
+        Task { @MainActor in
+            let recs = store.recordings(forSpeaker: speakerName)
+            var collectedEmbeddings: [([Float], Int)] = []
+            var recsNeedingExtraction: [Recording] = []
+
+            for rec in recs {
+                var hasEmbedding = false
+                for (rawID, name) in rec.speakerNames where name == speakerName {
+                    if let emb = rec.speakerEmbeddings[rawID], !emb.isEmpty {
+                        collectedEmbeddings.append((emb, 1))
+                        hasEmbedding = true
+                    }
+                }
+                if !hasEmbedding {
+                    recsNeedingExtraction.append(rec)
+                }
+            }
+
+            print("updateVoiceProfile(\(speakerName)): \(recs.count) recordings, \(collectedEmbeddings.count) with embeddings, \(recsNeedingExtraction.count) need extraction")
+
+            let total = recsNeedingExtraction.count
+            if total == 0, collectedEmbeddings.isEmpty {
+                updatingProfiles[speakerName] = ProfileUpdateState(
+                    progress: 1, status: "No voice data could be extracted.", isRunning: false)
+                return
+            }
+
+            for (i, rec) in recsNeedingExtraction.enumerated() {
+                updatingProfiles[speakerName]?.progress = Double(i) / Double(max(total, 1))
+                print("updateVoiceProfile(\(speakerName)): processing \(i+1)/\(total) — \(rec.title)")
+                let wavURL = store.audioURL(for: rec)
+                guard FileManager.default.fileExists(atPath: wavURL.path) else {
+                    print("updateVoiceProfile(\(speakerName)): audio file missing: \(wavURL.lastPathComponent)")
+                    continue
+                }
+                do {
+                    let embeddings = try await SpeakerDiarizer.extractEmbeddings(
+                        wavURL: wavURL, pythonPath: pythonPath)
+                    print("updateVoiceProfile(\(speakerName)): got \(embeddings.count) embeddings from \(rec.title)")
+                    if var current = store.recordings.first(where: { $0.id == rec.id }) {
+                        current.speakerEmbeddings.merge(embeddings) { _, new in new }
+                        store.update(current)
+                        for (rawID, name) in current.speakerNames where name == speakerName {
+                            if let emb = current.speakerEmbeddings[rawID], !emb.isEmpty {
+                                collectedEmbeddings.append((emb, 1))
+                            }
+                        }
+                    }
+                } catch {
+                    print("updateVoiceProfile(\(speakerName)): extract failed for \(rec.title): \(error)")
+                }
+            }
+            updatingProfiles[speakerName]?.progress = 1.0
+
+            if collectedEmbeddings.isEmpty {
+                updatingProfiles[speakerName] = ProfileUpdateState(
+                    progress: 1, status: "No voice data could be extracted.", isRunning: false)
+                return
+            }
+
+            let dim = collectedEmbeddings[0].0.count
+            var centroid = [Float](repeating: 0, count: dim)
+            var totalCount = 0
+            for (emb, count) in collectedEmbeddings {
+                guard emb.count == dim else { continue }
+                for i in 0..<dim { centroid[i] += emb[i] * Float(count) }
+                totalCount += count
+            }
+            if totalCount > 0 {
+                for i in 0..<dim { centroid[i] /= Float(totalCount) }
+            }
+
+            deleteProfile(name: speakerName)
+            updateProfile(name: speakerName, embedding: centroid, sampleCount: totalCount)
+            let msg = "Updated from \(collectedEmbeddings.count) recording\(collectedEmbeddings.count == 1 ? "" : "s")"
+            print("updateVoiceProfile(\(speakerName)): done — \(msg)")
+            updatingProfiles[speakerName] = ProfileUpdateState(
+                progress: 1, status: msg, isRunning: false)
         }
     }
 

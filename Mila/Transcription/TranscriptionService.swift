@@ -400,33 +400,25 @@ final class TranscriptionService: ObservableObject {
     /// speakers…" status (via `diarizingRecordingID`) for exactly the
     /// recording being re-diarized — the transcript text is already final
     /// here, so calling this "Transcribing" would mislead.
-    func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> (segments: [TranscriptSegment], embeddings: [String: [Float]])? {
+    func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> [TranscriptSegment]? {
         guard diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
         diarizingRecordingID = recordingID
         defer { diarizingRecordingID = nil }
         do {
-            let result = try await SpeakerDiarizer.diarize(wavURL: wavURL,
-                                                           pythonPath: diarizationSettings.pythonPath)
-            guard !result.turns.isEmpty else { return nil }
+            let turns = try await SpeakerDiarizer.diarize(wavURL: wavURL,
+                                                          pythonPath: diarizationSettings.pythonPath)
+            guard !turns.isEmpty else { return nil }
             var enriched = segments
             for i in enriched.indices {
                 enriched[i].speaker = SpeakerDiarizer.assignSpeaker(
                     segmentStart: enriched[i].start,
                     segmentEnd: enriched[i].end,
-                    turns: result.turns)
+                    turns: turns)
             }
             let normalized = Self.normalizeSpeakerLabels(in: enriched)
-            // Remap embeddings to match normalized speaker IDs.
-            var normalizedEmbeddings: [String: [Float]] = [:]
-            let mapping = Self.speakerLabelMapping(in: enriched)
-            for (original, remapped) in mapping {
-                if let emb = result.embeddings[original] {
-                    normalizedEmbeddings[remapped] = emb
-                }
-            }
             let distinct = Set(normalized.compactMap(\.speaker)).count
-            serviceLog.log("rediarizeSegments: offline pass labeled \(normalized.count, privacy: .public) segments with \(distinct, privacy: .public) speakers (was \(Set(segments.compactMap(\.speaker)).count, privacy: .public) live), \(normalizedEmbeddings.count, privacy: .public) embeddings")
-            return (normalized, normalizedEmbeddings)
+            serviceLog.log("rediarizeSegments: offline pass labeled \(normalized.count, privacy: .public) segments with \(distinct, privacy: .public) speakers (was \(Set(segments.compactMap(\.speaker)).count, privacy: .public) live)")
+            return normalized
         } catch {
             serviceLog.log("rediarizeSegments: failed (keeping live speakers): \(error.localizedDescription, privacy: .public)")
             return nil
@@ -647,20 +639,20 @@ final class TranscriptionService: ObservableObject {
             let shouldDiarize = diarizationSettings.isConfigured
             let diarPythonPath = diarizationSettings.pythonPath
 
-            async let diarizeTask: SpeakerDiarizer.DiarizeResult = {
-                guard shouldDiarize else { return SpeakerDiarizer.DiarizeResult(turns: [], embeddings: [:]) }
+            async let diarizeTask: [SpeakerTurn] = {
+                guard shouldDiarize else { return [] }
                 print("Transcribe: running speaker diarization...")
                 do {
-                    let result = try await SpeakerDiarizer.diarize(
+                    let turns = try await SpeakerDiarizer.diarize(
                         wavURL: audioURL,
                         pythonPath: diarPythonPath
                     )
-                    let speakerCount = Set(result.turns.map(\.speaker)).count
-                    print("Transcribe: diarization found \(speakerCount) speakers across \(result.turns.count) turns, \(result.embeddings.count) embeddings")
-                    return result
+                    let speakerCount = Set(turns.map(\.speaker)).count
+                    print("Transcribe: diarization found \(speakerCount) speakers across \(turns.count) turns")
+                    return turns
                 } catch {
                     print("Transcribe: diarization failed (continuing without speakers): \(error)")
-                    return SpeakerDiarizer.DiarizeResult(turns: [], embeddings: [:])
+                    return []
                 }
             }()
 
@@ -692,8 +684,7 @@ final class TranscriptionService: ObservableObject {
                 }
             )
 
-            let (diarizeResult, segments) = try await (diarizeTask, transcribeTask)
-            let speakerTurns = diarizeResult.turns
+            let (speakerTurns, segments) = try await (diarizeTask, transcribeTask)
 
             // Cover the narrow window where transcription completed BEFORE the
             // user hit Cancel (so the abort_callback never tripped) but the
@@ -720,17 +711,10 @@ final class TranscriptionService: ObservableObject {
                 // clusters are merged away — which then shows up as
                 // "Speaker A" + "Speaker C" with no B. Friendlier to
                 // re-key everything as 00, 01, 02… in transcript order.
-                let mapping = Self.speakerLabelMapping(in: enrichedSegments)
                 enrichedSegments = Self.normalizeSpeakerLabels(in: enrichedSegments)
-                // Remap batch embeddings to match normalized speaker IDs.
-                for (original, remapped) in mapping {
-                    if let emb = diarizeResult.embeddings[original] {
-                        working.speakerEmbeddings[remapped] = emb
-                    }
-                }
                 let labeled = enrichedSegments.compactMap(\.speaker).count
                 let distinct = Set(enrichedSegments.compactMap(\.speaker)).count
-                print("Transcribe: applied speaker labels — \(labeled)/\(enrichedSegments.count) segments labeled, \(distinct) distinct speakers, \(working.speakerEmbeddings.count) embeddings")
+                print("Transcribe: applied speaker labels — \(labeled)/\(enrichedSegments.count) segments labeled, \(distinct) distinct speakers")
             } else {
                 print("Transcribe: NO speaker labels — shouldDiarize=\(shouldDiarize), speakerTurns.count=0. Either diarization is not configured, returned no turns, or the pyannote subprocess failed (check stderr above).")
             }
@@ -741,35 +725,6 @@ final class TranscriptionService: ObservableObject {
             print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
             working.segments = enrichedSegments
-
-            // Carry forward speaker names from the previous transcription by
-            // matching old embeddings to new embeddings via cosine similarity.
-            // This preserves the user's speaker labels across re-transcriptions.
-            let oldSpeakerNames = working.speakerNames
-            let oldEmbeddings = working.speakerEmbeddings
-            if !oldSpeakerNames.isEmpty, !oldEmbeddings.isEmpty, !working.speakerEmbeddings.isEmpty {
-                var newNames: [String: String] = [:]
-                for (newRawID, newEmb) in working.speakerEmbeddings {
-                    var bestMatch: (oldRawID: String, sim: Double)?
-                    for (oldRawID, oldEmb) in oldEmbeddings {
-                        let sim = cosineSimilarity(newEmb, oldEmb)
-                        if bestMatch == nil || sim > bestMatch!.sim {
-                            bestMatch = (oldRawID, sim)
-                        }
-                    }
-                    if let match = bestMatch, match.sim >= 0.50,
-                       let name = oldSpeakerNames[match.oldRawID] {
-                        newNames[newRawID] = name
-                    }
-                }
-                if !newNames.isEmpty {
-                    working.speakerNames = newNames
-                    print("Transcribe: carried forward \(newNames.count) speaker name(s) from previous transcription")
-                } else {
-                    working.speakerNames = [:]
-                }
-            }
-
             working.fullText = text
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd
@@ -819,20 +774,6 @@ final class TranscriptionService: ObservableObject {
     ///
     /// First-appearance order is preferred over alphabetical so the
     /// person who spoke first is always `SPEAKER_00`.
-    /// Build the old→new speaker label mapping without modifying segments.
-    static func speakerLabelMapping(in segments: [TranscriptSegment]) -> [String: String] {
-        var mapping: [String: String] = [:]
-        var nextIndex = 0
-        for seg in segments {
-            guard let original = seg.speaker, !original.isEmpty else { continue }
-            if mapping[original] == nil {
-                mapping[original] = String(format: "SPEAKER_%02d", nextIndex)
-                nextIndex += 1
-            }
-        }
-        return mapping
-    }
-
     static func normalizeSpeakerLabels(in segments: [TranscriptSegment]) -> [TranscriptSegment] {
         var mapping: [String: String] = [:]
         var nextIndex = 0
