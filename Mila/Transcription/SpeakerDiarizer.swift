@@ -212,7 +212,7 @@ enum SpeakerDiarizer {
         return output
     }
 
-    static func diarize(wavURL: URL, pythonPath: String) async throws -> [SpeakerTurn] {
+    static func diarize(wavURL: URL, pythonPath: String) async throws -> DiarizeResult {
         guard let modelsPath = bundledModelsPath else {
             throw Error.diarizationFailed("Bundled diarization models not found in app")
         }
@@ -286,8 +286,38 @@ enum SpeakerDiarizer {
                     "speaker": speaker,
                 })
 
+            # Extract per-speaker embeddings from the longest turn per speaker.
+            embeddings = {}
+            try:
+                import soundfile as sf
+                embedder = getattr(pipeline, "_embedding", None)
+                if embedder is not None:
+                    # Find the longest turn for each speaker.
+                    longest = {}
+                    for t in turns:
+                        sp = t["speaker"]
+                        dur = t["end"] - t["start"]
+                        if sp not in longest or dur > (longest[sp]["end"] - longest[sp]["start"]):
+                            longest[sp] = t
+                    samples, sr = sf.read(wav_path, dtype="float32")
+                    if samples.ndim > 1:
+                        samples = samples.mean(axis=1)
+                    for sp, t in longest.items():
+                        start_sample = int(t["start"] * sr)
+                        end_sample = int(t["end"] * sr)
+                        chunk = samples[start_sample:end_sample]
+                        if len(chunk) < sr * 0.3:
+                            continue
+                        wave = torch.from_numpy(chunk).unsqueeze(0).unsqueeze(0)
+                        emb = embedder(wave)
+                        arr = emb.detach().cpu().numpy().flatten()
+                        embeddings[sp] = arr.tolist()
+                    print(f"diarize: extracted {len(embeddings)} speaker embeddings", file=sys.stderr)
+            except Exception as e:
+                print(f"diarize: embedding extraction failed (non-fatal): {e}", file=sys.stderr)
+
             print(f"diarize: found {len(set(t['speaker'] for t in turns))} speakers, {len(turns)} turns", file=sys.stderr)
-            json.dump(turns, sys.stdout)
+            json.dump({"turns": turns, "embeddings": embeddings}, sys.stdout)
         finally:
             os.unlink(tmp.name)
         """
@@ -301,7 +331,13 @@ enum SpeakerDiarizer {
             let errMsg = String(data: result.stderr, encoding: .utf8) ?? "exit code \(result.exitCode)"
             throw Error.diarizationFailed(errMsg)
         }
-        return try JSONDecoder().decode([SpeakerTurn].self, from: result.stdout)
+        return try JSONDecoder().decode(DiarizeResult.self, from: result.stdout)
+    }
+
+    /// Combined diarization result: speaker turns + per-speaker embeddings.
+    struct DiarizeResult: Codable {
+        let turns: [SpeakerTurn]
+        let embeddings: [String: [Float]]
     }
 
     struct VerifyResult: Codable {

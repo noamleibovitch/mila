@@ -603,9 +603,10 @@ private struct SegmentRow: View {
                             )
                         }
                 } else {
+                    let colorKey = recording.speakerNames[raw] ?? raw
                     Text(recording.displayName(for: raw, language: language) + ":")
                         .font(.body.weight(.semibold))
-                        .foregroundStyle(useSpeakerColor ? raw.speakerColor : Color.accentColor)
+                        .foregroundStyle(useSpeakerColor ? colorKey.speakerColor : Color.accentColor)
                         .fixedSize(horizontal: true, vertical: false)
                         .onTapGesture { beginSpeakerEdit(raw: raw) }
                         .help("Click to rename speaker")
@@ -625,14 +626,39 @@ private struct SegmentRow: View {
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+        .contextMenu {
+            if let raw = segment.speaker, !raw.isEmpty {
+                let otherSpeakers = Array(Set(recording.segments.compactMap(\.speaker)).filter { $0 != raw }).sorted()
+                if !otherSpeakers.isEmpty {
+                    Menu("Reassign to") {
+                        ForEach(otherSpeakers, id: \.self) { other in
+                            Button(recording.displayName(for: other, language: language)) {
+                                store.reassignSegment(in: recording, segmentID: segment.id, to: other)
+                            }
+                        }
+                    }
+                }
+                Button("Split to new speaker") {
+                    let newID = store.nextSpeakerID(in: recording)
+                    store.reassignSegment(in: recording, segmentID: segment.id, to: newID)
+                }
+            }
+        }
         .alert("Merge speakers?", isPresented: $showMergeAlert) {
             Button("Yes, same person") {
                 let oldName = recording.speakerNames[mergeRawID] ?? ""
+                // Find the raw ID that already owns the target name.
+                let targetRawID = recording.speakerNames.first(where: { $0.value == mergeName })?.key
                 if !oldName.isEmpty {
                     profileStore.mergeProfiles(keep: mergeName, absorb: oldName)
                     store.renameSpeakerGlobally(from: oldName, to: mergeName)
                 }
-                store.renameSpeaker(in: recording, rawID: mergeRawID, to: mergeName)
+                // Merge the raw IDs so all segments unify under one ID.
+                if let target = targetRawID, target != mergeRawID {
+                    store.mergeSpeakerIDs(in: recording, from: mergeRawID, to: target)
+                } else {
+                    store.renameSpeaker(in: recording, rawID: mergeRawID, to: mergeName)
+                }
             }
             Button("No, different people", role: .cancel) {}
         } message: {
@@ -689,9 +715,13 @@ private struct SegmentRow: View {
 
     private func applySpeakerRename(raw: String, name: String) {
         store.renameSpeaker(in: recording, rawID: raw, to: name)
-        // Save voice profile if the live diarizer has a centroid for this speaker.
+        // Save voice profile: try live pool first, then fall back to
+        // stored embeddings on the recording (from batch diarization
+        // or a previous live session).
         if let entry = liveDiarizer.currentProfiles().first(where: { $0.id == raw }) {
             profileStore.updateProfile(name: name, embedding: entry.centroid, sampleCount: entry.sampleCount)
+        } else if let embedding = recording.speakerEmbeddings[raw] {
+            profileStore.updateProfile(name: name, embedding: embedding, sampleCount: 1)
         }
     }
 

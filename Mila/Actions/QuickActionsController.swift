@@ -718,6 +718,16 @@ final class QuickActionsController: ObservableObject {
             }
             return names
         }()
+        // Snapshot live pool embeddings for the recording so naming a
+        // speaker later (on an older recording) can still save a voice profile.
+        let liveEmbeddings: [String: [Float]] = {
+            guard let diar = liveDiarizer else { return [:] }
+            var embs: [String: [Float]] = [:]
+            for entry in diar.currentProfiles() {
+                embs[entry.id] = entry.centroid
+            }
+            return embs
+        }()
         let finalLiveSegments = liveTranscriber?.segments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -794,6 +804,8 @@ final class QuickActionsController: ObservableObject {
         for (rawID, name) in recognisedSpeakerNames {
             updated.speakerNames[rawID] = name
         }
+        // Store live pool embeddings on the recording.
+        updated.speakerEmbeddings.merge(liveEmbeddings) { _, new in new }
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         store.update(updated)
 
@@ -883,13 +895,15 @@ final class QuickActionsController: ObservableObject {
                     // Re-fetch before writing: the user may have renamed the
                     // recording (rename sheet) while this tail was running, so
                     // we update only the segments rather than clobbering the row.
-                    if let rediarized = await self.transcription.rediarizeSegments(
+                    if let result = await self.transcription.rediarizeSegments(
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
-                        updated.segments = rediarized
+                        updated.segments = result.segments
+                        updated.speakerEmbeddings.merge(result.embeddings) { _, new in new }
                         if var current = self.store.recordings.first(where: { $0.id == id }) {
-                            current.segments = rediarized
+                            current.segments = result.segments
+                            current.speakerEmbeddings.merge(result.embeddings) { _, new in new }
                             self.store.update(current)
                             updated = current
                         }

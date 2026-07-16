@@ -72,6 +72,12 @@ struct Recording: Identifiable, Codable, Hashable {
     /// and tooling compatibility; this dictionary is the override layer.
     var speakerNames: [String: String] = [:]
 
+    /// Per-speaker voice embeddings (256-dim centroids). Populated from the
+    /// live diarizer pool at end of recording, or extracted after batch
+    /// diarization. Used to create voice profiles when the user names a
+    /// speaker, even on older recordings.
+    var speakerEmbeddings: [String: [Float]] = [:]
+
     /// Rolling Live-AI summary captured at the moment recording stopped.
     /// nil for any recording that ran without Live AI mode active.
     var summary: String?
@@ -122,6 +128,7 @@ struct Recording: Identifiable, Codable, Hashable {
          folder: String? = nil,
          appName: String? = nil,
          speakerNames: [String: String] = [:],
+         speakerEmbeddings: [String: [Float]] = [:],
          summary: String? = nil,
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
@@ -141,6 +148,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.folder = folder
         self.appName = appName
         self.speakerNames = speakerNames
+        self.speakerEmbeddings = speakerEmbeddings
         self.summary = summary
         self.actionItems = actionItems
         self.voiceMemoUniqueID = voiceMemoUniqueID
@@ -186,7 +194,7 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             speakerNames, summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
+             speakerNames, speakerEmbeddings, summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -208,6 +216,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
         self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        self.speakerEmbeddings = try c.decodeIfPresent([String: [Float]].self, forKey: .speakerEmbeddings) ?? [:]
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
@@ -234,6 +243,9 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(appName, forKey: .appName)
         if !speakerNames.isEmpty {
             try c.encode(speakerNames, forKey: .speakerNames)
+        }
+        if !speakerEmbeddings.isEmpty {
+            try c.encode(speakerEmbeddings, forKey: .speakerEmbeddings)
         }
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encodeIfPresent(actionItems, forKey: .actionItems)

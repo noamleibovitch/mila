@@ -389,6 +389,38 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Reassign a single segment to a different speaker. Used when the
+    /// diarizer wrongly grouped two different people under the same ID.
+    /// If `newSpeaker` doesn't exist in the recording yet, it's created
+    /// as the next `SPEAKER_NN` ID.
+    func reassignSegment(in recording: Recording, segmentID: UUID, to newSpeaker: String) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard let segIdx = recordings[idx].segments.firstIndex(where: { $0.id == segmentID }) else { return }
+        recordings[idx].segments[segIdx].speaker = newSpeaker
+        persist()
+    }
+
+    /// Merge two raw speaker IDs within a recording: reassign all segments
+    /// from `fromRawID` to `toRawID`, then clean up the old speakerNames entry.
+    func mergeSpeakerIDs(in recording: Recording, from fromRawID: String, to toRawID: String) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        for segIdx in recordings[idx].segments.indices {
+            if recordings[idx].segments[segIdx].speaker == fromRawID {
+                recordings[idx].segments[segIdx].speaker = toRawID
+            }
+        }
+        recordings[idx].speakerNames.removeValue(forKey: fromRawID)
+        persist()
+    }
+
+    /// Create a new speaker ID for a recording (next available SPEAKER_NN).
+    func nextSpeakerID(in recording: Recording) -> String {
+        let existing = Set(recording.segments.compactMap(\.speaker))
+        var n = 0
+        while existing.contains(String(format: "SPEAKER_%02d", n)) { n += 1 }
+        return String(format: "SPEAKER_%02d", n)
+    }
+
     /// All custom speaker names the user has assigned across every
     /// recording, sorted alphabetically. Powers the autocomplete when
     /// renaming a speaker and the Speakers directory view.
