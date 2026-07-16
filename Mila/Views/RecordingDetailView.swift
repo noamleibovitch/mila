@@ -626,7 +626,7 @@ private struct SegmentRow: View {
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
         .alert("Merge speakers?", isPresented: $showMergeAlert) {
-            Button("Merge") {
+            Button("Yes, same person") {
                 let oldName = recording.speakerNames[mergeRawID] ?? ""
                 if !oldName.isEmpty {
                     profileStore.mergeProfiles(keep: mergeName, absorb: oldName)
@@ -634,9 +634,9 @@ private struct SegmentRow: View {
                 }
                 store.renameSpeaker(in: recording, rawID: mergeRawID, to: mergeName)
             }
-            Button("Cancel", role: .cancel) {}
+            Button("No, different people", role: .cancel) {}
         } message: {
-            Text("A speaker named \"\(mergeName)\" already has a voice profile. Merge these speakers? This will combine their voice data for better recognition.")
+            Text("\"\(mergeName)\" is already assigned to another speaker. Are these the same person? Merging will combine their voice data for better future recognition.")
         }
     }
 
@@ -648,12 +648,10 @@ private struct SegmentRow: View {
     }
 
     private var hasSuggestions: Bool {
-        let usedNames = Set(recording.speakerNames.values)
         return store.allSpeakerNames.contains { name in
             !speakerDraft.isEmpty
             && name.localizedCaseInsensitiveContains(speakerDraft)
             && name.caseInsensitiveCompare(speakerDraft) != .orderedSame
-            && !usedNames.contains(name)
         }
     }
 
@@ -671,18 +669,18 @@ private struct SegmentRow: View {
             return
         }
 
-        // Check if the target name already has a stored voice profile
-        // from a different speaker — if so, prompt to merge.
-        let oldName = recording.speakerNames[raw]
-        if profileStore.profileExists(name: trimmed), oldName != trimmed {
-            // Is there also a profile for the current speaker?
-            if let old = oldName, profileStore.profileExists(name: old) {
-                mergeRawID = raw
-                mergeName = trimmed
-                isEditingSpeaker = false
-                showMergeAlert = true
-                return
-            }
+        // Check if the target name is already assigned to a different
+        // speaker in this recording or has a stored voice profile.
+        // Prompt to merge so the user confirms it's the same person.
+        let nameAlreadyInRecording = recording.speakerNames.contains { $0.key != raw && $0.value == trimmed }
+        let nameHasProfile = profileStore.profileExists(name: trimmed)
+
+        if nameAlreadyInRecording || nameHasProfile {
+            mergeRawID = raw
+            mergeName = trimmed
+            isEditingSpeaker = false
+            showMergeAlert = true
+            return
         }
 
         applySpeakerRename(raw: raw, name: trimmed)
@@ -710,12 +708,10 @@ private struct SpeakerSuggestionsView: View {
     @EnvironmentObject private var store: RecordingStore
 
     var body: some View {
-        let usedNames = Set(recording.speakerNames.values)
         let suggestions = store.allSpeakerNames.filter { name in
             !draft.isEmpty
             && name.localizedCaseInsensitiveContains(draft)
             && name.caseInsensitiveCompare(draft) != .orderedSame
-            && !usedNames.contains(name)
         }
         VStack(alignment: .leading, spacing: 0) {
             ForEach(suggestions.prefix(5), id: \.self) { name in
