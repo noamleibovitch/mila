@@ -47,6 +47,8 @@ private struct SpeakerRow: View {
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var isExpanded = false
     @State private var isEditing = false
+    @State private var isUpdatingProfile = false
+    @State private var profileUpdateStatus: String?
     @State private var nameDraft = ""
     @FocusState private var nameFieldFocused: Bool
 
@@ -99,18 +101,35 @@ private struct SpeakerRow: View {
                             .help("Click to rename speaker")
                     }
                     HStack(spacing: 12) {
-                        if profileStore.profileExists(name: name) {
-                            Label("Voice profile", systemImage: "waveform.badge.person.crop")
-                                .font(.caption)
-                                .foregroundStyle(.teal)
-                        }
-                        Text("\(recordingCount) recording\(recordingCount == 1 ? "" : "s")")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        if let date = lastRecordingDate {
-                            Text("Last: \(date, format: .dateTime.month().day())")
+                        if isUpdatingProfile {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Updating profile…")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                        } else if let status = profileUpdateStatus {
+                            Text(status)
+                                .font(.caption)
+                                .foregroundStyle(status.contains("No") ? .orange : .teal)
+                                .onAppear {
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                                        profileUpdateStatus = nil
+                                    }
+                                }
+                        } else {
+                            if profileStore.profileExists(name: name) {
+                                Label("Voice profile", systemImage: "waveform.badge.person.crop")
+                                    .font(.caption)
+                                    .foregroundStyle(.teal)
+                            }
+                            Text("\(recordingCount) recording\(recordingCount == 1 ? "" : "s")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if let date = lastRecordingDate {
+                                Text("Last: \(date, format: .dateTime.month().day())")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
@@ -118,6 +137,10 @@ private struct SpeakerRow: View {
             }
             .padding(.vertical, 4)
             .contextMenu {
+                Button("Update Voice Profile") {
+                    updateVoiceProfile()
+                }
+                .disabled(isUpdatingProfile)
                 if profileStore.profileExists(name: name) {
                     Button("Delete Voice Profile", role: .destructive) {
                         profileStore.deleteProfile(name: name)
@@ -146,5 +169,51 @@ private struct SpeakerRow: View {
     private func cancelEdit() {
         isEditing = false
         nameDraft = name
+    }
+
+    /// Scan all recordings that have this speaker and collect their
+    /// stored embeddings to build/update the voice profile.
+    private func updateVoiceProfile() {
+        isUpdatingProfile = true
+        profileUpdateStatus = nil
+        let recs = store.recordings(forSpeaker: name)
+        var collectedEmbeddings: [([Float], Int)] = []
+
+        for rec in recs {
+            for (rawID, speakerName) in rec.speakerNames where speakerName == name {
+                if let emb = rec.speakerEmbeddings[rawID], !emb.isEmpty {
+                    collectedEmbeddings.append((emb, 1))
+                }
+            }
+        }
+
+        if collectedEmbeddings.isEmpty {
+            isUpdatingProfile = false
+            profileUpdateStatus = "No voice data found. Re-transcribe recordings to extract embeddings."
+            return
+        }
+
+        // Compute weighted average centroid from all collected embeddings.
+        let dim = collectedEmbeddings[0].0.count
+        var centroid = [Float](repeating: 0, count: dim)
+        var totalCount = 0
+        for (emb, count) in collectedEmbeddings {
+            guard emb.count == dim else { continue }
+            for i in 0..<dim {
+                centroid[i] += emb[i] * Float(count)
+            }
+            totalCount += count
+        }
+        if totalCount > 0 {
+            for i in 0..<dim {
+                centroid[i] /= Float(totalCount)
+            }
+        }
+
+        // Delete existing profile and create fresh from all data.
+        profileStore.deleteProfile(name: name)
+        profileStore.updateProfile(name: name, embedding: centroid, sampleCount: totalCount)
+        isUpdatingProfile = false
+        profileUpdateStatus = "Voice profile updated from \(collectedEmbeddings.count) recording\(collectedEmbeddings.count == 1 ? "" : "s")"
     }
 }

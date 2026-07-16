@@ -741,6 +741,35 @@ final class TranscriptionService: ObservableObject {
             print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
             working.segments = enrichedSegments
+
+            // Carry forward speaker names from the previous transcription by
+            // matching old embeddings to new embeddings via cosine similarity.
+            // This preserves the user's speaker labels across re-transcriptions.
+            let oldSpeakerNames = working.speakerNames
+            let oldEmbeddings = working.speakerEmbeddings
+            if !oldSpeakerNames.isEmpty, !oldEmbeddings.isEmpty, !working.speakerEmbeddings.isEmpty {
+                var newNames: [String: String] = [:]
+                for (newRawID, newEmb) in working.speakerEmbeddings {
+                    var bestMatch: (oldRawID: String, sim: Double)?
+                    for (oldRawID, oldEmb) in oldEmbeddings {
+                        let sim = cosineSimilarity(newEmb, oldEmb)
+                        if bestMatch == nil || sim > bestMatch!.sim {
+                            bestMatch = (oldRawID, sim)
+                        }
+                    }
+                    if let match = bestMatch, match.sim >= 0.50,
+                       let name = oldSpeakerNames[match.oldRawID] {
+                        newNames[newRawID] = name
+                    }
+                }
+                if !newNames.isEmpty {
+                    working.speakerNames = newNames
+                    print("Transcribe: carried forward \(newNames.count) speaker name(s) from previous transcription")
+                } else {
+                    working.speakerNames = [:]
+                }
+            }
+
             working.fullText = text
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd

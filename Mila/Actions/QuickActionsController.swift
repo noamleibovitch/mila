@@ -895,15 +895,36 @@ final class QuickActionsController: ObservableObject {
                     // Re-fetch before writing: the user may have renamed the
                     // recording (rename sheet) while this tail was running, so
                     // we update only the segments rather than clobbering the row.
+                    let oldNames = updated.speakerNames
+                    let oldEmbeddings = updated.speakerEmbeddings
                     if let result = await self.transcription.rediarizeSegments(
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
                         updated.segments = result.segments
                         updated.speakerEmbeddings.merge(result.embeddings) { _, new in new }
+                        // Carry forward speaker names by matching embeddings.
+                        if !oldNames.isEmpty, !oldEmbeddings.isEmpty {
+                            var newNames: [String: String] = [:]
+                            for (newRawID, newEmb) in result.embeddings {
+                                var bestMatch: (oldRawID: String, sim: Double)?
+                                for (oldRawID, oldEmb) in oldEmbeddings {
+                                    let sim = cosineSimilarity(newEmb, oldEmb)
+                                    if bestMatch == nil || sim > bestMatch!.sim {
+                                        bestMatch = (oldRawID, sim)
+                                    }
+                                }
+                                if let match = bestMatch, match.sim >= 0.50,
+                                   let name = oldNames[match.oldRawID] {
+                                    newNames[newRawID] = name
+                                }
+                            }
+                            updated.speakerNames = newNames
+                        }
                         if var current = self.store.recordings.first(where: { $0.id == id }) {
                             current.segments = result.segments
-                            current.speakerEmbeddings.merge(result.embeddings) { _, new in new }
+                            current.speakerEmbeddings = updated.speakerEmbeddings
+                            current.speakerNames = updated.speakerNames
                             self.store.update(current)
                             updated = current
                         }
