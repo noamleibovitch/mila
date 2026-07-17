@@ -47,16 +47,34 @@ final class MeetingDetector: ObservableObject {
         let meetingTitleHints: [String]
     }
 
-    /// Supported meeting apps. Zoom is the only one implemented now;
-    /// adding Google Meet / Teams later is an entry here (they'd use the
-    /// same mic-capture signal, keyed on their own bundle IDs).
+    /// Supported meeting apps. Detection uses mic-capture (Core Audio) —
+    /// any app that grabs the mic while running triggers it. Browser apps
+    /// capture mic during web-based meetings (Google Meet, etc.).
     static let supportedApps: [App] = [
-        App(
-            bundleID: "us.zoom.xos",
+        App(bundleID: "us.zoom.xos",
             displayName: "Zoom",
             captureBundlePrefixes: ["us.zoom"],
-            meetingTitleHints: ["zoom meeting"]
-        )
+            meetingTitleHints: ["zoom meeting"]),
+        App(bundleID: "com.microsoft.teams2",
+            displayName: "Microsoft Teams",
+            captureBundlePrefixes: ["com.microsoft.teams"],
+            meetingTitleHints: ["meeting"]),
+        App(bundleID: "com.tinyspeck.slackmacgap",
+            displayName: "Slack",
+            captureBundlePrefixes: ["com.tinyspeck.slackmacgap"],
+            meetingTitleHints: ["huddle"]),
+        App(bundleID: "com.google.Chrome",
+            displayName: "Google Chrome",
+            captureBundlePrefixes: ["com.google.Chrome"],
+            meetingTitleHints: ["meet.google.com"]),
+        App(bundleID: "com.apple.Safari",
+            displayName: "Safari",
+            captureBundlePrefixes: ["com.apple.Safari", "com.apple.WebKit"],
+            meetingTitleHints: ["meet.google.com"]),
+        App(bundleID: "company.thebrowser.Browser",
+            displayName: "Arc",
+            captureBundlePrefixes: ["company.thebrowser"],
+            meetingTitleHints: ["meet.google.com"]),
     ]
 
     /// Fired exactly once per meeting — the first poll that sees a

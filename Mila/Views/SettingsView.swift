@@ -1308,6 +1308,34 @@ private struct MeetingsSettingsTab: View {
                 .toggleStyle(.switch)
                 .controlSize(.regular)
 
+                Toggle(isOn: $settings.autoStartOnMeetingDetected) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto-start recording when meeting detected")
+                            .font(.body)
+                        Text("Automatically start recording when a supported app begins a call, without showing a confirmation prompt.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.regular)
+                .disabled(!settings.enabled)
+
+                Toggle(isOn: $settings.autoStopOnMeetingEnd) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto-stop recording when meeting ends")
+                            .font(.body)
+                        Text("Automatically stop recording when the meeting app releases the microphone, without showing a confirmation prompt.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.regular)
+                .disabled(!settings.enabled)
+
                 Divider()
 
                 supportedAppsBlock

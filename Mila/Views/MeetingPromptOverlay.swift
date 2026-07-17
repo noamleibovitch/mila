@@ -144,7 +144,13 @@ final class MeetingPromptCoordinator: ObservableObject {
         guard settings.enabled else { return }
         guard !settings.isDisabled(forBundleID: app.bundleID) else { return }
 
-        showStartPanel(for: app)
+        if settings.autoStartOnMeetingDetected {
+            Task { @MainActor in
+                await actions.toggleRecord(withSystemAudio: true)
+            }
+        } else {
+            showStartPanel(for: app)
+        }
     }
 
     /// The inverse of `handleMeetingStart`: a meeting we were tracking went
@@ -158,7 +164,13 @@ final class MeetingPromptCoordinator: ObservableObject {
             promptAlreadyShowing: window != nil
         ) else { return }
 
-        showStopPanel(for: app)
+        if settings.autoStopOnMeetingEnd {
+            Task { @MainActor in
+                await actions.stopRecording()
+            }
+        } else {
+            showStopPanel(for: app)
+        }
     }
 
     /// Fires on every `actions.activeJob` change. If the stop prompt is up
