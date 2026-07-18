@@ -19,12 +19,13 @@ import Combine
 /// positioned top-right of the active screen.
 @MainActor
 final class MeetingPromptCoordinator: ObservableObject {
-    private let detector: MeetingDetector
+    let detector: MeetingDetector
     private let settings: MeetingDetectionSettings
     private let actions: QuickActionsController
     private var startCancellable: AnyCancellable?
     private var endCancellable: AnyCancellable?
     private var recordingStateCancellable: AnyCancellable?
+    private var queuePauseCancellables: Set<AnyCancellable> = []
     private var window: NSPanel?
     /// True only while the currently-presented panel is the *stop* prompt.
     /// Used to auto-dismiss that prompt if recording ends through any other
@@ -120,6 +121,19 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     /// Bind the detector's start/stop to the user's enabled toggle.
+    /// Pause the transcription queue while a meeting is active so
+    /// batch transcription doesn't compete with the call for CPU.
+    func bindQueuePause(transcription: TranscriptionService) {
+        detector.meetingStarted
+            .receive(on: DispatchQueue.main)
+            .sink { _ in transcription.queuePaused = true }
+            .store(in: &queuePauseCancellables)
+        detector.meetingEnded
+            .receive(on: DispatchQueue.main)
+            .sink { _ in transcription.queuePaused = false }
+            .store(in: &queuePauseCancellables)
+    }
+
     func bindEnabledChanges() {
         // Re-observe whenever `enabled` flips: if the user disables
         // detection, stop polling and dismiss any visible prompt;

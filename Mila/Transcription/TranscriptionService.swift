@@ -17,6 +17,12 @@ final class TranscriptionService: ObservableObject {
     @Published private(set) var activeRecordingID: UUID?
     @Published private(set) var pendingIDs: [UUID] = []
 
+    /// When true, the queue pauses between jobs — the current job
+    /// finishes but the next one waits until unpaused. Set by the
+    /// meeting detector so batch transcription doesn't compete with
+    /// an active call.
+    @Published var queuePaused = false
+
     /// Set to a recording's id while the OFFLINE speaker re-diarize pass is
     /// running for it (`rediarizeSegments`). This is NOT transcription —
     /// the transcript text is already final by this point; the pyannote
@@ -459,6 +465,11 @@ final class TranscriptionService: ObservableObject {
 
     private func run() async {
         while let next = popNext() {
+            // Wait while paused (meeting in progress). Check every
+            // second so we resume promptly when the meeting ends.
+            while queuePaused {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
             await process(next)
         }
         worker = nil

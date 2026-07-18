@@ -537,6 +537,7 @@ struct MilaApp: App {
                 .task { maybeRelocateBundle() }
                 .task { enqueueRecoveredRecordings() }
                 .task { startMeetingDetectionIfNeeded() }
+                .task { wireMeetingQueuePause() }
                 .task { await simulateMeetingEndedIfRequested() }
                 .task { await wireLiveAIPipeline() }
                 .task { await injectFixtureWavIfRequested() }
@@ -649,6 +650,13 @@ struct MilaApp: App {
     private func startMeetingDetectionIfNeeded() {
         meetingPrompt.start()
         meetingPrompt.bindEnabledChanges()
+    }
+
+    /// Pause the transcription queue while a meeting is in progress so
+    /// batch transcription doesn't compete with the active call for CPU.
+    /// Resumes automatically when the meeting ends.
+    private func wireMeetingQueuePause() {
+        meetingPrompt.bindQueuePause(transcription: transcription)
     }
 
     /// CI/UI-test seam for the end-of-meeting STOP prompt. With
