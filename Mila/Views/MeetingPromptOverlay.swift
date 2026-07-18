@@ -33,6 +33,11 @@ final class MeetingPromptCoordinator: ObservableObject {
     /// untouched by this.
     private var stopPromptShowing = false
 
+    /// Meeting title captured at the moment a meeting is detected.
+    /// Stored here so it's available when the recording stops, even
+    /// if the meeting window title has changed by then.
+    private(set) var capturedMeetingTitle: String?
+
     init(detector: MeetingDetector,
          settings: MeetingDetectionSettings,
          actions: QuickActionsController) {
@@ -143,6 +148,11 @@ final class MeetingPromptCoordinator: ObservableObject {
         guard !actions.isRecording else { return }
         guard settings.enabled else { return }
         guard !settings.isDisabled(forBundleID: app.bundleID) else { return }
+
+        // Capture the meeting title NOW — by the time recording stops,
+        // the window title may have changed or the meeting may have ended.
+        capturedMeetingTitle = MeetingDetector.meetingTitle(for: app)
+        actions.capturedMeetingTitle = capturedMeetingTitle
 
         if settings.autoStartOnMeetingDetected {
             Task { @MainActor in

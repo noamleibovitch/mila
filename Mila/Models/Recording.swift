@@ -65,6 +65,12 @@ struct Recording: Identifiable, Codable, Hashable {
     /// microphone-only or system-wide system-audio captures.
     var appName: String?
 
+    /// Meeting name extracted from the meeting app's window title at
+    /// recording start (e.g., "Weekly Standup" from Zoom). Preserved
+    /// separately from `title` so the user can rename the recording
+    /// without losing the original meeting context.
+    var meetingTitle: String?
+
     /// User-assigned display names for diarized speakers. Maps raw
     /// diarizer IDs (`SPEAKER_00`, `SPEAKER_01`, …) to custom names
     /// ("John", "Sarah"). Empty when no speakers have been renamed.
@@ -127,6 +133,7 @@ struct Recording: Identifiable, Codable, Hashable {
          deletedAt: Date? = nil,
          folder: String? = nil,
          appName: String? = nil,
+         meetingTitle: String? = nil,
          speakerNames: [String: String] = [:],
          speakerEmbeddings: [String: [Float]] = [:],
          summary: String? = nil,
@@ -147,6 +154,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = deletedAt
         self.folder = folder
         self.appName = appName
+        self.meetingTitle = meetingTitle
         self.speakerNames = speakerNames
         self.speakerEmbeddings = speakerEmbeddings
         self.summary = summary
@@ -194,7 +202,7 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             speakerNames, speakerEmbeddings, summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
+             meetingTitle, speakerNames, speakerEmbeddings, summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -215,6 +223,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
         self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        self.meetingTitle = try c.decodeIfPresent(String.self, forKey: .meetingTitle)
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         self.speakerEmbeddings = try c.decodeIfPresent([String: [Float]].self, forKey: .speakerEmbeddings) ?? [:]
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
@@ -241,6 +250,7 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
         try c.encodeIfPresent(folder, forKey: .folder)
         try c.encodeIfPresent(appName, forKey: .appName)
+        try c.encodeIfPresent(meetingTitle, forKey: .meetingTitle)
         if !speakerNames.isEmpty {
             try c.encode(speakerNames, forKey: .speakerNames)
         }

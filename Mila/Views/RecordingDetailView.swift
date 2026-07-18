@@ -63,6 +63,10 @@ struct RecordingDetailView: View {
                              ? "Zoom"
                              : recording.source.displayName)
                     }
+                    if let meetingName = recording.meetingTitle {
+                        Text("·")
+                        Text(meetingName)
+                    }
                     Text("·")
                     Text(recording.createdAt, format: .dateTime)
                     Text("·")

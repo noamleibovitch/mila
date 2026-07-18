@@ -314,4 +314,99 @@ final class MeetingDetector: ObservableObject {
         }
         return false
     }
+
+    // MARK: - Meeting title extraction
+
+    /// Extract the meeting name from the window title of a supported app.
+    /// Returns a cleaned meeting name, or nil if unavailable (no Screen
+    /// Recording permission, app not running, or no recognisable title).
+    static func meetingTitle(for app: App) -> String? {
+        let runningPIDs = NSWorkspace.shared.runningApplications
+            .filter { $0.bundleIdentifier == app.bundleID }
+            .map { $0.processIdentifier }
+        guard !runningPIDs.isEmpty else { return nil }
+
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]
+        else { return nil }
+
+        // Collect all window titles for this app, pick the longest
+        // (most likely the main meeting window, not a small toolbar).
+        var bestTitle: String?
+        var bestLength = 0
+        for window in info {
+            guard let pid = window[kCGWindowOwnerPID as String] as? Int32,
+                  runningPIDs.contains(pid) else { continue }
+            guard let title = window[kCGWindowName as String] as? String,
+                  !title.isEmpty, title.count > bestLength else { continue }
+            bestTitle = title
+            bestLength = title.count
+        }
+        guard let raw = bestTitle else { return nil }
+        return cleanMeetingTitle(raw, app: app)
+    }
+
+    /// Strip app-specific prefixes/suffixes from a raw window title to
+    /// extract just the meeting name.
+    private static func cleanMeetingTitle(_ raw: String, app: App) -> String? {
+        var title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch app.bundleID {
+        case "us.zoom.xos":
+            // Zoom titles: "Zoom Workplace", "Zoom Meeting",
+            // "Weekly Standup - Zoom Meeting" → "Weekly Standup"
+            for prefix in ["Zoom Workplace - ", "Zoom Meeting - ", "Zoom Workplace", "Zoom Meeting"] {
+                if title.hasPrefix(prefix) {
+                    title = String(title.dropFirst(prefix.count))
+                    break
+                }
+            }
+            // Also strip trailing " - Zoom Meeting"
+            if let range = title.range(of: " - Zoom Meeting", options: .backwards) {
+                title = String(title[..<range.lowerBound])
+            }
+
+        case "com.microsoft.teams2":
+            // Teams: "Meeting Name | Microsoft Teams" → "Meeting Name"
+            if let range = title.range(of: " | Microsoft Teams", options: .backwards) {
+                title = String(title[..<range.lowerBound])
+            }
+            for prefix in ["Microsoft Teams - "] {
+                if title.hasPrefix(prefix) {
+                    title = String(title.dropFirst(prefix.count))
+                }
+            }
+
+        case "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser":
+            // Browser: "Meeting Name - Google Meet - Google Chrome" → "Meeting Name"
+            // Or: "Meet - xxx - Google Chrome"
+            let browserSuffixes = [" - Google Chrome", " - Safari", " - Arc"]
+            for suffix in browserSuffixes {
+                if let range = title.range(of: suffix, options: .backwards) {
+                    title = String(title[..<range.lowerBound])
+                }
+            }
+            if let range = title.range(of: " - Google Meet", options: .backwards) {
+                title = String(title[..<range.lowerBound])
+            }
+
+        case "com.tinyspeck.slackmacgap":
+            // Slack: "Huddle in #channel - Slack" → "Huddle in #channel"
+            if let range = title.range(of: " - Slack", options: .backwards) {
+                title = String(title[..<range.lowerBound])
+            }
+
+        default:
+            break
+        }
+
+        title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Don't return empty or generic titles.
+        let generic = ["zoom", "zoom workplace", "microsoft teams", "slack",
+                       "google chrome", "safari", "arc", "meet", "meeting"]
+        if title.isEmpty || generic.contains(title.lowercased()) {
+            return nil
+        }
+        return title
+    }
 }

@@ -63,6 +63,10 @@ final class QuickActionsController: ObservableObject {
     /// IslandWhisper → Mila rename), so macOS treats this as a brand
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
+    /// Meeting title captured from the app's window title when a meeting
+    /// is detected. Set by MeetingPromptOverlay before recording starts;
+    /// consumed by stopRecording to name the recording. Cleared on stop.
+    var capturedMeetingTitle: String?
 
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
@@ -555,21 +559,20 @@ final class QuickActionsController: ObservableObject {
             return
         }
         let duration = max(durationBeforeStop, audioDuration(at: outputURL))
+        let meetingTitle = capturedMeetingTitle
+        capturedMeetingTitle = nil
         let (title, source, appName): (String, RecordingSource, String?) = {
             switch captured {
             case .recordingMic:
                 return (defaultTitle(prefix: "Voice Memo"), .microphone, nil)
             case .recording(let withSystemAudio):
-                // Unified Record: mic only when checkbox is off, or
-                // mic + system mix when on. The title stays generic —
-                // every recording is just "a recording" in the new UI.
-                let prefix = "Recording"
+                let prefix = meetingTitle ?? "Recording"
                 return (defaultTitle(prefix: prefix),
                         withSystemAudio ? .meeting : .microphone,
                         nil)
             case .recordingApp(let pid, let includeMic):
                 let app = availableApps.first(where: { $0.processID == pid })?.applicationName
-                let prefix = app ?? "System Audio"
+                let prefix = meetingTitle ?? app ?? "System Audio"
                 return (defaultTitle(prefix: prefix),
                         includeMic ? .meeting : .systemAudio,
                         app)
@@ -624,6 +627,7 @@ final class QuickActionsController: ObservableObject {
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             appName: appName,
+            meetingTitle: meetingTitle,
             summary: initialSummary.isEmpty ? nil : initialSummary,
             actionItems: initialItems.isEmpty ? nil : initialItems
         )
