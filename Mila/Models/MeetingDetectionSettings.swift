@@ -24,16 +24,6 @@ final class MeetingDetectionSettings: ObservableObject {
     @Published var enabled: Bool {
         didSet { defaults.set(enabled, forKey: Keys.enabled) }
     }
-    /// When true, recording starts automatically when a meeting is
-    /// detected — no prompt shown. Default false (show prompt).
-    @Published var autoStartOnMeetingDetected: Bool {
-        didSet { defaults.set(autoStartOnMeetingDetected, forKey: Keys.autoStart) }
-    }
-    /// When true, recording stops automatically when the meeting app
-    /// releases the mic — no prompt shown. Default false (show prompt).
-    @Published var autoStopOnMeetingEnd: Bool {
-        didSet { defaults.set(autoStopOnMeetingEnd, forKey: Keys.autoStop) }
-    }
     @Published private(set) var disabledBundleIDs: Set<String> {
         didSet {
             let joined = disabledBundleIDs.sorted().joined(separator: ",")
@@ -65,8 +55,6 @@ final class MeetingDetectionSettings: ObservableObject {
             defaults.set(true, forKey: Keys.enabled)
         }
         self.enabled = defaults.bool(forKey: Keys.enabled)
-        self.autoStartOnMeetingDetected = defaults.bool(forKey: Keys.autoStart)
-        self.autoStopOnMeetingEnd = defaults.bool(forKey: Keys.autoStop)
         let raw = defaults.string(forKey: Keys.disabledBundleIDs) ?? ""
         self.disabledBundleIDs = Set(
             raw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
@@ -107,12 +95,11 @@ final class MeetingDetectionSettings: ObservableObject {
     /// per-app override is set, OR the global toggle is on and no
     /// per-app override exists.
     func shouldAutoStart(bundleID: String) -> Bool {
-        autoStartBundleIDs.contains(bundleID) || autoStartOnMeetingDetected
+        autoStartBundleIDs.contains(bundleID)
     }
 
-    /// Whether auto-stop should fire for a specific app.
     func shouldAutoStop(bundleID: String) -> Bool {
-        autoStopBundleIDs.contains(bundleID) || autoStopOnMeetingEnd
+        autoStopBundleIDs.contains(bundleID)
     }
 
     func setAutoStart(bundleID: String, enabled: Bool) {
@@ -131,8 +118,6 @@ final class MeetingDetectionSettings: ObservableObject {
 
     private enum Keys {
         static let enabled = "meetingDetection.enabled"
-        static let autoStart = "meetingDetection.autoStart"
-        static let autoStop = "meetingDetection.autoStop"
         static let autoStartApps = "meetingDetection.autoStartApps"
         static let autoStopApps = "meetingDetection.autoStopApps"
         static let disabledBundleIDs = "meetingDetection.disabledBundleIDs"
