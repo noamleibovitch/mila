@@ -40,13 +40,27 @@ final class MeetingDetectionSettings: ObservableObject {
             defaults.set(joined, forKey: Keys.disabledBundleIDs)
         }
     }
+    /// Per-app auto-start overrides. Apps in this set auto-start
+    /// regardless of the global toggle.
+    @Published private(set) var autoStartBundleIDs: Set<String> {
+        didSet {
+            let joined = autoStartBundleIDs.sorted().joined(separator: ",")
+            defaults.set(joined, forKey: Keys.autoStartApps)
+        }
+    }
+    /// Per-app auto-stop overrides. Apps in this set auto-stop
+    /// regardless of the global toggle.
+    @Published private(set) var autoStopBundleIDs: Set<String> {
+        didSet {
+            let joined = autoStopBundleIDs.sorted().joined(separator: ",")
+            defaults.set(joined, forKey: Keys.autoStopApps)
+        }
+    }
 
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        // ON by default — first launch should surface the feature so
-        // users discover it. The toggle in Settings flips it.
         if defaults.object(forKey: Keys.enabled) == nil {
             defaults.set(true, forKey: Keys.enabled)
         }
@@ -56,6 +70,14 @@ final class MeetingDetectionSettings: ObservableObject {
         let raw = defaults.string(forKey: Keys.disabledBundleIDs) ?? ""
         self.disabledBundleIDs = Set(
             raw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        )
+        let autoStartRaw = defaults.string(forKey: Keys.autoStartApps) ?? ""
+        self.autoStartBundleIDs = Set(
+            autoStartRaw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        )
+        let autoStopRaw = defaults.string(forKey: Keys.autoStopApps) ?? ""
+        self.autoStopBundleIDs = Set(
+            autoStopRaw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         )
     }
 
@@ -81,10 +103,38 @@ final class MeetingDetectionSettings: ObservableObject {
         disabledBundleIDs = copy
     }
 
+    /// Whether auto-start should fire for a specific app. True if the
+    /// per-app override is set, OR the global toggle is on and no
+    /// per-app override exists.
+    func shouldAutoStart(bundleID: String) -> Bool {
+        autoStartBundleIDs.contains(bundleID) || autoStartOnMeetingDetected
+    }
+
+    /// Whether auto-stop should fire for a specific app.
+    func shouldAutoStop(bundleID: String) -> Bool {
+        autoStopBundleIDs.contains(bundleID) || autoStopOnMeetingEnd
+    }
+
+    func setAutoStart(bundleID: String, enabled: Bool) {
+        guard !bundleID.isEmpty else { return }
+        var copy = autoStartBundleIDs
+        if enabled { copy.insert(bundleID) } else { copy.remove(bundleID) }
+        autoStartBundleIDs = copy
+    }
+
+    func setAutoStop(bundleID: String, enabled: Bool) {
+        guard !bundleID.isEmpty else { return }
+        var copy = autoStopBundleIDs
+        if enabled { copy.insert(bundleID) } else { copy.remove(bundleID) }
+        autoStopBundleIDs = copy
+    }
+
     private enum Keys {
         static let enabled = "meetingDetection.enabled"
         static let autoStart = "meetingDetection.autoStart"
         static let autoStop = "meetingDetection.autoStop"
+        static let autoStartApps = "meetingDetection.autoStartApps"
+        static let autoStopApps = "meetingDetection.autoStopApps"
         static let disabledBundleIDs = "meetingDetection.disabledBundleIDs"
     }
 }

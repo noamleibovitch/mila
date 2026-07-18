@@ -1364,23 +1364,41 @@ private struct MeetingsSettingsTab: View {
             Text("Supported apps")
                 .font(.callout.weight(.semibold))
             ForEach(MeetingDetector.supportedApps, id: \.bundleID) { app in
-                HStack {
-                    Image(systemName: "video.fill")
-                        .foregroundStyle(.tint)
-                    Text(app.displayName)
-                    Spacer()
-                    if settings.isDisabled(forBundleID: app.bundleID) {
-                        Text("Silenced")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if !settings.enabled {
-                        Text("Off")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        Text("On")
-                            .font(.caption)
-                            .foregroundStyle(.green)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Image(systemName: "video.fill")
+                            .foregroundStyle(.tint)
+                        Text(app.displayName)
+                            .font(.body)
+                        Spacer()
+                        if settings.isDisabled(forBundleID: app.bundleID) {
+                            Text("Silenced")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if !settings.enabled {
+                            Text("Off")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        } else {
+                            Text("On")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                        }
+                    }
+                    if settings.enabled, !settings.isDisabled(forBundleID: app.bundleID) {
+                        HStack(spacing: 16) {
+                            Toggle("Auto-start", isOn: Binding(
+                                get: { settings.autoStartBundleIDs.contains(app.bundleID) },
+                                set: { settings.setAutoStart(bundleID: app.bundleID, enabled: $0) }
+                            ))
+                            Toggle("Auto-stop", isOn: Binding(
+                                get: { settings.autoStopBundleIDs.contains(app.bundleID) },
+                                set: { settings.setAutoStop(bundleID: app.bundleID, enabled: $0) }
+                            ))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .font(.caption)
                     }
                 }
                 .padding(.vertical, 4)

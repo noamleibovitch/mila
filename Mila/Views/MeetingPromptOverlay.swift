@@ -154,7 +154,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         capturedMeetingTitle = MeetingDetector.meetingTitle(for: app)
         actions.capturedMeetingTitle = capturedMeetingTitle
 
-        if settings.autoStartOnMeetingDetected {
+        if settings.shouldAutoStart(bundleID: app.bundleID) {
             Task { @MainActor in
                 await actions.toggleRecord(withSystemAudio: true)
             }
@@ -174,7 +174,7 @@ final class MeetingPromptCoordinator: ObservableObject {
             promptAlreadyShowing: window != nil
         ) else { return }
 
-        if settings.autoStopOnMeetingEnd {
+        if settings.shouldAutoStop(bundleID: app.bundleID) {
             Task { @MainActor in
                 await actions.stopRecording()
             }
