@@ -75,6 +75,10 @@ final class MeetingDetector: ObservableObject {
             displayName: "Arc",
             captureBundlePrefixes: ["company.thebrowser"],
             meetingTitleHints: ["meet.google.com"]),
+        App(bundleID: "io.island.Island",
+            displayName: "Island",
+            captureBundlePrefixes: ["io.island.Island"],
+            meetingTitleHints: ["meet.google.com", "zoom"]),
     ]
 
     /// Fired exactly once per meeting — the first poll that sees a
@@ -377,10 +381,10 @@ final class MeetingDetector: ObservableObject {
                 }
             }
 
-        case "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser":
+        case "com.google.Chrome", "com.apple.Safari", "company.thebrowser.Browser", "io.island.Island":
             // Browser: "Meeting Name - Google Meet - Google Chrome" → "Meeting Name"
             // Or: "Meet - xxx - Google Chrome"
-            let browserSuffixes = [" - Google Chrome", " - Safari", " - Arc"]
+            let browserSuffixes = [" - Google Chrome", " - Safari", " - Arc", " - Island"]
             for suffix in browserSuffixes {
                 if let range = title.range(of: suffix, options: .backwards) {
                     title = String(title[..<range.lowerBound])
@@ -403,7 +407,7 @@ final class MeetingDetector: ObservableObject {
         title = title.trimmingCharacters(in: .whitespacesAndNewlines)
         // Don't return empty or generic titles.
         let generic = ["zoom", "zoom workplace", "microsoft teams", "slack",
-                       "google chrome", "safari", "arc", "meet", "meeting"]
+                       "google chrome", "safari", "arc", "island", "meet", "meeting"]
         if title.isEmpty || generic.contains(title.lowercased()) {
             return nil
         }
