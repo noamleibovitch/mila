@@ -1085,6 +1085,14 @@ struct MilaApp: App {
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
+                // When batch-only mode is on, skip live transcription
+                // entirely — audio is just recorded, transcribed after
+                // stop via the batch queue. Saves CPU/memory during calls.
+                if aiSettings.batchTranscribeOnly {
+                    os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                        .log("wireLiveAIPipeline: .recording — batch-only mode, skipping live transcription")
+                    continue
+                }
                 // Live transcription runs on every recording — it's how
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval

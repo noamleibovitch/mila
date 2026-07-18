@@ -1421,6 +1421,20 @@ private struct LiveAISettingsTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
+
+                Toggle(isOn: $settings.batchTranscribeOnly) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Transcribe after recording only")
+                            .font(.body)
+                        Text("Skip live transcription during recording. Audio is recorded and transcribed after you stop — uses less CPU/memory during calls.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.regular)
+
                 if !settings.isLiveAIAvailable {
                     hardwareDisabledNotice
                 }

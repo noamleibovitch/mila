@@ -77,6 +77,14 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(useNeuralVAD, forKey: Keys.useNeuralVAD) }
     }
 
+    /// When true, skip live transcription during recording entirely.
+    /// Audio is recorded and transcribed only after stopping (queued
+    /// for batch processing). Reduces CPU/memory usage during calls
+    /// at the cost of no real-time transcript.
+    @Published var batchTranscribeOnly: Bool {
+        didSet { defaults.set(batchTranscribeOnly, forKey: Keys.batchTranscribeOnly) }
+    }
+
     /// When true, the recording UI stays on the Home screen (just a
     /// Stop button) instead of switching to the LiveAIRecordingView's
     /// split pane. Transcription + summary continue to run in the
@@ -232,6 +240,7 @@ final class LiveAISettings: ObservableObject {
         // on) and a CPU win (skips whisper on those). Explicit false
         // is preserved for users who turned it off.
         self.useNeuralVAD = defaults.object(forKey: Keys.useNeuralVAD) as? Bool ?? true
+        self.batchTranscribeOnly = defaults.bool(forKey: Keys.batchTranscribeOnly)
         self.backgroundMode = defaults.bool(forKey: Keys.backgroundMode)
         self.forceLiveAIOnLowEndHardware = defaults.bool(forKey: Keys.forceLowEnd)
         let sim = defaults.double(forKey: Keys.simThreshold)
@@ -335,6 +344,7 @@ the content.
         static let llmMinInterval = "liveAI.llmMinIntervalSeconds"
         static let useVAD = "liveAI.useVAD"
         static let useNeuralVAD = "liveAI.useNeuralVAD"
+        static let batchTranscribeOnly = "liveAI.batchTranscribeOnly"
         static let backgroundMode = "liveAI.backgroundMode"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
