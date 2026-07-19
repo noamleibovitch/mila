@@ -121,16 +121,14 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     /// Bind the detector's start/stop to the user's enabled toggle.
-    /// Pause the transcription queue while a meeting is active so
-    /// batch transcription doesn't compete with the call for CPU.
+    /// Pause the transcription queue while Mila is actively recording.
+    /// Resumes when recording stops so queued batch transcriptions run.
     func bindQueuePause(transcription: TranscriptionService) {
-        detector.meetingStarted
+        actions.$activeJob
             .receive(on: DispatchQueue.main)
-            .sink { _ in transcription.queuePaused = true }
-            .store(in: &queuePauseCancellables)
-        detector.meetingEnded
-            .receive(on: DispatchQueue.main)
-            .sink { _ in transcription.queuePaused = false }
+            .sink { job in
+                transcription.queuePaused = (job != .none)
+            }
             .store(in: &queuePauseCancellables)
     }
 
