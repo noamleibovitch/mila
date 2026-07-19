@@ -42,8 +42,12 @@ final class MeetingDetector: ObservableObject {
         /// prefixes AND is capturing mic input ⇒ this app is in a meeting.
         /// A prefix (not exact) because Zoom may capture under a helper
         /// bundle ID (`us.zoom.*`) rather than `us.zoom.xos`.
+        /// Empty = skip mic-capture, use window title only (for apps
+        /// like Slack/browsers where mic capture is too broad).
         let captureBundlePrefixes: [String]
-        /// Lowercased window-title substrings, fallback path only.
+        /// Lowercased window-title substrings. Used as fallback when
+        /// mic-capture API is unavailable, AND as primary signal for
+        /// apps with empty `captureBundlePrefixes`.
         let meetingTitleHints: [String]
     }
 
@@ -59,25 +63,27 @@ final class MeetingDetector: ObservableObject {
             displayName: "Microsoft Teams",
             captureBundlePrefixes: ["com.microsoft.teams"],
             meetingTitleHints: ["meeting"]),
+        // Slack, browsers: use window title only — mic capture is too
+        // broad (Slack DMs, any browser tab with mic access trigger it).
         App(bundleID: "com.tinyspeck.slackmacgap",
             displayName: "Slack",
-            captureBundlePrefixes: ["com.tinyspeck.slackmacgap"],
+            captureBundlePrefixes: [],
             meetingTitleHints: ["huddle"]),
         App(bundleID: "com.google.Chrome",
             displayName: "Google Chrome",
-            captureBundlePrefixes: ["com.google.Chrome"],
+            captureBundlePrefixes: [],
             meetingTitleHints: ["meet.google.com"]),
         App(bundleID: "com.apple.Safari",
             displayName: "Safari",
-            captureBundlePrefixes: ["com.apple.Safari", "com.apple.WebKit"],
+            captureBundlePrefixes: [],
             meetingTitleHints: ["meet.google.com"]),
         App(bundleID: "company.thebrowser.Browser",
             displayName: "Arc",
-            captureBundlePrefixes: ["company.thebrowser"],
+            captureBundlePrefixes: [],
             meetingTitleHints: ["meet.google.com"]),
         App(bundleID: "io.island.Island",
             displayName: "Island",
-            captureBundlePrefixes: ["io.island.Island"],
+            captureBundlePrefixes: [],
             meetingTitleHints: ["meet.google.com", "zoom"]),
     ]
 
@@ -159,7 +165,11 @@ final class MeetingDetector: ObservableObject {
         var activeMeetings: Set<String> = []
         for app in Self.supportedApps {
             let inMeeting: Bool
-            if let capturing {
+            if app.captureBundlePrefixes.isEmpty {
+                // Title-only apps (Slack, browsers): mic capture is too
+                // broad, so use window title matching exclusively.
+                inMeeting = isRunning(app) && hasMeetingWindow(for: app)
+            } else if let capturing {
                 inMeeting = app.captureBundlePrefixes.contains { prefix in
                     capturing.contains { $0.hasPrefix(prefix) }
                 }
