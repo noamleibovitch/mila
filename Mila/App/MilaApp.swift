@@ -423,13 +423,8 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak store, weak diarSettings] rec, wasRetranscription in
             if wasRetranscription {
-                // `regenerate` bypasses the "already has a summary" gate by
-                // design (it's also the manual on-demand path), so it does
-                // NOT consult `summaryEnabled` itself. Guard the AUTOMATIC
-                // re-transcription trigger here so a transcript-only user
-                // doesn't get a summary regenerated behind their back.
                 guard llm?.summaryEnabled ?? true else { return }
                 summarizer?.regenerate(rec)
             } else {
@@ -544,6 +539,12 @@ struct MilaApp: App {
                 .task { await runFinalizeRegressionIfRequested() }
                 .task { recordingSummarizer.backfillIfNeeded() }
                 .task { voiceMemosImporter.start() }
+                .onChange(of: transcription.activeRecordingID) { old, new in
+                    // A transcription just completed — match speakers against profiles.
+                    if let completedID = old, new == nil {
+                        matchSpeakerProfiles(recordingID: completedID)
+                    }
+                }
                 .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
                 .environmentObject(voiceMemosSettings)
@@ -650,6 +651,43 @@ struct MilaApp: App {
     private func startMeetingDetectionIfNeeded() {
         meetingPrompt.start()
         meetingPrompt.bindEnabledChanges()
+    }
+
+    /// After a transcription completes, extract speaker embeddings (if
+    /// missing) and match against stored voice profiles to auto-assign
+    /// speaker names.
+    private func matchSpeakerProfiles(recordingID: UUID) {
+        guard !speakerProfileStore.profiles.isEmpty else { return }
+        guard var rec = store.recordings.first(where: { $0.id == recordingID }),
+              rec.speakerNames.isEmpty,
+              rec.segments.contains(where: { $0.speaker != nil }) else { return }
+
+        Task {
+            var embeddings = rec.speakerEmbeddings
+            if embeddings.isEmpty {
+                let wavURL = store.audioURL(for: rec)
+                if let extracted = try? await SpeakerDiarizer.extractEmbeddings(
+                    wavURL: wavURL,
+                    pythonPath: diarizationSettings.pythonPath),
+                   !extracted.isEmpty {
+                    embeddings = extracted
+                    rec.speakerEmbeddings.merge(extracted) { _, new in new }
+                    store.update(rec)
+                }
+            }
+            var names: [String: String] = [:]
+            for (rawID, emb) in embeddings {
+                if let profile = speakerProfileStore.match(embedding: emb) {
+                    names[rawID] = profile.name
+                }
+            }
+            if !names.isEmpty {
+                if var current = store.recordings.first(where: { $0.id == recordingID }) {
+                    current.speakerNames.merge(names) { existing, _ in existing }
+                    store.update(current)
+                }
+            }
+        }
     }
 
     /// Pause the transcription queue while a meeting is in progress so
