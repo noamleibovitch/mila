@@ -344,20 +344,28 @@ final class MeetingDetector: ObservableObject {
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]
         else { return nil }
 
-        // Collect all window titles for this app, pick the longest
-        // (most likely the main meeting window, not a small toolbar).
-        var bestTitle: String?
-        var bestLength = 0
+        // Collect window titles, filtering out internal/HUD windows.
+        // Zoom uses internal names like "ZM_HUD_TOAST_WINDOW",
+        // "ZM_NOTIFICATION_WINDOW", etc. — skip anything with "ZM_".
+        let internalPrefixes = ["ZM_", "NSStatusBarWindow", "Menubar"]
+        var candidates: [String] = []
         for window in info {
             guard let pid = window[kCGWindowOwnerPID as String] as? Int32,
                   runningPIDs.contains(pid) else { continue }
             guard let title = window[kCGWindowName as String] as? String,
-                  !title.isEmpty, title.count > bestLength else { continue }
-            bestTitle = title
-            bestLength = title.count
+                  !title.isEmpty else { continue }
+            if internalPrefixes.contains(where: { title.hasPrefix($0) }) { continue }
+            candidates.append(title)
         }
-        guard let raw = bestTitle else { return nil }
-        return cleanMeetingTitle(raw, app: app)
+        // Try to find a title that cleans to something meaningful.
+        // Prefer longer titles (more likely the meeting window).
+        let sorted = candidates.sorted { $0.count > $1.count }
+        for raw in sorted {
+            if let cleaned = cleanMeetingTitle(raw, app: app) {
+                return cleaned
+            }
+        }
+        return nil
     }
 
     /// Strip app-specific prefixes/suffixes from a raw window title to
