@@ -713,6 +713,38 @@ struct MilaApp: App {
             )
         }
 
+        // Batch voice matching: after a batch transcription completes
+        // (re-transcription, imported file), extract speaker embeddings
+        // and match against stored voice profiles. The live path handles
+        // this via RecognisedSpeakerAssigner; this covers the batch path
+        // where the live diarizer wasn't running.
+        let existingCallback = svc.onTranscriptionCompleted
+        svc.onTranscriptionCompleted = { [weak store, weak diarSettings] rec, wasRetranscription in
+            existingCallback?(rec, wasRetranscription)
+            guard voiceSettings.isConfigured,
+                  !profileStoreRef.profiles.isEmpty,
+                  rec.speakerNames.isEmpty,
+                  rec.segments.contains(where: { $0.speaker != nil }),
+                  let store else { return }
+            let pythonPath = diarSettings?.pythonPath ?? "/usr/bin/python3"
+            Task.detached(priority: .utility) {
+                let wavURL = await store.audioURL(for: rec)
+                guard FileManager.default.fileExists(atPath: wavURL.path) else { return }
+                let embeddings = (try? await SpeakerDiarizer.extractEmbeddings(
+                    wavURL: wavURL, pythonPath: pythonPath)) ?? [:]
+                guard !embeddings.isEmpty else { return }
+                await MainActor.run {
+                    for (rawID, emb) in embeddings {
+                        if let profile = profileStoreRef.match(embedding: emb) {
+                            store.setSpeakerName(
+                                profile.name, forSpeaker: rawID,
+                                recordingID: rec.id)
+                        }
+                    }
+                }
+            }
+        }
+
         // Auto-drop accidental short+empty captures (issue #61). A recording
         // that finishes transcription with no text AND under the user's
         // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
