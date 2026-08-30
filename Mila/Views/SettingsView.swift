@@ -8,12 +8,12 @@ import Carbon.HIToolbox
 /// (#177 replaced the strip with a sidebar). The name is deliberately kept:
 /// it is the key of the deep-link contract (`SettingsNavigation.pendingTab`),
 /// its raw values are pinned by `AISettingsKeyCompatibilityTests`, and the
-/// per-destination views are all still named `…SettingsTab`. Renaming the
-/// type would churn all three for no behavioural gain.
+/// per-destination views are all still named `…SettingsTab`. Renaming the type
+/// would churn all three for no behavioural gain.
 ///
 /// `allCases` order IS the sidebar order, top to bottom. Adding a case adds a
 /// row; it costs vertical space in a scrollable list, so — unlike the old tab
-/// strip — there is no width budget to re-measure. See `SettingsView.body`.
+/// strip — there is no width budget to re-measure.
 enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     /// `aiProvider` + `aiFeatures` replace the former separate `llm` and
     /// `liveAI` tabs. The split is by *how often you touch it*: the provider
@@ -24,6 +24,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
 
     var id: Int { rawValue }
 
+    /// Sidebar row label, and the Settings window title while selected.
     var title: String {
         switch self {
         case .general: return "General"
@@ -54,6 +55,9 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
 
     /// Stable per-row accessibility identifier, so GUI tests can select a
     /// destination without matching on the (localisable) visible label.
+    /// `MilaUITests` hardcodes these strings — the UI-test target cannot
+    /// import the app's types — and `AISettingsKeyCompatibilityTests` pins
+    /// them.
     var accessibilityID: String {
         switch self {
         case .general: return "settings.section.general"
@@ -65,6 +69,25 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
         case .meetings: return "settings.section.meetings"
         case .voiceMemos: return "settings.section.voiceMemos"
         case .storage: return "settings.section.storage"
+        }
+    }
+
+    /// True when the destination's own root view is already a `ScrollView`.
+    ///
+    /// Load-bearing, not cosmetic. The detail column must never report a
+    /// height larger than the window proposes it — that overflow is exactly
+    /// what made the first attempt at this change render an empty window (see
+    /// `SettingsView`). A `ScrollView` is the structural guarantee: it
+    /// accepts whatever height it is offered and scrolls the rest. Sections
+    /// that don't bring their own get wrapped in one by
+    /// `SettingsView.detailPane`; double-wrapping the ones that do would nest
+    /// two vertical scrollers, which fight each other.
+    var providesOwnScrollView: Bool {
+        switch self {
+        case .models, .aiProvider, .aiFeatures, .meetings, .storage:
+            return true
+        case .general, .audio, .speakers, .voiceMemos:
+            return false
         }
     }
 }
@@ -86,69 +109,115 @@ final class SettingsNavigation {
 /// ## Why a sidebar and not a tab strip (#177)
 ///
 /// This used to be a `TabView`, and the window width was load-bearing because
-/// of it: AppKit's `NSTabView` collapses whatever does not fit into a `>>`
-/// overflow menu, which reads as a stray "expand button" and makes the
-/// collapsed tabs look disabled. That was reported as #131 and fixed in #137
-/// by pinning the window to 700×560 (740 pt of strip room) to hold the
-/// measured 599 pt run of nine tab items. #144 then concluded the obvious:
-/// nine fits, "with no room for a tenth". Every remaining move — widen again,
-/// or merge tabs — was spent, so new settings were being parked inside the
-/// Storage tab for want of a slot.
+/// of it: AppKit's `NSTabView` collapses whatever does not fit the strip into
+/// a `>>` overflow menu, which reads as a stray "expand button" and makes the
+/// collapsed tabs look disabled. That was reported as #131 and worked around
+/// in #137 by pinning the window to 700×560 (740 pt of strip room) to hold
+/// the measured 599 pt run of nine tab items. #144 then concluded the
+/// obvious: nine fits, "with no room for a tenth". Both remaining moves —
+/// widen again, or merge tabs — were spent, so new settings were being parked
+/// inside the Storage section for want of a slot.
 ///
-/// A sidebar list removes the ceiling instead of raising it. Destinations cost
+/// A sidebar list removes the ceiling instead of raising it: destinations cost
 /// vertical space, which scrolls, rather than horizontal strip width, which
-/// does not. There is no `NSTabView`, so the `>>` chevron of #131 cannot come
-/// back at any count, and the window no longer needs a hardcoded size — it is
-/// resizable, which also settles the "dense tab can't be given more room"
-/// complaint in #177.
+/// does not. There is no `NSTabView` in the tree, so #131's `>>` chevron
+/// cannot come back at any destination count, and the window no longer needs
+/// a hardcoded size — it is resizable, which also settles #177's "a dense tab
+/// can't be given more room".
 ///
 /// Settings stays its own `Settings` scene rather than becoming a page inside
-/// the main window: that keeps `Cmd+,`, `SettingsLink` and the App-menu item
-/// working for free (no hand-rolled `.appSettings` command, no "reopen the
-/// main window first" path when it is closed), keeps the macOS-native
-/// idiom, and — being a real window — can actually be put side by side with
-/// the main window, which an in-app page that takes over the content area
-/// cannot.
+/// the main window (which is what #177 literally proposed): that keeps
+/// `Cmd+,`, `SettingsLink` and the App-menu item working with no code at all,
+/// keeps the macOS-native idiom, and — being a real window — can be placed
+/// side by side with the main window, which an in-app page that takes over
+/// the content area cannot. It also keeps the documented convention that
+/// app-wide settings objects are injected into both scenes (`CLAUDE.md`) true
+/// as written.
+///
+/// ## Why the layout is hand-rolled and not a `NavigationSplitView`
+///
+/// The first attempt at this change (#194, commit `60218f1`) used
+/// `NavigationSplitView` and shipped a completely empty window: no sidebar
+/// rows, no controls. It was reverted in `6b64e8b`.
+///
+/// The cause, from the accessibility tree of the running app: inside the
+/// 900×472 Settings window, the split view laid out at
+/// `{{62, -2671}, {900, 6115}}` — 6115 pt tall, vertically centred, so it
+/// began 2671 pt *above* the window. Every sidebar row landed at y ≈ -2600
+/// and `updates.autoCheck.toggle` at y = 3314, i.e. thousands of points
+/// outside the visible content area. Nothing was missing; everything was
+/// off-screen. The window title still tracked the section, which is why the
+/// window read as "chrome but no content".
+///
+/// What let that happen: the old `.frame(width: 700, height: 560)` was a
+/// *rigid* frame, and it had been the only thing pinning the content to the
+/// window. #194 replaced it with `.frame(minWidth:idealWidth:minHeight:
+/// idealHeight:)` — no `max` in either axis. A flexible frame reports
+/// `clamp(childSize, min, max)`, so with no upper bound it adopted the split
+/// view's content-driven 6115 pt instead of the 472 pt the window offered.
+///
+/// So the rule this layout follows: **every child of the window-sized frame
+/// must be bounded** — it may never report a size larger than it is
+/// proposed. A `ScrollView` satisfies that by construction (it takes the
+/// height offered and scrolls the overflow), and so does a fixed-width
+/// column. That is the whole reason `SettingsTab.providesOwnScrollView`
+/// exists and the reason this is a plain `HStack` of two bounded columns
+/// rather than an AppKit-bridged split container whose sizing behaviour is
+/// not ours to reason about. It is also the same failure mode
+/// `DetailLayoutUITests` was originally written for, one window over.
 struct SettingsView: View {
     @State private var selectedTab: SettingsTab = .general
 
+    /// Sidebar column width. Fixed rather than draggable: nine short labels
+    /// need no user-tunable column, and a fixed column is one fewer thing
+    /// that can be dragged into an unusable state.
+    private static let sidebarWidth: CGFloat = 188
+
+    /// The old `TabView` was wrapped in `.padding(20)`, so every
+    /// destination's content is written assuming a 20 pt outer inset. Keep
+    /// it, so the per-destination layouts are untouched by this change.
+    private static let detailInset: CGFloat = 20
+
+    /// Narrowest the destination *content* may get. Every destination lays
+    /// out flexibly (`maxWidth:`); the widest rigid run in any of them is a
+    /// 110 pt label beside a 160 pt hotkey field, so 560 has real slack. It
+    /// exists to stop the window being dragged into nonsense, and it is what
+    /// `minWindowWidth` is derived from.
+    private static let minDetailWidth: CGFloat = 560
+
+    /// The old window was 740 pt wide with 700 pt of content. Keep 700 pt of
+    /// content at the ideal size so first launch is not a downgrade.
+    private static let idealDetailWidth: CGFloat = 700
+
+    static let minWindowWidth = sidebarWidth + minDetailWidth + 2 * detailInset
+    static let idealWindowWidth = sidebarWidth + idealDetailWidth + 2 * detailInset
+
+    /// The old window was 600 pt tall (560 pt of content). Never offer less
+    /// vertical room than the fixed window did; growing past it is the point.
+    private static let minWindowHeight: CGFloat = 600
+    private static let idealWindowHeight: CGFloat = 700
+
     var body: some View {
-        NavigationSplitView {
-            List(SettingsTab.allCases, selection: sidebarSelection) { tab in
-                Label(tab.title, systemImage: tab.systemImage)
-                    .accessibilityIdentifier(tab.accessibilityID)
-                    .tag(tab)
-            }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 168, ideal: 184, max: 240)
-            // Every destination lives in this list, so collapsing it would
-            // hide all navigation — the sidebar-toggle button a
-            // NavigationSplitView adds by default is exactly the kind of
-            // stray chrome #131 complained about.
-            .toolbar(removing: .sidebarToggle)
-        } detail: {
-            detail
-                // The old `TabView` was wrapped in `.padding(20)`, so every
-                // destination's content was written assuming an outer inset.
-                // Keep it, here, so the per-destination layouts are untouched.
-                .padding(20)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                // Puts the destination name in the window title, which is
-                // what the tab strip used to do.
-                .navigationTitle(selectedTab.title)
+        HStack(spacing: 0) {
+            sectionList
+            Divider()
+            detailPane
         }
-        .navigationSplitViewStyle(.balanced)
-        // No fixed size any more — the window is resizable, which is half the
-        // point of #177. The ideal is the old 740 pt content width plus the
-        // sidebar, so first launch looks like it always did.
-        //
-        // The floor is a judgement call, not a measurement: every destination
-        // lays out flexibly (`maxWidth:`), and the widest RIGID element in any
-        // of them is a 160 pt label, so ~500 pt of detail column is
-        // comfortable. It exists only to stop the two columns being dragged
-        // into nonsense.
-        .frame(minWidth: 700, idealWidth: 920,
-               minHeight: 440, idealHeight: 620)
+        // Bounded in both axes, unlike #194's frame. `maxWidth`/`maxHeight`
+        // of `.infinity` make this greedy — it fills the window instead of
+        // sizing to its content — and `windowResizability(.contentSize)` on
+        // the `Settings` scene in `MilaApp` maps min/max onto the window's
+        // own resize limits.
+        .frame(minWidth: Self.minWindowWidth,
+               idealWidth: Self.idealWindowWidth,
+               maxWidth: .infinity,
+               minHeight: Self.minWindowHeight,
+               idealHeight: Self.idealWindowHeight,
+               maxHeight: .infinity)
+        .background(
+            SettingsWindowTitle(title: selectedTab.title)
+                .frame(width: 0, height: 0)
+        )
         .onChange(of: SettingsNavigation.shared.pendingTab, initial: true) { _, newTab in
             if let tab = newTab {
                 selectedTab = tab
@@ -157,9 +226,25 @@ struct SettingsView: View {
         }
     }
 
-    /// `List`'s selection binding is `Optional` — Escape or a click on empty
-    /// sidebar space clears it, which would blank the detail pane. Swallowing
-    /// the nil keeps a destination always selected.
+    // MARK: Sidebar
+
+    private var sectionList: some View {
+        List(SettingsTab.allCases, selection: sidebarSelection) { tab in
+            Label(tab.title, systemImage: tab.systemImage)
+                .accessibilityIdentifier(tab.accessibilityID)
+                .tag(tab)
+        }
+        .listStyle(.sidebar)
+        // A `List` is bounded by construction — it takes the height it is
+        // offered and scrolls the rest — so a tenth, twentieth or fiftieth
+        // destination changes nothing about the window's geometry.
+        .frame(width: Self.sidebarWidth)
+        .frame(maxHeight: .infinity)
+    }
+
+    /// `List`'s selection binding is `Optional` — Escape, or a click on empty
+    /// sidebar space, clears it, which would blank the detail pane.
+    /// Swallowing the nil keeps a destination always selected.
     private var sidebarSelection: Binding<SettingsTab?> {
         Binding(
             get: { selectedTab },
@@ -167,8 +252,34 @@ struct SettingsView: View {
         )
     }
 
+    // MARK: Detail
+
+    private var detailPane: some View {
+        Group {
+            if selectedTab.providesOwnScrollView {
+                destination
+                    .padding(Self.detailInset)
+            } else {
+                ScrollView(.vertical) {
+                    destination
+                        .padding(Self.detailInset)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // A fresh identity per destination. Two things hang off it: the
+        // scroll offset resets per section (a leftover offset from a long
+        // section reads as a mis-rendered short one), and SwiftUI is
+        // guaranteed to tear the previous destination down — so
+        // `AudioSettingsTab`'s `.onDisappear` really does stop the VU meter
+        // when you leave Audio, and its `.task` really does restart it when
+        // you come back. The old `TabView` gave that teardown for free.
+        .id(selectedTab)
+    }
+
     @ViewBuilder
-    private var detail: some View {
+    private var destination: some View {
         switch selectedTab {
         case .general: GeneralSettingsTab()
         case .audio: AudioSettingsTab()
@@ -179,6 +290,33 @@ struct SettingsView: View {
         case .meetings: MeetingsSettingsTab()
         case .voiceMemos: VoiceMemosSettingsTab()
         case .storage: StorageSettingsTab()
+        }
+    }
+}
+
+/// Puts the selected destination's name in the Settings window's title bar.
+///
+/// The old `TabView` got this for free: AppKit titles an `NSTabView`-backed
+/// Settings window after the selected tab item. With the strip gone nothing
+/// sets it, and `.navigationTitle` needs a navigation container to hang off —
+/// there isn't one here — so set it on the hosting `NSWindow` directly. This
+/// is the only window this view is ever installed in, so there is no risk of
+/// retitling someone else's.
+private struct SettingsWindowTitle: NSViewRepresentable {
+    let title: String
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        let title = self.title
+        // `nsView.window` is nil while the view is still being installed, so
+        // the very first update would drop the title. Defer a runloop turn.
+        DispatchQueue.main.async {
+            nsView.window?.title = title
         }
     }
 }
@@ -220,6 +358,10 @@ private struct AudioSettingsTab: View {
             }
             .pickerStyle(.menu)
             .frame(maxWidth: 360)
+            // Audio's per-section probe for `DetailLayoutUITests`: a control
+            // that is present unconditionally, so "this destination rendered"
+            // is checkable without depending on device state.
+            .accessibilityIdentifier("audio.input.picker")
 
             Button("Refresh device list") { refresh() }
                 .buttonStyle(.borderless)
@@ -242,6 +384,14 @@ private struct AudioSettingsTab: View {
                     Text(meterStatusText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        // Lets a GUI test see that the VU meter's lifecycle
+                        // still runs when Settings switches destinations
+                        // (`.task` / `.onDisappear` now fire on selection
+                        // change rather than tab change — see
+                        // `SettingsView.detailPane`). Deliberately not
+                        // asserted to read "Live" in CI: the hosted runners
+                        // have no input device.
+                        .accessibilityIdentifier("audio.meter.status")
                 }
                 LevelMeterView(level: monitor.level,
                                isLive: monitor.isRunning && !actions.isRecording)
@@ -331,9 +481,10 @@ private struct AudioSettingsTab: View {
 /// AppKit's ">>" overflow chevron at that width, which is what made the
 /// Updates tab look "disabled" (see PR discussion).
 ///
-/// The strip is gone as of #177, so the width argument no longer applies;
-/// the "a toggle and a version string don't deserve their own destination"
-/// one still does, which is why this stays folded in.
+/// The strip is gone as of #177, so the width half of that argument no longer
+/// applies. The other half — a single toggle and a version string don't
+/// deserve their own destination — still does, which is why this stays folded
+/// in.
 private struct GeneralSettingsTab: View {
     @EnvironmentObject private var hotkeys: HotkeySettings
 
@@ -670,6 +821,10 @@ private struct ModelsSettingsTab: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                // Models' per-section probe for `DetailLayoutUITests` — the
+                // one control on this destination that is present whichever
+                // backend is selected.
+                .accessibilityIdentifier("models.backend.picker")
 
                 switch remote.backend {
                 case .local:
@@ -728,10 +883,32 @@ private struct ModelsSettingsTab: View {
 /// Endpoint / model / API-key configuration for the remote transcription
 /// backend, plus a connectivity test and the mandatory "audio leaves your
 /// device" warning.
+///
+/// The **Model** row is a picker over `RemoteModelPreset.all`, not free text.
+/// It used to be a `TextField` whose only guidance was a `whisper-1`
+/// placeholder, which invited model ids that fail with an opaque HTTP 400 —
+/// and, before PR #189, that was *most* of OpenAI's transcription line-up
+/// (issue #178). Free text still exists, behind **Advanced**, for a
+/// self-hosted id no catalogue could enumerate.
 private struct RemoteBackendSection: View {
     @ObservedObject var remote: RemoteTranscriptionSettings
 
     private static let setupGuideURL = URL(string: "https://github.com/island-io/mila/blob/main/docs/REMOTE_TRANSCRIPTION_SERVER.md")!
+
+    /// Picker tag for "a model id Mila has no entry for". A `nil` selection
+    /// can't be a `Picker` tag, so `Custom…` gets its own sentinel.
+    private static let customTag = "__mila.remote.model.custom__"
+
+    /// Opens itself when the configured model isn't one of the presets — a
+    /// custom id (typed, or arriving via a `.milaconfig` import) must not be
+    /// invisible just because it doesn't fit the picker.
+    @State private var showAdvanced: Bool
+
+    @MainActor
+    init(remote: RemoteTranscriptionSettings) {
+        self.remote = remote
+        _showAdvanced = State(initialValue: remote.selectedPreset == nil)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -743,26 +920,12 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                 }
-                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Defaults to OpenAI; point it at your own server for ivrit.ai or other models.")
+                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                fieldRow(label: "Model") {
-                    TextField(RemoteTranscriptionSettings.defaultModel, text: $remote.model)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                }
-
-                fieldRow(label: "English model") {
-                    TextField("Same as above", text: $remote.englishModel)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                }
-                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                modelPickerRow
 
                 fieldRow(label: "API key") {
                     SecureField("Stored in your Keychain", text: $remote.apiKey)
@@ -773,6 +936,8 @@ private struct RemoteBackendSection: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            advancedDisclosure
 
             HStack(spacing: 10) {
                 Button {
@@ -796,6 +961,131 @@ private struct RemoteBackendSection: View {
                 Label("How to host ivrit.ai (or any model) behind this API", systemImage: "book")
                     .font(.callout)
             }
+        }
+    }
+
+    // MARK: - Model
+
+    /// The picker, plus one caption describing the selection and — when the
+    /// model can't return timings — the warning that says so *before* the user
+    /// records an hour-long meeting with it.
+    @ViewBuilder
+    private var modelPickerRow: some View {
+        fieldRow(label: "Model") {
+            Picker("Model", selection: modelSelection) {
+                ForEach(RemoteModelPreset.Group.allCases, id: \.self) { group in
+                    Section(group.displayName) {
+                        ForEach(RemoteModelPreset.presets(in: group)) { preset in
+                            Text(preset.displayName).tag(preset.id)
+                        }
+                    }
+                }
+                Text("Custom…").tag(Self.customTag)
+            }
+            .labelsHidden()
+            .accessibilityIdentifier("remote.model.picker")
+        }
+
+        if let preset = remote.selectedPreset {
+            Text(preset.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text("Custom model id — set it under **Advanced** below. Mila can't vouch for a model it doesn't know; use **Test connection** to confirm the server accepts it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // Asked of the engine, not of the preset. `forModel(_:)` sends ANY
+        // `gpt-*` id as `json`, preset or not, so a hand-typed
+        // `gpt-4o-transcribe-something` loses timestamps just as surely as a
+        // listed one -- and gating the warning on a preset match is exactly
+        // how it would lose them silently.
+        if RemoteWhisperEngine.ResponseFormat.forModel(remote.model).timestamps.isUntimed {
+            noTimestampsWarning
+        }
+    }
+
+    /// Bridges the picker's `String` tag to the settings' model id.
+    ///
+    /// Reads as `customTag` whenever the configured id isn't a preset, so a
+    /// hand-typed model shows as *Custom…* rather than snapping the display to
+    /// some unrelated row. Selecting `Custom…` deliberately leaves `model`
+    /// alone — it opens the free-text field rather than clearing the value the
+    /// user is about to edit.
+    private var modelSelection: Binding<String> {
+        Binding(
+            get: { remote.selectedPreset?.id ?? Self.customTag },
+            set: { tag in
+                guard let preset = RemoteModelPreset.matching(tag) else {
+                    showAdvanced = true
+                    return
+                }
+                remote.apply(preset)
+            }
+        )
+    }
+
+    /// Losing per-segment timings is not a cosmetic downgrade — it costs SRT
+    /// timings *and* speaker labels, because local diarization has nothing to
+    /// align its speaker turns to. Say so at the point of choice; silently
+    /// degrading transcripts is what this picker exists to stop.
+    private var noTimestampsWarning: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "clock.badge.exclamationmark")
+                .foregroundStyle(.orange)
+            Text("No timestamps. This model can only return plain text, so the recording arrives as one segment: SRT export has no timings and speaker labels can't be aligned. Fine for dictation, poor for meetings.")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityIdentifier("remote.model.noTimestamps")
+    }
+
+    // MARK: - Advanced
+
+    /// The raw ids. Free text is still fully supported — a self-hosted server
+    /// can serve any model id — it just stops being the first thing the user
+    /// sees, the same treatment #144 gave "technical, set once" configuration.
+    private var advancedDisclosure: some View {
+        DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+            VStack(alignment: .leading, spacing: 8) {
+                fieldRow(label: "Model id") {
+                    TextField(RemoteTranscriptionSettings.defaultModel, text: $remote.model)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("remote.model.custom")
+                }
+                Text("Any model id your server accepts. Mila derives the response format from the id — `gpt-*` ids are sent without timestamps, anything else as a Whisper-style request (`verbose_json`).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                fieldRow(label: "English model") {
+                    TextField("Same as above", text: $remote.englishModel)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("remote.model.english")
+                }
+                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 6)
+        }
+        .font(.callout)
+        // `showAdvanced` is @State, so its initial value is used once and never
+        // recomputed. If `model` changes to a custom id while this section is on
+        // screen -- a `.milaconfig` import is the realistic way -- the picker
+        // flips to "Custom..." while the Model id field stays collapsed, leaving
+        // the value visible nowhere and un-editable. Open the disclosure when
+        // the configured id stops being one of the presets.
+        .onChange(of: remote.model) { _, _ in
+            if remote.selectedPreset == nil { showAdvanced = true }
         }
     }
 
@@ -1202,7 +1492,7 @@ private struct AIProviderSettingsTab: View {
     private var cliFields: some View {
         VStack(alignment: .leading, spacing: 6) {
             fieldRow("Executable",
-                     help: "Set this when `claude` / `cursor-agent` / `gemini` lives somewhere a GUI app won't see by default — ~/.local/bin, an asdf shim, a Homebrew prefix that isn't on the system PATH.") {
+                     help: "Only needed when Mila can't find the CLI itself — it already searches $PATH, Homebrew, ~/.local/bin, your configured npm prefix and the node version managers (nvm, Volta, asdf).") {
                 TextField("(use $PATH)", text: $settings.executablePath)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
@@ -1479,6 +1769,7 @@ private struct AIFeaturesSettingsTab: View {
                         ExamplesView(title: "Examples", items: LLMSettings.actionExamples) {
                             settings.postActionPrompt = $0
                         }
+                        transcriptByPathToggle
                     }
                 }
                 Divider()
@@ -1507,6 +1798,48 @@ private struct AIFeaturesSettingsTab: View {
         }
     }
 
+    /// Transcript delivery for the Send-to-LLM action (issue #179): paste the
+    /// transcript into the prompt, or name the recording's files and let the CLI
+    /// read them.
+    ///
+    /// Lives inside the action row rather than next to the provider picker
+    /// because it governs that one feature — title generation and the automatic
+    /// summary stay inlined on purpose (see
+    /// `LLMSettings.actionTranscriptByPath`).
+    ///
+    /// Greyed rather than hidden for a provider that can't read files, matching
+    /// how the Live AI row treats its own gates: a control that vanishes reads
+    /// as "this app can't do that", and the caption says which gate is closed.
+    private var transcriptByPathToggle: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("Send the transcript as a file path",
+                   isOn: $settings.actionTranscriptByPath)
+                .font(.callout)
+                .toggleStyle(.switch)
+                .disabled(!settings.postActionEnabled || !settings.tool.readsLocalFiles)
+                .accessibilityIdentifier("llm.action.transcriptByPath.toggle")
+            Text(transcriptByPathCaption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+        }
+        .help("Instead of pasting the transcript into the prompt, Mila names the "
+              + "recording's subtitle (.srt), transcript (.txt) and audio files and "
+              + "asks the tool to read them. The .srt keeps the timestamps the pasted "
+              + "text drops, and the tool can re-read or seek within the file instead "
+              + "of getting one pass over a blob. Needs a tool that reads local files.")
+    }
+
+    /// Say which gate is closed rather than leaving a dead switch unexplained —
+    /// same principle as `liveAICaption`.
+    private var transcriptByPathCaption: String {
+        if !settings.tool.readsLocalFiles {
+            return "Needs a local CLI — the OpenAI-compatible endpoint can't read your files."
+        }
+        return "Point the tool at the recording's .srt / .txt / audio instead of pasting the text. Keeps timestamps."
+    }
+
     /// Live AI has two independent gates on top of the user's own switch, and
     /// a switch that reads "on" while the feature is inert is exactly the
     /// legibility problem this redesign is fixing. Say which gate is closed.
@@ -1526,10 +1859,6 @@ private struct AIFeaturesSettingsTab: View {
 
     /// Shown once, at the top, instead of repeating "no provider" inside every
     /// feature that needs one.
-    ///
-    /// The pointer at the AI Provider destination is a button rather than
-    /// prose: with the sidebar (#177) a cross-reference inside Settings can
-    /// actually navigate, so it does.
     private var notConfiguredBanner: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -1538,6 +1867,11 @@ private struct AIFeaturesSettingsTab: View {
                 Text("No AI provider yet.")
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
+                // A button, not prose: with the sidebar (#177) a
+                // cross-reference inside Settings can actually navigate, so
+                // it does. This is also the only producer of
+                // `SettingsNavigation.pendingTab` inside Settings, which
+                // until now had consumers but no caller.
                 Button("Set one up in AI Provider") {
                     SettingsNavigation.shared.pendingTab = .aiProvider
                 }
@@ -2020,6 +2354,10 @@ private struct DiarizationSettingsTabContent: View {
 
             KnownSpeakersSection()
 
+            Divider()
+
+            VoiceRecognitionSection(diarization: diarization)
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2217,6 +2555,94 @@ private struct KnownSpeakersSection: View {
     }
 }
 
+/// Settings → Speakers → voice recognition: the opt-in switch for
+/// cross-recording recognition, plus the delete path for whatever it has
+/// already stored. Sits below the known-speakers list.
+///
+/// The off-state footprint is deliberately one toggle and one caption — the
+/// shape `ObsidianSettingsSection.enableCard` uses, in the flat,
+/// divider-separated style the rest of this tab uses rather than a card —
+/// with one addition that only appears when it has to. While profiles from
+/// an earlier opt-in are still on disk, the delete button stays visible
+/// *even with the feature off*: opting out stops all reading and writing but
+/// does not destroy the user's work, so deleting is a separate, explicit
+/// decision, and it would be dishonest for the opt-out to be the only hint
+/// that voice data is still at rest.
+///
+/// The caption is the full disclosure in both states rather than a teaser
+/// that expands once you've already switched it on. What gets stored, where
+/// it goes, and the fact that it never leaves the Mac are things you need
+/// *before* deciding, not after.
+private struct VoiceRecognitionSection: View {
+    /// The diarization settings this tab is already showing. Voice
+    /// recognition rides on the diarizer's embedding pool, so the section
+    /// observes it to explain why an enabled toggle might not be doing
+    /// anything yet.
+    @ObservedObject var diarization: DiarizationSettings
+    @EnvironmentObject private var settings: VoiceRecognitionSettings
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
+    @State private var showDeleteConfirmation = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Voice recognition")
+                .font(.callout.weight(.semibold))
+
+            Toggle("Recognise returning speakers by voice", isOn: $settings.isEnabled)
+                .accessibilityIdentifier("speakers.voiceRecognition.toggle")
+
+            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac and are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // An enabled toggle does nothing until the diarizer can hand it
+            // embeddings, so say so rather than letting it look broken.
+            if settings.isEnabled, !diarization.isConfigured {
+                Text("Waiting on speaker diarization above — until that reports Ready there are no voices to learn from, and nothing is stored.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("speakers.voiceRecognition.waiting")
+            }
+
+            if profileStore.hasStoredProfilesOnDisk {
+                Divider()
+                HStack(alignment: .firstTextBaseline) {
+                    Text(storedProfilesLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 12)
+                    Button("Delete Voice Profiles", role: .destructive) {
+                        showDeleteConfirmation = true
+                    }
+                    .font(.caption)
+                    .accessibilityIdentifier("speakers.voiceRecognition.delete")
+                }
+                .alert("Delete stored voice profiles?", isPresented: $showDeleteConfirmation) {
+                    Button("Delete", role: .destructive) {
+                        profileStore.deleteAllProfiles()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This deletes speaker-profiles.json and every voice fingerprint in it. Speaker names already on your recordings are untouched, but nobody will be recognised in new ones. This can't be undone.")
+                }
+            }
+        }
+    }
+
+    /// While the feature is off the profiles file is deliberately never
+    /// parsed, so there is no count to show — only the fact that it exists.
+    private var storedProfilesLabel: String {
+        guard settings.isEnabled else {
+            return "Voice profiles from an earlier session are still stored on this Mac. Turning the switch back on picks up where you left off; they are only removed if you remove them."
+        }
+        let n = profileStore.profiles.count
+        return n == 1 ? "1 voice profile stored." : "\(n) voice profiles stored."
+    }
+}
+
 // MARK: - Meetings
 
 /// Settings → Meetings. Toggles the floating "Zoom meeting detected" prompt
@@ -2242,6 +2668,8 @@ private struct MeetingsSettingsTab: View {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.regular)
+                // Meetings' per-section probe for `DetailLayoutUITests`.
+                .accessibilityIdentifier("meetings.enable.toggle")
 
                 Divider()
 

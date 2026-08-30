@@ -352,6 +352,7 @@ struct MilaApp: App {
     /// StateObject purely so it stays alive — the completion hooks capture it
     /// weakly.
     @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
+    @StateObject private var mcpAccessSettings: MCPAccessSettings
     @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
@@ -360,7 +361,16 @@ struct MilaApp: App {
     @StateObject private var speakerDirectory: SpeakerDirectory
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
+    /// Mirrors the live transcript to `live/current.json` for external
+    /// tools (mila-mcp). Not observed by any view; held as a StateObject
+    /// purely so it survives SwiftUI re-inits like the other singletons.
+    @StateObject private var liveSidecarWriter: LiveTranscriptSidecarWriter
     @StateObject private var updater = UpdaterViewModel()
+    /// Opt-in switch for cross-recording voice recognition (off by default).
+    @StateObject private var voiceRecognitionSettings: VoiceRecognitionSettings
+    /// Persisted voice fingerprints behind that feature. Inert — nothing
+    /// read, nothing written — until the setting above is turned on.
+    @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
@@ -528,6 +538,33 @@ struct MilaApp: App {
         // transcript fallback) once its summary is ready, then optionally
         // committed + pushed to git. Off by default.
         let obsidianSettings = ObsidianVaultSettings()
+        // Opt-in gate for the bundled mila-mcp helper. Constructing it
+        // mirrors the persisted flag back out to `mcp-access.json`, so the
+        // helper's view of consent re-converges on every launch.
+        //
+        // The readiness half is bound to the store: consent alone isn't
+        // enough, because a `store-location.json` write that failed after a
+        // relocation would leave the helper reading the OLD store and
+        // answering from it. `storeIsDiscoverable` is a closure, not a
+        // snapshot, so it is re-consulted on every mirror — the store is
+        // already constructed above, and the launch-time relocation on line
+        // ~379 has already run, so the first mirror sees the real verdict.
+        //
+        // `store` is captured STRONGLY on purpose. A weak capture that went
+        // nil would fall back to the `?? true` default and quietly re-open
+        // the gate — a fail-open in the one place that must not have one.
+        // There is no cycle: the store's callback below holds `mcpAccess`
+        // weakly, and both objects are `@StateObject`-lived anyway.
+        let mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
+            store.storeLocationIsDiscoverable
+        })
+        // A mid-session relocation can flip discoverability either way, and
+        // the helper's gate must follow immediately rather than at the next
+        // launch. The store only calls this when the verdict actually
+        // changes, so a normal relocation doesn't rewrite the gate file.
+        store.onStoreLocationDiscoverabilityChanged = { [weak mcpAccess] in
+            mcpAccess?.refreshMirror()
+        }
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
@@ -546,7 +583,23 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+        // Live-transcript sidecar for external tools (mila-mcp). Anchored
+        // to the store's original root so tests / UI-test temp stores stay
+        // isolated from the user's real app-support directory.
+        //
+        // Constructed HERE, above `onTranscriptionCompleted`, because that hook
+        // captures it to publish the deferred batch handoff. It only needs
+        // `store`; the `actions` wiring stays further down with the rest.
+        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
+        sidecarWriter.cleanupAtLaunch()
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
+            // A recording whose live transcript wasn't final closed its live
+            // sidecar WITHOUT a handoff id, because at Stop the batch worker
+            // hadn't produced the transcript yet. It just did — so publish the
+            // handoff now, completing what `finish(…, transcriptIsFinal:
+            // false)` deferred. A no-op unless this is that exact recording
+            // and its snapshot is still the one on disk; see `attachHandoff`.
+            sidecarWriter?.attachHandoff(forRecording: rec.id)
             // Obsidian export is driven off the summarizer's completion hook.
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
@@ -570,6 +623,196 @@ struct MilaApp: App {
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
+        // Cross-recording voice recognition. Opt-in and off by default:
+        // `voiceSettings.isConfigured` is the single gate, and it means
+        // "the user turned it on AND diarization can actually produce
+        // embeddings" — see `.claude/rules/feature-gates.md`. Readiness is
+        // injected as a closure so the settings object can read the
+        // diarization gate without being able to mutate it.
+        let voiceSettings = VoiceRecognitionSettings()
+        voiceSettings.diarizationReady = { [weak diarSettings] in
+            diarSettings?.isConfigured ?? false
+        }
+        _voiceRecognitionSettings = StateObject(wrappedValue: voiceSettings)
+        let profileStoreRef = SpeakerProfileStore(settings: voiceSettings)
+        _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
+        let voiceSnapshots = ObservedVoiceSnapshots()
+        voiceSnapshots.clearOnOptOut(of: voiceSettings)
+        // …and the third holder of copied voice data: the live pool. The two
+        // lines above unload the profiles (`SpeakerProfileStore`'s own
+        // observer) and drop the snapshots, but `seedPool` handed the
+        // diarizer its own copy of every centroid at record-start, so an
+        // opt-out mid-recording otherwise leaves `assign` matching against
+        // stored voices for the rest of it. The write gates stop the result
+        // being persisted; they do not stop it being *read*, and the user
+        // still watches their transcript auto-fill with names from a feature
+        // they just switched off.
+        //
+        // Exactly the deletion path's problem, so it gets the deletion
+        // path's remedy — see `addDeletionObserver` below. Opt-out is the
+        // broader of the two, so it forgets every seeded entry rather than
+        // named ones.
+        voiceSettings.addEnabledObserver { [weak liveDiar] nowEnabled in
+            guard !nowEnabled else { return }
+            liveDiar?.forgetSeededProfiles()
+        }
+        // Auto-naming + the per-recording snapshot, driven by the finalize
+        // drain rather than by observing `isRecording`. The drain hands over
+        // the id of the recording that actually finished, and calls
+        // synchronously inside the window where the diarizer pool still
+        // belongs to it — see `RecognisedSpeakerAssigner`.
+        let assigner = RecognisedSpeakerAssigner(store: store,
+                                                diarizer: liveDiar,
+                                                snapshots: voiceSnapshots,
+                                                settings: voiceSettings,
+                                                profileStillStored: { name in
+                                                    profileStoreRef.profileExists(name: name)
+                                                })
+        // Deleting voice profiles has to reach the recording that is already
+        // running, not just memory and the file. The pool was seeded from
+        // these profiles at record-start and keeps its own copy of every
+        // centroid, so without this the rest of the recording goes on
+        // matching the erased voice and `assigner.finish` writes it back at
+        // stop — the deleted file reappears, holding the same person's
+        // fingerprint. Same immediacy as the opt-out path above.
+        profileStoreRef.addDeletionObserver { [weak liveDiar] deletion in
+            switch deletion {
+            case .all: liveDiar?.forgetSeededProfiles()
+            case .named(let names): liveDiar?.forgetSeededProfiles(named: names)
+            }
+        }
+        actions.onRecordingFinalized = { [assigner] recordingID in
+            assigner.finish(recording: recordingID)
+        }
+        // Save a voice profile when a speaker is named — if the live
+        // diarizer observed that speaker *in that recording*, persist it.
+        // The store refuses writes while the feature is off; the guard here
+        // means an opted-out user's voice isn't so much as looked up.
+        //
+        // Resolved through the per-recording snapshot keyed on
+        // `recordingID`, never against the live pool. `SPEAKER_00` restarts from zero on every
+        // `reset()`, so a live-pool lookup silently returned the *current*
+        // recording's speaker for a name applied to an older one — writing a
+        // stranger's voice into the named profile. A recording with no
+        // snapshot resolves to nil and persists nothing, which is the honest
+        // answer: its pool is gone.
+        //
+        // The snapshot holds what was observed in that recording, not the
+        // pool's matching centroid — for a seeded speaker the latter carries
+        // weight already stored on disk, and folding it back counts it twice.
+        // This is the only place voice profiles are written, so a recognised
+        // speaker merges exactly once per recording.
+        let voiceLog = os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceProfile")
+        store.onSpeakerNamed = { [weak store, weak diarSettings] recordingID, rawID, name in
+            guard voiceSettings.isConfigured else { return }
+            if let observed = voiceSnapshots.observation(forSpeaker: rawID,
+                                                         in: recordingID) {
+                // Snapshot exists (live or batch) — save immediately.
+                profileStoreRef.updateProfile(
+                    name: name,
+                    embedding: observed.observedCentroid,
+                    sampleCount: observed.observedCount
+                )
+            } else if let store {
+                // No snapshot (old recording, never re-transcribed).
+                // Extract the embedding on demand (~0.5s) from the
+                // speaker's longest segment in this recording.
+                guard let rec = store.recordings.first(where: { $0.id == recordingID }) else { return }
+                var best: (start: Double, end: Double)?
+                for seg in rec.segments where seg.speaker == rawID {
+                    let dur = seg.end - seg.start
+                    if best == nil || dur > (best!.end - best!.start) {
+                        best = (seg.start, seg.end)
+                    }
+                }
+                guard let segment = best else { return }
+                let pythonPath = diarSettings?.pythonPath ?? "/usr/bin/python3"
+                let capturedName = name
+                let capturedRecID = recordingID
+                let capturedRawID = rawID
+                Task.detached(priority: .utility) {
+                    let wavURL = await store.audioURL(for: rec)
+                    guard FileManager.default.fileExists(atPath: wavURL.path) else { return }
+                    do {
+                        let embeddings = try await SpeakerDiarizer.embedSpeakers(
+                            wavURL: wavURL, pythonPath: pythonPath,
+                            speakerSegments: [capturedRawID: segment])
+                        guard let emb = embeddings[capturedRawID] else { return }
+                        voiceLog.log("on-demand voice profile saved for \(capturedRawID, privacy: .public)")
+                        await MainActor.run {
+                            voiceSnapshots.record(
+                                [(id: capturedRawID, observedCentroid: emb.map { Float($0) },
+                                  observedCount: 1, profileName: nil)],
+                                for: capturedRecID)
+                            profileStoreRef.updateProfile(
+                                name: capturedName,
+                                embedding: emb.map { Float($0) },
+                                sampleCount: 1)
+                        }
+                    } catch {
+                        voiceLog.log("on-demand embedding failed: \(error.localizedDescription, privacy: .public)")
+                    }
+                }
+            }
+        }
+
+        // Batch voice matching: after any transcription completes, embed
+        // each speaker's longest segment and match against stored voice
+        // profiles. Uses embedSpeakers (embedding model only, ~0.5s)
+        // instead of extractEmbeddings (full pyannote pipeline, 30-60min).
+        let existingCallback = svc.onTranscriptionCompleted
+        svc.onTranscriptionCompleted = { [weak store, weak diarSettings] rec, wasRetranscription in
+            existingCallback?(rec, wasRetranscription)
+            guard voiceSettings.isConfigured,
+                  !profileStoreRef.profiles.isEmpty,
+                  rec.speakerNames.isEmpty,
+                  rec.segments.contains(where: { $0.speaker != nil }),
+                  let store else { return }
+            // Build a map of each speaker's longest segment.
+            var longest: [String: (start: Double, end: Double)] = [:]
+            for seg in rec.segments {
+                guard let sp = seg.speaker else { continue }
+                let dur = seg.end - seg.start
+                if let existing = longest[sp] {
+                    if dur > (existing.end - existing.start) {
+                        longest[sp] = (seg.start, seg.end)
+                    }
+                } else {
+                    longest[sp] = (seg.start, seg.end)
+                }
+            }
+            guard !longest.isEmpty else { return }
+            let pythonPath = diarSettings?.pythonPath ?? "/usr/bin/python3"
+            Task.detached(priority: .utility) {
+                let wavURL = await store.audioURL(for: rec)
+                guard FileManager.default.fileExists(atPath: wavURL.path) else { return }
+                let embeddings = (try? await SpeakerDiarizer.embedSpeakers(
+                    wavURL: wavURL, pythonPath: pythonPath,
+                    speakerSegments: longest)) ?? [:]
+                guard !embeddings.isEmpty else { return }
+                await MainActor.run {
+                    // Store embeddings as snapshots so naming a speaker
+                    // later (via onSpeakerNamed) can save the voice
+                    // profile even for batch-transcribed recordings.
+                    let entries = embeddings.map { (rawID, emb) in
+                        (id: rawID,
+                         observedCentroid: emb.map { Float($0) },
+                         observedCount: 1,
+                         profileName: nil as String?)
+                    }
+                    voiceSnapshots.record(entries, for: rec.id)
+
+                    for (rawID, emb) in embeddings {
+                        if let profile = profileStoreRef.match(embedding: emb) {
+                            store.setSpeakerName(
+                                profile.name, forSpeaker: rawID,
+                                recordingID: rec.id)
+                        }
+                    }
+                }
+            }
+        }
+
         // Auto-drop accidental short+empty captures (issue #61). A recording
         // that finishes transcription with no text AND under the user's
         // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
@@ -591,6 +834,7 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
+        actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -630,6 +874,7 @@ struct MilaApp: App {
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
         _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
+        _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
@@ -644,6 +889,7 @@ struct MilaApp: App {
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
         _configImporter = StateObject(wrappedValue: configImporter)
+        _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -696,6 +942,8 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 .sheet(item: Binding(
                     get: { configImporter.pending },
@@ -719,6 +967,7 @@ struct MilaApp: App {
                     Text(configImporter.errorMessage ?? "")
                 }
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
         .commands {
@@ -774,6 +1023,8 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 // Settings ▸ General shows the Sparkle-backed
                 // "Automatically check for updates" toggle, so the Settings
@@ -781,8 +1032,16 @@ struct MilaApp: App {
                 // and the menu command use — never a second one.
                 .environmentObject(updater)
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
+        // Settings used to be pinned to 700×560 by a rigid `.frame` inside
+        // `SettingsView`; since #177 it is a resizable sidebar window whose
+        // content declares min/ideal/max instead. `.contentSize` is what
+        // turns those declarations into the window's own resize limits —
+        // without it the window would not honour the minimum and could be
+        // dragged narrower than the destinations can lay out in.
+        .windowResizability(.contentSize)
     }
 
     /// Build a diagnostic zip and let the user pick where to save it.
@@ -1239,6 +1498,7 @@ struct MilaApp: App {
         // drain belongs here (sleep/lock/quit path) or to
         // `stopRecording` (Stop-button path).
         let actionsRef: QuickActionsController? = actions
+        let sidecarWriter = liveSidecarWriter
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
@@ -1313,10 +1573,19 @@ struct MilaApp: App {
                     // to a recording that never ran the LLM loop.
                     // Cursor flagged on c95d2bb.
                     aiSession.cancel()
+                    // Still surface the recording to external pollers
+                    // (mila-mcp): they get an honest "recording, but no
+                    // live text on this hardware" status instead of
+                    // silence.
+                    sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
+                // Open the live-transcript sidecar for this recording so
+                // external tools (mila-mcp) can follow the meeting; the
+                // feed loop below streams content into it.
+                sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
                 // Live transcription runs on every recording — it's how
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
@@ -1373,6 +1642,14 @@ struct MilaApp: App {
                 // By the time this runs, the session has already been freshly
                 // started for this recording.
                 diarizer.reset()
+                // Seed the embedding pool with known voices only when the
+                // user opted in. `seedEntries()` refuses on its own too, and
+                // while off it has nothing to hand over regardless (the
+                // profiles file is never parsed) — three independent reasons
+                // an opted-out recording starts from a blank pool.
+                if voiceRecognitionSettings.isConfigured {
+                    diarizer.seedPool(with: speakerProfileStore.seedEntries())
+                }
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.
@@ -1405,7 +1682,7 @@ struct MilaApp: App {
                     }
 
                 feedTask?.cancel()
-                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, aiSettings, llmSettingsRef] in
+                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
                     var lastFed = ""
                     guard let transcriber else { return }
                     for await _ in transcriber.$segments.values {
@@ -1426,6 +1703,14 @@ struct MilaApp: App {
                         if let diarizer {
                             transcriber.applySpeakerLabels(diarizer.intervals)
                         }
+                        // Mirror the tick to the on-disk live sidecar
+                        // (throttled + deduped inside the writer).
+                        let liveSegments = transcriber.segments.map {
+                            TranscriptSegment(start: $0.startSeconds, end: $0.endSeconds,
+                                              text: $0.text, speaker: $0.speaker)
+                        }
+                        sidecarWriter?.update(segments: liveSegments,
+                                              speakerNames: transcriber.speakerNames)
                         if aiActive {
                             let text = transcriber.formattedTranscript
                             if text != lastFed, !text.isEmpty {
@@ -1515,6 +1800,11 @@ struct MilaApp: App {
                     // `stopRecording`, which owns finalize and cancels the
                     // session itself once its snapshot is stored.
                     aiSession.cancel()
+                    // Close the live sidecar with no handoff id — this
+                    // teardown path (sleep/lock/quit/cancelAll) has no
+                    // saved Recording yet; the Stop-button path closes
+                    // it from stopRecording with the real id instead.
+                    sidecarWriter.finish(recordingID: nil)
                 }
                 // Note: no aiSession.cancel() out here, outside the branch
                 // above — this handler fires during `session.stop()`,
@@ -1881,6 +2171,43 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         applyChrome(to: window)
     }
 
+    /// Whether `applyChrome` must leave a window alone.
+    ///
+    /// Pure and `static` so the decision is unit-testable without an
+    /// `NSWindow` — see `WindowChromeExemptionTests`. The two exemptions
+    /// are deliberately different shapes, because identifiers turn out
+    /// to be a usable discriminator for only one of them:
+    ///
+    /// - **Settings** is matched on its identifier, lowercased. SwiftUI
+    ///   names that window `com_apple_SwiftUI_Settings_window` — capital
+    ///   `S`. The original guard tested `id.contains("settings")`, which
+    ///   is case-sensitive and therefore never matched, so the early
+    ///   return never fired and this whole method ran on the Settings
+    ///   window on every `didBecomeKeyNotification` (#207). Lowercasing
+    ///   once and comparing is what actually honours the intent.
+    ///
+    /// - **Panels** are matched on their *class*, not their identifier,
+    ///   and this replaces the old `id.contains("alert")` arm rather
+    ///   than merely case-correcting it. That arm could never have
+    ///   worked: an `NSAlert`'s window is an `_NSAlertPanel` whose
+    ///   identifier is an opaque AppKit nib id — `_NS:87` when probed on
+    ///   macOS 26 — containing no recognisable substring in any case,
+    ///   and not something to depend on across OS versions. A bare
+    ///   `NSPanel` and an `NSOpenPanel` report no identifier at all, so
+    ///   `if let id = window.identifier` fell through for them too and
+    ///   they were also being restyled. Alerts, open/save panels, and
+    ///   the dictation overlay are all `NSPanel`s, and none of them
+    ///   wants a toolbar-separator tweak; the main window is a plain
+    ///   `NSWindow`, so it is unaffected.
+    /// `nonisolated` because it is pure — it touches no delegate state and
+    /// needs no main-actor context, which is also what lets the unit tests
+    /// call it synchronously.
+    nonisolated static func isChromeExempt(identifier: String?, isPanel: Bool) -> Bool {
+        if isPanel { return true }
+        guard let identifier else { return false }
+        return identifier.lowercased().contains("settings")
+    }
+
     /// Apply Mila's window chrome tweaks to a single NSWindow. Strips
     /// the hairline separator that renders below the toolbar in the
     /// detail pane but stops at the sidebar splitter — looks like a
@@ -1892,8 +2219,8 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// macOS version + SwiftUI version, either or both can produce the
     /// line. Setting both is harmless and covers everything.
     private func applyChrome(to window: NSWindow) {
-        if let id = window.identifier?.rawValue,
-           id.contains("settings") || id.contains("alert") {
+        if Self.isChromeExempt(identifier: window.identifier?.rawValue,
+                               isPanel: window is NSPanel) {
             return
         }
         // Belt and suspenders: queue the property change behind any

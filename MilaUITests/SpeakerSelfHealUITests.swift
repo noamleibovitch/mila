@@ -63,23 +63,23 @@ final class SpeakerSelfHealUITests: XCTestCase {
         let settingsApp = XCUIApplication()
         settingsApp.typeKey(",", modifierFlags: .command)
 
-        // SettingsView is a NavigationSplitView (#177): destinations are rows
-        // in the sidebar list, each carrying a stable identifier. Fall back to
-        // the visible label for older builds / if the identifier is dropped by
-        // the AX tree.
-        var speakersTab = app.descendants(matching: .any)
-            // Mirrors `SettingsTab.speakers.accessibilityID`; the UI-test
-            // target can't import the app's types.
+        // SettingsView is a sidebar since #177: destinations are rows in a
+        // list, each carrying a stable identifier. Mirrors
+        // `SettingsTab.speakers.accessibilityID` — the UI-test target can't
+        // import the app's types, so `AISettingsKeyCompatibilityTests` pins
+        // the string on the app side. Falls back to the visible label if the
+        // identifier ever stops reaching the accessibility tree.
+        var speakersSection = app.descendants(matching: .any)
             .matching(identifier: "settings.section.speakers")
             .firstMatch
-        if !speakersTab.waitForExistence(timeout: 10) {
-            speakersTab = app.descendants(matching: .any)
+        if !speakersSection.waitForExistence(timeout: 10) {
+            speakersSection = app.descendants(matching: .any)
                 .matching(NSPredicate(format: "label == 'Speakers'"))
                 .firstMatch
         }
-        XCTAssertTrue(speakersTab.waitForExistence(timeout: 10),
+        XCTAssertTrue(speakersSection.waitForExistence(timeout: 10),
                       "Speakers settings destination not found")
-        speakersTab.click()
+        speakersSection.click()
 
         // Toggle "Enable speaker diarization" on.
         let toggle = app.checkBoxes["speakers.enable.toggle"]

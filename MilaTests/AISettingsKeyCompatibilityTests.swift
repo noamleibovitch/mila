@@ -204,7 +204,7 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
 
     // MARK: - Sidebar destination inventory (#177)
 
-    func test_every_settings_destination_is_reachable_from_the_sidebar() {
+    func test_every_settings_destination_is_presentable_in_the_sidebar() {
         // `SettingsView` builds the sidebar from `allCases` and switches the
         // detail pane on the same enum, so a case with no `switch` arm is a
         // compile error and a case missing from `allCases` is impossible.
@@ -228,16 +228,44 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         XCTAssertEqual(Set(all.map(\.id)).count, all.count,
                        "Two destinations share a List identity")
 
-        // `SpeakerSelfHealUITests` hardcodes this string — the UI-test target
-        // cannot import the app's types, so this is the only thing keeping
-        // the two in sync.
-        XCTAssertEqual(SettingsTab.speakers.accessibilityID,
-                       "settings.section.speakers")
-
-        // Sidebar order is `allCases` order, which is the declaration order,
-        // which is the raw-value order. The old left-to-right tab order is
+        // Sidebar order is `allCases` order, which is declaration order,
+        // which is raw-value order. The old left-to-right tab order is
         // preserved top-to-bottom.
         XCTAssertEqual(all.map(\.rawValue), Array(0..<all.count))
+    }
+
+    /// `MilaUITests` hardcode these strings — the UI-test target cannot
+    /// import the app's types, so this is the only thing keeping the two
+    /// sides in sync. `DetailLayoutUITests.settingsSections` drives every
+    /// Settings assertion off them, and `SpeakerSelfHealUITests` clicks
+    /// `settings.section.speakers` by name.
+    func test_destination_identifiers_match_the_strings_the_gui_tests_use() {
+        XCTAssertEqual(SettingsTab.general.accessibilityID, "settings.section.general")
+        XCTAssertEqual(SettingsTab.audio.accessibilityID, "settings.section.audio")
+        XCTAssertEqual(SettingsTab.models.accessibilityID, "settings.section.models")
+        XCTAssertEqual(SettingsTab.aiProvider.accessibilityID, "settings.section.aiProvider")
+        XCTAssertEqual(SettingsTab.aiFeatures.accessibilityID, "settings.section.aiFeatures")
+        XCTAssertEqual(SettingsTab.speakers.accessibilityID, "settings.section.speakers")
+        XCTAssertEqual(SettingsTab.meetings.accessibilityID, "settings.section.meetings")
+        XCTAssertEqual(SettingsTab.voiceMemos.accessibilityID, "settings.section.voiceMemos")
+        XCTAssertEqual(SettingsTab.storage.accessibilityID, "settings.section.storage")
+    }
+
+    /// The Settings window floor has to leave the destinations a workable
+    /// content width. #194's post-mortem called this out specifically
+    /// (Models and AI Provider are the widest), and a future tweak to the
+    /// sidebar width or the inset could quietly eat into it.
+    func test_settings_window_floor_leaves_room_for_the_widest_destination() {
+        // 188 pt sidebar + 560 pt of content + 2 × 20 pt inset. Pinned as
+        // literals on purpose: this is a tripwire, so shrinking the content
+        // budget has to be a deliberate edit here rather than a side effect
+        // of widening the sidebar.
+        XCTAssertEqual(SettingsView.minWindowWidth, 788,
+                       "Settings' narrowest window no longer leaves 560 pt of destination content")
+        // 188 pt sidebar + the old fixed window's 700 pt of content + inset,
+        // so first launch is not a downgrade from the tab strip.
+        XCTAssertEqual(SettingsView.idealWindowWidth, 928,
+                       "Settings' default window no longer offers the 700 pt of content the fixed window had")
     }
 
     // MARK: - Controls the two-tab split moved between screens
