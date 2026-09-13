@@ -2745,23 +2745,49 @@ private struct MeetingsSettingsTab: View {
                         .foregroundStyle(.tint)
                     Text(app.displayName)
                     Spacer()
-                    if settings.isDisabled(forBundleID: app.bundleID) {
-                        Text("Silenced")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if !settings.enabled {
-                        Text("Off")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        Text("On")
-                            .font(.caption)
-                            .foregroundStyle(.green)
+                    Picker("", selection: appModeBinding(for: app.bundleID)) {
+                        Text("Ask").tag(AppRecordingMode.ask)
+                        Text("Auto").tag(AppRecordingMode.auto)
+                        Text("Off").tag(AppRecordingMode.off)
                     }
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                    .disabled(!settings.enabled)
                 }
                 .padding(.vertical, 4)
             }
+            Text("Ask: prompt when a meeting is detected. Auto: start and stop recording automatically with a 10-second countdown. Off: ignore this app.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private enum AppRecordingMode {
+        case ask, auto, off
+    }
+
+    private func appModeBinding(for bundleID: String) -> Binding<AppRecordingMode> {
+        Binding(
+            get: {
+                if settings.isDisabled(forBundleID: bundleID) { return .off }
+                if settings.isAutoStart(forBundleID: bundleID) { return .auto }
+                return .ask
+            },
+            set: { mode in
+                switch mode {
+                case .ask:
+                    settings.reenable(bundleID: bundleID)
+                    settings.setAutoStart(bundleID: bundleID, enabled: false)
+                case .auto:
+                    settings.reenable(bundleID: bundleID)
+                    settings.setAutoStart(bundleID: bundleID, enabled: true)
+                case .off:
+                    settings.setAutoStart(bundleID: bundleID, enabled: false)
+                    settings.disable(bundleID: bundleID)
+                }
+            }
+        )
     }
 
     @ViewBuilder

@@ -30,6 +30,14 @@ final class MeetingDetectionSettings: ObservableObject {
             defaults.set(joined, forKey: Keys.disabledBundleIDs)
         }
     }
+    /// Apps that auto-start/stop recording with a countdown prompt
+    /// instead of waiting for user action.
+    @Published private(set) var autoStartBundleIDs: Set<String> {
+        didSet {
+            let joined = autoStartBundleIDs.sorted().joined(separator: ",")
+            defaults.set(joined, forKey: Keys.autoStartBundleIDs)
+        }
+    }
 
     private let defaults: UserDefaults
 
@@ -44,6 +52,10 @@ final class MeetingDetectionSettings: ObservableObject {
         let raw = defaults.string(forKey: Keys.disabledBundleIDs) ?? ""
         self.disabledBundleIDs = Set(
             raw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        )
+        let autoRaw = defaults.string(forKey: Keys.autoStartBundleIDs) ?? ""
+        self.autoStartBundleIDs = Set(
+            autoRaw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         )
     }
 
@@ -69,8 +81,20 @@ final class MeetingDetectionSettings: ObservableObject {
         disabledBundleIDs = copy
     }
 
+    func isAutoStart(forBundleID bundleID: String) -> Bool {
+        autoStartBundleIDs.contains(bundleID)
+    }
+
+    func setAutoStart(bundleID: String, enabled: Bool) {
+        var copy = autoStartBundleIDs
+        if enabled { copy.insert(bundleID) }
+        else { copy.remove(bundleID) }
+        autoStartBundleIDs = copy
+    }
+
     private enum Keys {
         static let enabled = "meetingDetection.enabled"
         static let disabledBundleIDs = "meetingDetection.disabledBundleIDs"
+        static let autoStartBundleIDs = "meetingDetection.autoStartBundleIDs"
     }
 }

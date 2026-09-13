@@ -176,14 +176,13 @@ final class MeetingPromptCoordinator: ObservableObject {
         let view = MeetingPromptView(
             app: app,
             kind: .start,
+            autoAct: settings.isAutoStart(forBundleID: app.bundleID),
             onPrimary: { [weak self] in
                 self?.hidePanel()
                 Task { @MainActor [weak self] in
-                    // Auto-prompt always captures system audio — the
-                    // whole point of detecting a meeting is to grab the
-                    // other participants' audio alongside the user's
-                    // mic. If the user only wanted mic, they can switch
-                    // sources from the recording chip after the fact.
+                    // Guard: if the user already started recording
+                    // manually during the countdown, don't toggle it off.
+                    guard self?.actions.isRecording != true else { return }
                     await self?.actions.toggleRecord(withSystemAudio: true)
                 }
             },
@@ -198,6 +197,13 @@ final class MeetingPromptCoordinator: ObservableObject {
             onSilenceApp: { [weak self] in
                 self?.settings.disable(bundleID: app.bundleID)
                 self?.hidePanel()
+            },
+            onEnableAuto: { [weak self] in
+                self?.settings.setAutoStart(bundleID: app.bundleID, enabled: true)
+                self?.hidePanel()
+                Task { @MainActor [weak self] in
+                    await self?.actions.toggleRecord(withSystemAudio: true)
+                }
             }
         )
         presentPanel(hosting: view)
@@ -209,9 +215,13 @@ final class MeetingPromptCoordinator: ObservableObject {
         let view = MeetingPromptView(
             app: app,
             kind: .stop,
+            autoAct: settings.isAutoStart(forBundleID: app.bundleID),
             onPrimary: { [weak self] in
                 self?.hidePanel()
                 Task { @MainActor [weak self] in
+                    // Guard: if the user already stopped recording
+                    // manually during the countdown, don't try again.
+                    guard self?.actions.isRecording == true else { return }
                     await self?.actions.stopRecording()
                 }
             },
@@ -291,9 +301,14 @@ private struct MeetingPromptView: View {
 
     let app: MeetingDetector.App
     let kind: Kind
+    /// When true, the timer auto-triggers `onPrimary` instead of
+    /// `onDismiss` — used for per-app auto-start/stop.
+    let autoAct: Bool
     let onPrimary: () -> Void
     let onDismiss: () -> Void
     let onSilenceApp: () -> Void
+    /// Enable auto-start/stop for this app and start recording now.
+    var onEnableAuto: (() -> Void)?
 
     /// How long the prompt stays up if the user doesn't interact.
     private let autoDismissSeconds: Double = 10
@@ -363,6 +378,13 @@ private struct MeetingPromptView: View {
     }
 
     private var subtitleText: String {
+        if autoAct {
+            let remaining = max(0, Int(ceil(autoDismissSeconds - elapsed)))
+            switch kind {
+            case .start: return "Starting recording in \(remaining)…"
+            case .stop:  return "Stopping recording in \(remaining)…"
+            }
+        }
         switch kind {
         case .start: return "Want Mila to transcribe this call?"
         case .stop:  return "Stop recording now?"
@@ -377,6 +399,7 @@ private struct MeetingPromptView: View {
     }
 
     private var dismissButtonText: String {
+        if autoAct { return "Cancel" }
         switch kind {
         case .start: return "Not now"
         case .stop:  return "Keep recording"
@@ -458,6 +481,22 @@ private struct MeetingPromptView: View {
 
     private var expandedActions: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let onEnableAuto, kind == .start, !autoAct {
+                Button {
+                    guard !dismissed else { return }
+                    dismissed = true
+                    onEnableAuto()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "play.circle")
+                            .font(.caption)
+                        Text("Always start for \(app.displayName)")
+                            .font(.callout)
+                    }
+                    .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+            }
             Button(action: triggerSilence) {
                 HStack(spacing: 6) {
                     Image(systemName: "bell.slash")
@@ -506,7 +545,7 @@ private struct MeetingPromptView: View {
         if hovering { return }   // freeze the countdown while the cursor is over the card
         elapsed += dt
         if elapsed >= autoDismissSeconds {
-            triggerDismiss()
+            if autoAct { triggerPrimary() } else { triggerDismiss() }
         }
     }
 
