@@ -229,6 +229,8 @@ you entered is preserved. Disable the toggle for subsequent live recordings.
 
 ## Changelog
 
+- **Unreleased** — Quitting during remote transcription safely cancels uploads and leaves unfinished recordings available for automatic retry on the next launch.
+
 Newest first. Dates are release dates.
 
 - **Unreleased** — Optional batch-only recording defers live processing until
