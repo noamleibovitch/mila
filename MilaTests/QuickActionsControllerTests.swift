@@ -74,6 +74,17 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertNil(session.fileURL)
     }
 
+    func test_busy_app_capture_dismisses_picker_without_replacing_recording() async {
+        let url = store.freshAudioURL(suggestedName: "Manual picker safeguard")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.isAppPickerShown = true
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertFalse(controller.isAppPickerShown)
+        XCTAssertEqual(session.fileURL, url)
+        XCTAssertTrue(controller.isRecording)
+        await controller.discardFakeRecordingForTesting()
+    }
+
     // MARK: - Pause / resume
 
     /// Pause and resume drive the session state through the controller.

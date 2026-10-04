@@ -112,6 +112,10 @@ final class MeetingPromptCoordinator: ObservableObject {
     func start() {
         guard !running else { return }
         running = true
+        // MeetingDetector and MeetingDetectionSettings are @MainActor;
+        // their polling/mutation paths deliver these subjects on this actor.
+        // Synchronous delivery prevents an ended/revoked request from firing
+        // between the event and a later dispatch-queue hop.
         detector.meetingStarted.sink { [weak self] in self?.meetingStarted($0) }
             .store(in: &subscriptions)
         detector.meetingEnded.sink { [weak self] in self?.meetingEnded($0) }

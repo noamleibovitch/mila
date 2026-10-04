@@ -920,6 +920,9 @@ struct MilaApp: App {
         if CommandLine.arguments.contains("--ui-test-meeting-auto"),
            CommandLine.arguments.contains("--ui-test-clean-store") {
             meetingDefaults = UserDefaults(suiteName: "Mila.MeetingAutoUITests")!
+            if CommandLine.arguments.contains("--ui-test-reset-meeting-auto") {
+                meetingDefaults.removePersistentDomain(forName: "Mila.MeetingAutoUITests")
+            }
         }
         #endif
         let meetingSettings = MeetingDetectionSettings(defaults: meetingDefaults)

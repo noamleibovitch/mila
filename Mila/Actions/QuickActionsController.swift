@@ -587,10 +587,10 @@ final class QuickActionsController: ObservableObject {
     }
 
     func startAppRecording(app: SCRunningApplication?, includeMic: Bool) async {
+        isAppPickerShown = false
         guard activeJob == .none, !isFinalizingRecording, !captureStartInFlight else { return }
         captureStartInFlight = true
         defer { captureStartInFlight = false }
-        isAppPickerShown = false
         // Same Neural-Engine-preparing guard as `startRecording` — the
         // app-audio entry point isn't behind the gated Home button.
         guard !transcription.isPreparingModel else {
