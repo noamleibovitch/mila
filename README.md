@@ -218,7 +218,33 @@ distribution via the App Store you'd:
   `com.apple.security.network.client`, etc.)
 - Provide your team ID in `DEVELOPMENT_TEAM`.
 
+## Automatic meeting recording
+
+In **Settings → Meetings**, leave detection enabled and choose a mode for each supported app:
+
+- **Ask** (default): show start/stop prompts; recording requires a click.
+- **Auto**: start recording after a 10-second countdown. When that meeting ends,
+  stop its automatically started recording after another 10-second countdown.
+- **Off**: ignore that app.
+
+Use **Cancel start** or **Keep recording** to cancel an automatic action. Hovering,
+expanding options, or focusing the prompt pauses its countdown; Escape dismisses
+it while the prompt has keyboard focus. Sleep cancels pending automatic actions.
+Changing Auto to Ask/Off or disabling detection cancels pending automation and
+leaves an active recording running for you to stop manually.
+
+Auto never takes over a manually started recording. Rejoining a call or another
+meeting remaining active keeps the recording under explicit control. Detection
+uses the existing app/microphone activity heuristics, so it can miss a meeting or
+mistake other audio activity for a call. Check the visible recording state and
+use manual controls when needed. Microphone and system-audio permissions are
+still required. Saving and post-recording processing follow your existing settings.
+
 ## Changelog
+
+- **Unreleased** — Per-app Ask/Auto/Off meeting recording, cancellable start/stop
+  countdowns, and safeguards for manual recordings, settings changes and rejoined calls.
+
 
 Newest first. Dates are release dates.
 

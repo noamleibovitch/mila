@@ -2699,9 +2699,9 @@ private struct MeetingsSettingsTab: View {
                 header
                 Toggle(isOn: $settings.enabled) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Prompt when a meeting starts or ends")
+                        Text("Detect meetings")
                             .font(.body)
-                        Text("Mila shows a small prompt in the top-right when it sees you join a meeting in a supported app — and, while it's recording, when that meeting ends, it offers to stop.")
+                        Text("Choose whether Mila asks before recording, records automatically, or ignores each app. Turning detection off cancels pending actions; an active recording continues.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2728,7 +2728,7 @@ private struct MeetingsSettingsTab: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Meetings")
                 .font(.title3.weight(.semibold))
-            Text("Auto-prompt when Mila notices you're in a call so you don't have to remember to start recording.")
+            Text("Choose how Mila responds when a supported app starts or ends a call.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2746,47 +2746,30 @@ private struct MeetingsSettingsTab: View {
                     Text(app.displayName)
                     Spacer()
                     Picker("", selection: appModeBinding(for: app.bundleID)) {
-                        Text("Ask").tag(AppRecordingMode.ask)
-                        Text("Auto").tag(AppRecordingMode.auto)
-                        Text("Off").tag(AppRecordingMode.off)
+                        Text("Ask").tag(MeetingDetectionSettings.AppMode.ask)
+                        Text("Auto").tag(MeetingDetectionSettings.AppMode.auto)
+                        Text("Off").tag(MeetingDetectionSettings.AppMode.off)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 160)
                     .disabled(!settings.enabled)
+                    .accessibilityIdentifier(
+                        "meetings.mode.\(app.bundleID)")
+                    .accessibilityLabel("\(app.displayName) recording mode")
                 }
                 .padding(.vertical, 4)
             }
-            Text("Ask: prompt when a meeting is detected. Auto: start and stop recording automatically with a 10-second countdown. Off: ignore this app.")
+            Text("Ask: show start and stop prompts. Auto: start after a cancellable 10-second countdown, and offer the same countdown to stop a recording started by that meeting. Manual recordings always require confirmation to stop. Off: ignore this app.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private enum AppRecordingMode {
-        case ask, auto, off
-    }
-
-    private func appModeBinding(for bundleID: String) -> Binding<AppRecordingMode> {
+    private func appModeBinding(for bundleID: String) -> Binding<MeetingDetectionSettings.AppMode> {
         Binding(
-            get: {
-                if settings.isDisabled(forBundleID: bundleID) { return .off }
-                if settings.isAutoStart(forBundleID: bundleID) { return .auto }
-                return .ask
-            },
-            set: { mode in
-                switch mode {
-                case .ask:
-                    settings.reenable(bundleID: bundleID)
-                    settings.setAutoStart(bundleID: bundleID, enabled: false)
-                case .auto:
-                    settings.reenable(bundleID: bundleID)
-                    settings.setAutoStart(bundleID: bundleID, enabled: true)
-                case .off:
-                    settings.setAutoStart(bundleID: bundleID, enabled: false)
-                    settings.disable(bundleID: bundleID)
-                }
-            }
+            get: { settings.mode(forBundleID: bundleID) },
+            set: { settings.setMode($0, forBundleID: bundleID) }
         )
     }
 
