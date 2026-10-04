@@ -49,6 +49,7 @@ final class QuickActionsController: ObservableObject {
     /// Fixed before capture publishes state; preference changes affect the next recording.
     @Published private(set) var capturedBatchOnly = false
 
+    private(set) var captureStartInFlight = false
     @Published private(set) var availableApps: [SCRunningApplication] = []
     @Published var isAppPickerShown = false
     /// Set when system-audio capture fails because the user hasn't granted
@@ -459,7 +460,21 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
-    private func startRecording(withSystemAudio: Bool) async {
+    /// Starts only while the meeting request remains valid; never toggles an
+    /// existing recording off. Permission and capture awaits recheck the request.
+    func startMeetingRecording(isStillValid: @escaping () -> Bool) async -> URL? {
+        guard canStartMeetingRecording, isStillValid() else { return nil }
+        await startRecording(withSystemAudio: true, isStillValid: isStillValid)
+        guard isStillValid(), isRecording else { return nil }
+        return session.fileURL
+    }
+
+    private func startRecording(withSystemAudio: Bool,
+                                isStillValid: () -> Bool = { true }) async {
+        guard activeJob == .none, !isFinalizingRecording, !captureStartInFlight,
+              isStillValid() else { return }
+        captureStartInFlight = true
+        defer { captureStartInFlight = false }
         // Controller-side counterpart to HomeView's
         // `.disabled(... transcription.isPreparingModel)`. The button
         // greys out during the first-time Neural Engine compile, but
@@ -478,7 +493,7 @@ final class QuickActionsController: ObservableObject {
         // user at System Settings (like we do for screen recording),
         // not surface a vague "operation couldn't be completed" error
         // from deep inside AVAudioEngine.
-        guard await ensureMicrophonePermission() else { return }
+        guard await ensureMicrophonePermission(), isStillValid(), activeJob == .none else { return }
         let prefix = withSystemAudio ? "Recording" : "Voice Memo"
         let url = store.freshAudioURL(suggestedName: prefix)
         // `.meeting` mixes mic + system audio; `.microphone` is mic only.
@@ -494,11 +509,22 @@ final class QuickActionsController: ObservableObject {
         }
         do {
             prepareForNewRecording()
-            try await session.start(source: source, outputURL: url)
+            try await session.start(source: source, outputURL: url, isStillValid: isStillValid)
+            guard isStillValid() else {
+                liveAISession?.cancel()
+                if session.fileURL == url {
+                    await session.cancelAll()
+                    try? FileManager.default.removeItem(at: url)
+                }
+                return
+            }
             activeJob = .recording(withSystemAudio: withSystemAudio)
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
+        } catch is RecordingSession.StartCancelled {
+            liveAISession?.cancel()
+            return
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
@@ -561,6 +587,9 @@ final class QuickActionsController: ObservableObject {
     }
 
     func startAppRecording(app: SCRunningApplication?, includeMic: Bool) async {
+        guard activeJob == .none, !isFinalizingRecording, !captureStartInFlight else { return }
+        captureStartInFlight = true
+        defer { captureStartInFlight = false }
         isAppPickerShown = false
         // Same Neural-Engine-preparing guard as `startRecording` — the
         // app-audio entry point isn't behind the gated Home button.
