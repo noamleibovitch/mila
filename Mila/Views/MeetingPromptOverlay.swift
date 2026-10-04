@@ -71,6 +71,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         let automatic: Bool
         let meetingID: UUID?
         let recordingURL: URL?
+        var startUnavailable = false
     }
     private struct Ownership {
         let appID: String
@@ -191,10 +192,11 @@ final class MeetingPromptCoordinator: ObservableObject {
         if pending?.kind == .stop, pending?.automatic == true { dismissPrompt() }
         guard pending == nil, starting == nil, actions.meetingRecordingURL == nil,
               allowed(app.bundleID) else { return }
-        let automatic = settings.mode(forBundleID: app.bundleID) == .auto
-            && actions.canStartMeetingRecording
+        let wantsAuto = settings.mode(forBundleID: app.bundleID) == .auto
+        let automatic = wantsAuto && actions.canStartMeetingRecording
         present(Prompt(app: app, kind: .start, automatic: automatic,
-                       meetingID: meetings[app.bundleID], recordingURL: nil))
+                       meetingID: meetings[app.bundleID], recordingURL: nil,
+                       startUnavailable: wantsAuto && !automatic))
     }
 
     private func meetingEnded(_ app: MeetingDetector.App) {
@@ -258,6 +260,10 @@ final class MeetingPromptCoordinator: ObservableObject {
             settings.setMode(.auto, forBundleID: prompt.app.bundleID)
             prompt = Prompt(app: prompt.app, kind: .start, automatic: true,
                             meetingID: prompt.meetingID, recordingURL: nil)
+            // Enabling a preference is not consent to capture immediately.
+            // Give the newly enabled action its own cancellable grace period.
+            present(prompt)
+            return
         }
         switch prompt.kind {
         case .start:
@@ -266,7 +272,7 @@ final class MeetingPromptCoordinator: ObservableObject {
                 // Keep an explicit action available after a busy/preparing
                 // interval; do not repeatedly retry capture in the background.
                 present(Prompt(app: prompt.app, kind: .start, automatic: false,
-                               meetingID: prompt.meetingID, recordingURL: nil))
+                               meetingID: prompt.meetingID, recordingURL: nil, startUnavailable: true))
                 return
             }
             dismissPrompt()
@@ -318,12 +324,13 @@ final class MeetingPromptCoordinator: ObservableObject {
         guard presentsPanels else { return }
         let interaction = MeetingPromptInteraction()
         let view = MeetingPromptView(app: prompt.app, kind: prompt.kind,
-            autoAct: prompt.automatic, interaction: interaction,
+            autoAct: prompt.automatic, startUnavailable: prompt.startUnavailable, interaction: interaction,
             onPrimary: { [weak self] in self?.performPrompt(id: prompt.id) },
             onDismiss: { [weak self] in self?.cancelPrompt(id: prompt.id) },
             onSilenceApp: { [weak self] in
                 guard let self, self.pending?.id == prompt.id else { return }
                 self.settings.setMode(.off, forBundleID: prompt.app.bundleID)
+                self.announce("Meeting recording is off for \(prompt.app.displayName).")
                 self.dismissPrompt()
             },
             onEnableAuto: prompt.kind == .start && !prompt.automatic ? { [weak self] in
@@ -338,7 +345,7 @@ final class MeetingPromptCoordinator: ObservableObject {
                                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .participatesInCycle]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
@@ -351,7 +358,9 @@ final class MeetingPromptCoordinator: ObservableObject {
         }
         positionTopTrailing(panel)
         panel.orderFrontRegardless()
-        if prompt.automatic {
+        if prompt.startUnavailable {
+            announce("Recording has not started. Mila is busy; use Start transcribing when ready.")
+        } else if prompt.automatic {
             announce("\(prompt.app.displayName): \(prompt.kind == .start ? "starting" : "stopping") recording in ten seconds. Focus the prompt to pause, or cancel.")
         }
     }
@@ -366,8 +375,7 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
     private func announce(_ text: String) {
         guard presentsPanels else { return }
-        let element: Any = window.map { $0 as Any } ?? NSApplication.shared
-        NSAccessibility.post(element: element, notification: .announcementRequested,
+        NSAccessibility.post(element: NSApplication.shared, notification: .announcementRequested,
                              userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
     }
     private func positionTopTrailing(_ panel: NSPanel) {
@@ -393,11 +401,12 @@ private struct MeetingPromptView: View {
     /// When true, the timer auto-triggers `onPrimary` instead of
     /// `onDismiss` — used for per-app auto-start/stop.
     let autoAct: Bool
+    let startUnavailable: Bool
     @ObservedObject var interaction: MeetingPromptInteraction
     let onPrimary: () -> Void
     let onDismiss: () -> Void
     let onSilenceApp: () -> Void
-    /// Enable auto-start/stop for this app and start recording now.
+    /// Enable auto-start/stop and present a fresh cancellable countdown.
     var onEnableAuto: (() -> Void)? = nil
     var onHeightChange: (CGFloat) -> Void = { _ in }
 
@@ -475,8 +484,12 @@ private struct MeetingPromptView: View {
     }
 
     private var subtitleText: String {
+        if isPaused {
+            return autoAct ? "Countdown paused — leave the prompt to continue."
+                : "Prompt stays open while you interact."
+        }
+        if startUnavailable { return "Recording has not started. Mila is busy; try Start transcribing when ready." }
         if autoAct {
-            if isPaused { return "Countdown paused — leave the prompt to continue." }
             let remaining = max(0, Int(ceil(autoDismissSeconds - countdown.elapsed)))
             switch kind {
             case .start: return "Starting recording in \(remaining)…"

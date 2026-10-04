@@ -238,7 +238,9 @@ In **Settings → Meetings**, leave detection enabled and choose a mode for each
 
 Use **Cancel start** or **Keep recording** to cancel an automatic action. Hovering,
 expanding options, or focusing the prompt pauses its countdown; Escape dismisses
-it while the prompt has keyboard focus. Sleep cancels pending automatic actions.
+it while the prompt has keyboard focus. Switch to Mila and use window cycling
+(Command–backtick) to focus the prompt. Sleep or a long interruption cancels pending
+automatic actions, including paused countdowns.
 Changing Auto to Ask/Off or disabling detection cancels pending automation and
 leaves an active recording running for you to stop manually.
 
