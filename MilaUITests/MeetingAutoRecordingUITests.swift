@@ -22,11 +22,15 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         return app
     }
     private func waitForLabel(_ element: XCUIElement, _ label: String, timeout: TimeInterval = 20) {
-        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", label), object: element)
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@ OR value == %@", label, label), object: element)
         XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: timeout), .completed)
     }
+    private func container(_ app: XCUIApplication, containing id: String) -> XCUIElement {
+        let dialog = app.dialogs.containing(.any, identifier: id).firstMatch
+        return dialog.exists ? dialog : app.windows.containing(.any, identifier: id).firstMatch
+    }
     private func screenshot(_ app: XCUIApplication, containing id: String, name: String) {
-        let window = app.windows.containing(.any, identifier: id).firstMatch
+        let window = container(app, containing: id)
         XCTAssertTrue(window.exists)
         let attachment = XCTAttachment(screenshot: window.screenshot())
         attachment.name = name
@@ -56,12 +60,12 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         chevron.click()
         let silence = element(app, "meetingPrompt.silence")
         XCTAssertTrue(silence.waitForExistence(timeout: 5))
-        let window = app.windows.containing(.any, identifier: "meetingPrompt.silence").firstMatch
+        let window = container(app, containing: "meetingPrompt.silence")
         XCTAssertTrue(window.frame.contains(silence.frame), "Expanded actions must fit in the panel")
         waitForLabel(element(app, "meetingPrompt.countdown"), "Countdown paused — leave the prompt to continue.")
         screenshot(app, containing: "meetingPrompt.silence", name: "auto-start-expanded-paused")
         // Waiting beyond the grace period must not start while interacting.
-        let noStart = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'Recording'"), object: element(app, "meetingTest.state"))
+        let noStart = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'Recording' OR value == 'Recording'"), object: element(app, "meetingTest.state"))
         noStart.isInverted = true
         XCTAssertEqual(XCTWaiter.wait(for: [noStart], timeout: 11), .completed)
         app.typeKey(.escape, modifierFlags: [])
@@ -77,9 +81,9 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         XCTAssertTrue(subtitle.waitForExistence(timeout: 5))
         for _ in 0..<4 {
             app.typeKey("`", modifierFlags: .command)
-            if subtitle.label.contains("paused") { break }
+            if (subtitle.label + (subtitle.value as? String ?? "")).contains("paused") { break }
         }
-        XCTAssertTrue(subtitle.label.contains("paused"), "Keyboard window cycling must reach and pause the prompt")
+        XCTAssertTrue((subtitle.label + (subtitle.value as? String ?? "")).contains("paused"), "Keyboard window cycling must reach and pause the prompt")
         app.typeKey(.escape, modifierFlags: [])
         waitUntilGone(element(app, "meetingPrompt.primary"))
         waitForLabel(element(app, "meetingTest.counts"), "Starts: 0, stops: 0")

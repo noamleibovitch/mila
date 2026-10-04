@@ -464,7 +464,8 @@ private struct MeetingPromptView: View {
         .onPreferenceChange(MeetingPromptHeight.self, perform: onHeightChange)
         .onAppear { lastTick = .now }
         .onDisappear { dismissed = true; countdown.cancel() }
-        .accessibilityIdentifier("\(identifierPrefix).\(app.bundleID)")
+        // Keep identifiers on individual controls; a SwiftUI container
+        // identifier propagates to children and masks their identifiers.
     }
 
     /// Accessibility-identifier prefix, distinct per kind so UI tests can
