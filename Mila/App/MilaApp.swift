@@ -881,6 +881,13 @@ struct MilaApp: App {
         actions.liveAISession = liveSession
         actions.liveTranscriber = liveTrans
         actions.liveDiarizer = liveDiar
+        // Gates the deferred re-clustering pass at stop. Read at stop time
+        // rather than frozen here so a mid-recording opt-out is honoured;
+        // the pass exists only to correct live labels before
+        // `RecognisedSpeakerAssigner.finish` consumes them.
+        actions.voiceRecognitionConfigured = { [weak voiceSettings] in
+            voiceSettings?.isConfigured ?? false
+        }
         actions.summarizer = summarizer
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings

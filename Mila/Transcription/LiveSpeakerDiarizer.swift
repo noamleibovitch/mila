@@ -33,6 +33,21 @@ final class LiveSpeakerDiarizer: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var isReady: Bool = false
 
+    /// One entry per interval, in the same order, captured so the deferred
+    /// re-clustering pass can correct the greedy online assignments at stop.
+    /// Recording-local and deliberately never persisted; cleared in `reset()`.
+    private var utteranceRecords: [LiveSpeakerReclustering.UtteranceRecord] = []
+
+    /// Session-mean accumulator for channel-compensated matching (see
+    /// `normalizedSimilarity`). Running sum + count of this recording's
+    /// usable utterance embeddings; reset in `reset()`. Never persisted —
+    /// the folds and the stored pool pairs stay raw embeddings.
+    private var sessionEmbeddingSum: [Float] = []
+    private var sessionEmbeddingCount = 0
+    /// Speaker id the previous usable utterance was assigned online. Drives
+    /// the stickiness margin in `assign`; reset in `reset()`.
+    private var previousSpeakerID: String?
+
     /// Cosine threshold above which an incoming embedding is considered
     /// the same speaker as an existing pool entry. 0.55 fits wespeaker's
     /// short-utterance embeddings — VAD emits 1-5s clips and same-
@@ -201,6 +216,24 @@ final class LiveSpeakerDiarizer: ObservableObject {
         var observedCount: Int
         /// Name from a stored voice profile if this pool entry was seeded.
         var profileName: String?
+        /// The *original* stored centroid and the capped seed weight, kept
+        /// separately from the mutable matching pair so the deferred
+        /// re-clustering pass can rebuild corrected statistics as
+        /// `seed weight + corrected members`. Cleared by
+        /// `forgetSeededProfiles` together with `profileName`, so a deleted
+        /// profile can never be reconstructed from stale seed state.
+        var seededCentroid: [Float] = []
+        var seededCount: Int = 0
+        /// The most recent recording's centroid for a seeded profile, carried
+        /// through from `SpeakerProfileStore.seedEntries()` so the metadata is
+        /// available to the live pool. `nil` for a minted entry. It is **not
+        /// matched against** — `assign` still compares only `centroid` (the
+        /// stored centroid and its in-recording folds). Wiring it into live
+        /// matching is the separate dual-centroid change tracked by #206.
+        ///
+        /// `future: #206`
+        var recentCentroid: [Float]?
+        var recentCount: Int = 0
     }
 
     private struct EmbedResponse: Decodable {
@@ -347,6 +380,10 @@ final class LiveSpeakerDiarizer: ObservableObject {
     func reset() {
         pool.removeAll()
         intervals.removeAll()
+        utteranceRecords.removeAll()
+        sessionEmbeddingSum = []
+        sessionEmbeddingCount = 0
+        previousSpeakerID = nil
     }
 
     /// Pre-populate the pool with known speaker voice profiles so
@@ -367,18 +404,42 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// reads. A seeded entry that never speaks therefore contributes
     /// nothing to its stored profile, and one that speaks once contributes
     /// exactly one sample.
-    func seedPool(with entries: [(id: String, name: String, centroid: [Float], sampleCount: Int)]) {
+    ///
+    /// The `recentCentroid`/`recentCount` tuple fields are accepted and stored
+    /// on the pool entry for future use (`future: #206`) but are **not** read
+    /// by `assign` — live matching still runs on the stored `centroid` alone.
+    func seedPool(with entries: [(id: String, name: String, centroid: [Float], sampleCount: Int,
+                                  recentCentroid: [Float]?, recentCount: Int)]) {
         for entry in entries {
             let id = String(format: "SPEAKER_%02d", pool.count)
+            let weight = min(entry.sampleCount, effectiveSeedAnchorWeight)
             pool.append(SpeakerProfile(
                 id: id,
                 centroid: entry.centroid,
-                sampleCount: min(entry.sampleCount, effectiveSeedAnchorWeight),
+                sampleCount: weight,
                 observedCentroid: [],
                 observedCount: 0,
-                profileName: entry.name
+                profileName: entry.name,
+                seededCentroid: entry.centroid,
+                seededCount: weight,
+                recentCentroid: entry.recentCentroid,
+                recentCount: entry.recentCount
             ))
         }
+    }
+
+    /// Four-field forwarding form for the older seed shape. The recent pair
+    /// is simply absent, which is exactly an old profile's state, so this
+    /// carries no behavior change. Marked `@_disfavoredOverload` so an untyped
+    /// empty array — `seedPool(with: [])` — resolves to the six-field form
+    /// rather than becoming ambiguous; a caller that spells out a four-field
+    /// tuple still matches here.
+    @_disfavoredOverload
+    func seedPool(with entries: [(id: String, name: String, centroid: [Float], sampleCount: Int)]) {
+        seedPool(with: entries.map {
+            (id: $0.id, name: $0.name, centroid: $0.centroid, sampleCount: $0.sampleCount,
+             recentCentroid: nil, recentCount: 0)
+        })
     }
 
     /// Drop everything the pool holds that came off disk, for the profiles
@@ -435,6 +496,14 @@ final class LiveSpeakerDiarizer: ObservableObject {
             pool[idx].profileName = nil
             pool[idx].centroid = pool[idx].observedCentroid
             pool[idx].sampleCount = pool[idx].observedCount
+            pool[idx].seededCentroid = []
+            pool[idx].seededCount = 0
+            // The recent pair is deleted-profile metadata too, so it goes with
+            // the rest: nothing downstream may retain it for a voice the user
+            // just erased. (`future: #206` — it is not matched against today,
+            // but clearing it here keeps the deletion complete by construction.)
+            pool[idx].recentCentroid = nil
+            pool[idx].recentCount = 0
         }
     }
 
@@ -454,6 +523,28 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// never write a spurious update.
     func currentProfiles() -> [(id: String, observedCentroid: [Float], observedCount: Int, profileName: String?)] {
         pool.map { ($0.id, $0.observedCentroid, $0.observedCount, $0.profileName) }
+    }
+
+    /// Matching pair of a pool entry, for tests: the running
+    /// mean/weight behind matching (NOT the persisted observed pair).
+    /// Tests need it to prove a confident match still folds the matching
+    /// representation when the quality gate skips the observation fold.
+    func matchingSampleCount(forSpeaker id: String) -> Int? {
+        pool.first { $0.id == id }?.sampleCount
+    }
+
+    /// The recent-pair metadata `seedPool` stored on a pool entry, for tests.
+    /// Returns `nil` when no entry has `id`; otherwise the entry's stored
+    /// `recentCentroid` / `recentCount` (`nil` / `0` for a four-field seed, an
+    /// old profile, or a minted entry).
+    ///
+    /// Test seam for the #206 recent-pair carrying work. It is the only
+    /// read-out that observes that the six-field `seedPool` form actually
+    /// copied the pair onto the entry, because `assign` deliberately never
+    /// reads it — the form could compile yet silently drop the pair, and no
+    /// behavioural test would notice.
+    func recentPair(forSeeded id: String) -> (centroid: [Float]?, count: Int)? {
+        pool.first { $0.id == id }.map { ($0.recentCentroid, $0.recentCount) }
     }
 
     /// Fire-and-track variant of `process(...)`. Chains the call onto
@@ -511,10 +602,95 @@ final class LiveSpeakerDiarizer: ObservableObject {
             if let err = response.error { lastError = "Diar daemon: \(err)" }
             return
         }
-        let speakerID = assign(embedding: embedding, utteranceDuration: endSeconds - startSeconds)
-        intervals.append((start: startSeconds, end: endSeconds, speaker: speakerID))
+        let speakerID = ingest(embedding: embedding, startSeconds: startSeconds, endSeconds: endSeconds)
         diarLog.log("interval added: \(startSeconds, privacy: .public)..\(endSeconds, privacy: .public) → \(speakerID, privacy: .public) (poolSize=\(self.pool.count, privacy: .public) totalIntervals=\(self.intervals.count, privacy: .public))")
     }
+
+    /// Cosine similarity between an utterance embedding and a pool centroid,
+    /// with the session's mean embedding subtracted from both (channel
+    /// compensation). Falls back to raw cosine until 3 usable utterances
+    /// have been seen (a one-utterance mean IS the embedding, and
+    /// over-subtraction degenerates the comparison), or when either
+    /// mean-subtracted vector has a near-zero norm (sum of squares < 1e-12).
+    /// Dimension mismatch behaves exactly like `cosineSimilarity`: 0.
+    private func normalizedSimilarity(_ embedding: [Float], centroid: [Float]) -> Double {
+        guard embedding.count == centroid.count, !embedding.isEmpty else { return 0 }
+        if sessionEmbeddingCount >= 3,
+           sessionEmbeddingSum.count == embedding.count {
+            // `sessionEmbeddingSum` accumulates the raw sum; subtract the
+            // mean, not the sum, or the correction scales with the number
+            // of utterances seen and over-subtracts.
+            let meanScale = 1.0 / Float(sessionEmbeddingCount)
+            var a = embedding
+            var b = centroid
+            var normA: Float = 0
+            var normB: Float = 0
+            for i in 0..<embedding.count {
+                let mean = sessionEmbeddingSum[i] * meanScale
+                a[i] -= mean
+                b[i] -= mean
+                normA += a[i] * a[i]
+                normB += b[i] * b[i]
+            }
+            if normA >= 1e-12, normB >= 1e-12 {
+                var dot: Float = 0
+                for i in 0..<a.count { dot += a[i] * b[i] }
+                let denom = normA.squareRoot() * normB.squareRoot()
+                if denom > 0 { return Double(dot / denom) }
+            }
+        }
+        return cosineSimilarity(embedding, centroid)
+    }
+
+    /// Whether the stickiness margin applies: the previous utterance's
+    /// speaker is still a legitimate winner when its similarity trails the
+    /// best candidate by less than `stickinessMargin`. Same-tier only — see
+    /// `assign`.
+    static let stickinessMargin: Double = 0.05
+
+    /// Minimum utterance duration for an utterance to be worth LEARNING
+    /// from (observation fold). Short clips give noisy wespeaker embeddings;
+    /// they may still label and adapt matching, they just never reach the
+    /// persisted profile.
+    ///
+    /// Because `currentProfiles()` persists only the observed pair, the
+    /// `observedCount > 0` gate in `RecognisedSpeakerAssigner.finish` now
+    /// means "at least one confident, long-enough utterance this recording".
+    /// A speaker whose utterances were all short keeps their labels but
+    /// teaches the profile nothing — intentional: noise protection beats
+    /// sample volume.
+    static let minObservationDuration: Double = 2.0
+    /// How far above `similarityThreshold` a match must land before it is
+    /// worth learning from. 0.03: gates the just-barely-cleared band while
+    /// keeping the seed-anchor evaluation band (0.7434-0.750 at threshold
+    /// 0.7) observable — see SeedAnchorWeightTests, which pins that band.
+    ///
+    /// The margin separates "matched" from "worth learning from": a match
+    /// that just clears `similarityThreshold` is exactly the false-positive-
+    /// prone case the hysteresis rationale at `createThreshold` describes.
+    ///
+    /// **Why 0.03 and not 0.05 — adjudicated, do not re-litigate.** The
+    /// quality-gated learning brief originally specified a 0.05 margin. The
+    /// plan-review loop proved 0.05 deterministically breaks the seed-anchor
+    /// evaluation band pinned by `MilaTests/SeedAnchorWeightTests.swift`:
+    /// those fixtures assert `observedCount` for probes at cosine 0.7434 and
+    /// 0.750 against a 0.7 threshold — i.e. similarities in
+    /// `[threshold + 0.03, threshold + 0.05)` must still observe. At 0.05
+    /// those fixtures stop observing, failing tests that are upstream-pinned
+    /// tripwire documentation of the #206 anchor question (and out of scope
+    /// for this change). The brief author therefore fixed the margin at 0.03.
+    ///
+    /// What 0.03 buys: it still gates the just-barely-cleared band
+    /// (`[threshold, threshold + 0.03)` does not learn) while keeping the
+    /// evaluation band observable, so the seed-anchor sweep (#206) and its
+    /// pinned tests stay valid.
+    ///
+    /// The trade-off it accepts: utterances in
+    /// `[threshold + 0.03, threshold + 0.05)` do learn — a wider learning
+    /// window than a 0.05 margin would allow. That is accepted deliberately,
+    /// because protecting the upstream-pinned evaluation band outranks
+    /// narrowing the learning window by 0.02.
+    static let observationConfidenceMargin: Double = 0.03
 
     /// Match a new embedding against the pool by cosine similarity, using a
     /// two-tier (hysteresis) policy to curb over-segmentation:
@@ -535,8 +711,9 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// clearly-dissimilar embedding — or a long-enough utterance — before
     /// creating a speaker keeps the live pool from exploding. The offline
     /// pass at stop still does the authoritative global clustering.
-    func assign(embedding: [Float], utteranceDuration: Double = 2.0) -> String {
+    private func assignCore(embedding: [Float], utteranceDuration: Double = 2.0) -> String {
         var best: (idx: Int, sim: Double)?
+        var similaritiesBySpeaker: [String: Double] = [:]
         for (idx, profile) in pool.enumerated() {
             // An entry with no centroid has nothing to compare against, so
             // it cannot be anyone's best match. `cosineSimilarity` already
@@ -549,17 +726,44 @@ final class LiveSpeakerDiarizer: ObservableObject {
             // otherwise: `process` refuses an empty embedding, so nothing
             // else ever puts an empty centroid in the pool.
             guard !profile.centroid.isEmpty else { continue }
-            let sim = cosineSimilarity(embedding, profile.centroid)
+            let sim = normalizedSimilarity(embedding, centroid: profile.centroid)
+            similaritiesBySpeaker[profile.id] = sim
             if best == nil || sim > best!.sim {
                 best = (idx, sim)
             }
         }
-        let bestSim = best?.sim ?? -1.0
-        let bestId = best.map { pool[$0.idx].id } ?? "(none)"
         // Floor for minting a new speaker — kept a notch below the match
         // threshold so borderline utterances attach rather than fork.
         // Clamped so a low user-set threshold can't drive it negative.
         let createThreshold = max(0.40, similarityThreshold - 0.15)
+        // Temporal stickiness: an isolated borderline utterance should not
+        // switch speakers when the previous speaker is nearly as similar.
+        // Same-tier only — previous and winner must sit on the same side of
+        // *both* boundaries: the confidence boundary (`similarityThreshold`)
+        // and the attach/mint boundary (`createThreshold`). A previous entry
+        // that would mint (below `createThreshold`) must not pull a winner in
+        // the attach band back over it, or the attach branch below would fail
+        // and mint a brand-new speaker where raw comparison attached. A
+        // lower-tier previous speaker never overrides a higher-tier winner,
+        // and confident-tier folding still requires the winner itself to
+        // clear `similarityThreshold`. Ties keep `best` (deterministic).
+        if let chosen = best,
+           let previous = previousSpeakerID,
+           previous != chosen.id,
+           let prevSim = similaritiesBySpeaker[previous],
+           prevSim < chosen.sim,
+           chosen.sim - prevSim < Self.stickinessMargin,
+           let prevIdx = pool.firstIndex(where: { $0.id == previous }),
+           !pool[prevIdx].centroid.isEmpty {
+            let prevTierIsConfident = prevSim >= similarityThreshold
+            let chosenTierIsConfident = chosen.sim >= similarityThreshold
+            if prevTierIsConfident == chosenTierIsConfident,
+               (prevSim >= createThreshold) == (chosen.sim >= createThreshold) {
+                best = (prevIdx, prevSim)
+            }
+        }
+        let bestSim = best?.sim ?? -1.0
+        let bestId = best.map { pool[$0.idx].id } ?? "(none)"
         // Short chunks give noisy embeddings; don't let them mint a new
         // speaker when we already have a pool to attach to.
         let longEnoughForNewSpeaker = utteranceDuration >= 1.0
@@ -592,23 +796,34 @@ final class LiveSpeakerDiarizer: ObservableObject {
             pool[chosen.idx].centroid = centroid
             pool[chosen.idx].sampleCount = n + 1
             // The same fold over this recording's observations alone — the
-            // pair that gets persisted. A seeded entry starts empty, so its
-            // first match takes the embedding directly rather than averaging
-            // into nothing. A non-empty `observedCentroid` was itself built
-            // from embeddings that passed the dimension check above, so it is
-            // the same length as `embedding` and safe to index in step.
-            let observedSoFar = pool[chosen.idx].observedCount
-            if observedSoFar == 0 {
-                pool[chosen.idx].observedCentroid = embedding
-                pool[chosen.idx].observedCount = 1
-            } else {
-                var observed = pool[chosen.idx].observedCentroid
-                for i in 0..<observed.count {
-                    observed[i] = (observed[i] * Float(observedSoFar) + embedding[i])
-                        / Float(observedSoFar + 1)
+            // pair that gets persisted — but gated by utterance quality. A
+            // confident match always adapts the MATCHING representation
+            // above (that is how a returning speaker's entry tracks today's
+            // acoustics); only a long-enough, clearly-confident utterance is
+            // worth LEARNING from, so only it folds the persisted pair.
+            // Borderline just-clears-threshold matches are the false-positive-
+            // prone ones and short clips carry noisy embeddings.
+            let observes = utteranceDuration >= Self.minObservationDuration
+                && chosen.sim >= similarityThreshold + Self.observationConfidenceMargin
+            if observes {
+                // A seeded entry starts empty, so its first match takes the
+                // embedding directly rather than averaging into nothing. A
+                // non-empty `observedCentroid` was itself built from
+                // embeddings that passed the dimension check above, so it is
+                // the same length as `embedding` and safe to index in step.
+                let observedSoFar = pool[chosen.idx].observedCount
+                if observedSoFar == 0 {
+                    pool[chosen.idx].observedCentroid = embedding
+                    pool[chosen.idx].observedCount = 1
+                } else {
+                    var observed = pool[chosen.idx].observedCentroid
+                    for i in 0..<observed.count {
+                        observed[i] = (observed[i] * Float(observedSoFar) + embedding[i])
+                            / Float(observedSoFar + 1)
+                    }
+                    pool[chosen.idx].observedCentroid = observed
+                    pool[chosen.idx].observedCount = observedSoFar + 1
                 }
-                pool[chosen.idx].observedCentroid = observed
-                pool[chosen.idx].observedCount = observedSoFar + 1
             }
             return pool[chosen.idx].id
         }
@@ -619,14 +834,146 @@ final class LiveSpeakerDiarizer: ObservableObject {
         }
         // A speaker minted during this recording has no seeded weight, so
         // the matching pair and the persisted pair are the same thing.
+        // ENROLLMENT RULE: the utterance that CREATES an entry observes on
+        // duration alone — there is no winner to be confident about, so
+        // duration is the enrollment quality bar. A short mint starts with
+        // an empty observed pair (observable later by a quality match).
+        let observes = utteranceDuration >= Self.minObservationDuration
         let nextID = String(format: "SPEAKER_%02d", pool.count)
         pool.append(SpeakerProfile(id: nextID,
                                    centroid: embedding,
                                    sampleCount: 1,
-                                   observedCentroid: embedding,
-                                   observedCount: 1,
+                                   observedCentroid: observes ? embedding : [],
+                                   observedCount: observes ? 1 : 0,
                                    profileName: nil))
         return nextID
+    }
+
+    /// Online assignment wrapper. Runs the unchanged greedy `assignCore` and
+    /// then records which speaker the previous *usable* utterance landed on,
+    /// so `assignCore`'s stickiness margin can prefer temporal continuity.
+    /// An empty or zero-norm embedding is unusable and leaves the tracker
+    /// alone — it must not teach the next comparison a bogus predecessor.
+    func assign(embedding: [Float], utteranceDuration: Double = 2.0) -> String {
+        let id = assignCore(embedding: embedding, utteranceDuration: utteranceDuration)
+        if !embedding.isEmpty, embedding.contains(where: { $0 != 0 }) { previousSpeakerID = id }
+        return id
+    }
+
+    // MARK: - Deferred re-clustering
+
+    /// Ingest one utterance: assign it online (unchanged greedy behaviour)
+    /// and record it so the deferred pass can correct the assignment at stop.
+    /// Tests can drive this directly; production reaches it only through
+    /// `process`, which owns the daemon I/O.
+    ///
+    /// Returns the online speaker id, so `assign`'s behaviour and the
+    /// recorded interval stay in lockstep.
+    @discardableResult
+    func ingest(embedding: [Float], startSeconds: Double, endSeconds: Double) -> String {
+        // Channel-compensation accumulator: raw embeddings only, never
+        // persisted. Unusable (empty/zero-norm) embeddings contribute
+        // nothing; the dimension anchor is set by the first usable
+        // embedding and mismatched dims are ignored (matching
+        // `normalizedSimilarity`'s dimension guard).
+        if !embedding.isEmpty, embedding.contains(where: { $0 != 0 }) {
+            if sessionEmbeddingSum.isEmpty {
+                sessionEmbeddingSum = embedding
+            } else if sessionEmbeddingSum.count == embedding.count {
+                for i in 0..<embedding.count { sessionEmbeddingSum[i] += embedding[i] }
+            }
+            sessionEmbeddingCount += 1
+        }
+        let speakerID = assign(embedding: embedding,
+                               utteranceDuration: endSeconds - startSeconds)
+        intervals.append((start: startSeconds, end: endSeconds, speaker: speakerID))
+        utteranceRecords.append(LiveSpeakerReclustering.UtteranceRecord(
+            start: startSeconds,
+            end: endSeconds,
+            assignedID: speakerID,
+            embedding: embedding))
+        return speakerID
+    }
+
+    /// Re-cluster this recording's utterances and rewrite the labels in
+    /// place. Called once at stop, after `awaitPending()` and before
+    /// `RecognisedSpeakerAssigner.finish` reads the pool.
+    ///
+    /// A no-op unless the recording produced embeddings, so an unconfigured
+    /// or opted-out recording is never touched. Runs the pure
+    /// `LiveSpeakerReclustering` algorithm, rewrites `intervals` through the
+    /// per-record destinations, and replaces the pool's statistics from the
+    /// corrected deltas (never accumulating onto the online values).
+    @discardableResult
+    func applyReclusteredLabels() -> LiveSpeakerReclustering.Result? {
+        guard !utteranceRecords.isEmpty else { return nil }
+        let snapshot = pool.map {
+            LiveSpeakerReclustering.PoolEntry(
+                id: $0.id,
+                centroid: $0.centroid,
+                sampleCount: $0.sampleCount,
+                observedCentroid: $0.observedCentroid,
+                observedCount: $0.observedCount,
+                profileName: $0.profileName,
+                seededCentroid: $0.seededCentroid,
+                seededCount: $0.seededCount)
+        }
+        let result = LiveSpeakerReclustering.recluster(records: utteranceRecords,
+                                                       pool: snapshot,
+                                                       similarityThreshold: similarityThreshold)
+        applyReclusteredLabels(result)
+        return result
+    }
+
+    /// Split out from the no-argument form so a test can inject a synthetic
+    /// `Result` and exercise the rewrite/statistics-replacement path without
+    /// fabricating daemon embeddings.
+    func applyReclusteredLabels(_ result: LiveSpeakerReclustering.Result) {
+        guard result.destinations.count == intervals.count else { return }
+
+        // Rewrite interval labels. Every old id that appears gets a
+        // destination, so no interval label is left dangling.
+        for i in intervals.indices {
+            intervals[i].speaker = result.destinations[i]
+        }
+
+        // Replace statistics for every cluster the pass produced. A cluster
+        // id that is not yet in the pool gets appended in minted order so its
+        // positional slot is stable and its observed pair is what persistence
+        // reads.
+        for id in result.mintedOrder {
+            guard let stats = result.entryStats[id] else { continue }
+            pool.append(SpeakerProfile(
+                id: id,
+                centroid: stats.centroid,
+                sampleCount: stats.sampleCount,
+                observedCentroid: stats.observedCentroid,
+                observedCount: stats.observedCount,
+                profileName: stats.profileName,
+                seededCentroid: [],
+                seededCount: 0))
+        }
+        for idx in pool.indices {
+            guard let stats = result.entryStats[pool[idx].id] else {
+                // An entry no cluster claims was absorbed: it is not a
+                // destination any more, so it must not carry observations
+                // into persistence or the auto-name gate. Its matching pair
+                // is left alone — nothing reads it now.
+                pool[idx].observedCentroid = []
+                pool[idx].observedCount = 0
+                continue
+            }
+            pool[idx].centroid = stats.centroid
+            pool[idx].sampleCount = stats.sampleCount
+            pool[idx].observedCentroid = stats.observedCentroid
+            pool[idx].observedCount = stats.observedCount
+            // `seededCentroid` / `seededCount` are deliberately left as the
+            // retained original: the corrected matching pair above already
+            // equals `seed weight + corrected members`, and
+            // `forgetSeededProfiles` separately clears the seed when the
+            // profile is deleted, so a deleted profile can never be
+            // reconstructed from it.
+        }
     }
 
     // MARK: - Daemon I/O

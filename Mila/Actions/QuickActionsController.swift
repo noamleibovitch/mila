@@ -139,6 +139,14 @@ final class QuickActionsController: ObservableObject {
     /// diarizer work so the final utterance's speaker label lands
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
+    /// Set after init by MilaApp. Gates the deferred re-clustering pass,
+    /// read at stop time so a mid-recording opt-out is honoured. The pass
+    /// exists only to correct live labels before
+    /// `RecognisedSpeakerAssigner.finish` consumes them, so it must be a
+    /// no-op when the feature is off even if the diarizer produced
+    /// embeddings. Defaults to "off" so a controller built without the
+    /// wiring never reclusters.
+    var voiceRecognitionConfigured: () -> Bool = { false }
     /// Set after init by MilaApp. `stopRecording` closes the on-disk
     /// live-transcript sidecar with the saved recording's id so external
     /// pollers (mila-mcp) can hand off from the live feed to the stored
@@ -903,8 +911,37 @@ final class QuickActionsController: ObservableObject {
         // the lifecycle in this codepath.
         await liveTranscriber?.transcribeNow()
         await liveDiarizer?.awaitPending()
+        // Deferred re-clustering: correct the greedy online speaker
+        // assignments for the whole recording before anything consumes them.
+        // Must run after `awaitPending()` (intervals final) and before
+        // `applySpeakerLabels` / `onRecordingFinalized → finish`, so the
+        // corrected labels are what get labelled onto segments, snapshotted
+        // and persisted. Recording-time labels are untouched — this only
+        // moves the post-stop rewrite.
+        var reclusterMapping: [String: String] = [:]
+
+        if voiceRecognitionConfigured() {
+            let result = liveDiarizer?.applyReclusteredLabels()
+            reclusterMapping = result?.mapping ?? [:]
+            // Segments the diarizer already labelled during recording must be
+            // moved onto the corrected ids too — `applySpeakerLabels` skips
+            // them. Runs before the snapshot below, so the saved transcript
+            // carries the corrected labels.
+            if let diar = liveDiarizer {
+                liveTranscriber?.applyReclusteredSpeakerLabels(diar.intervals)
+            }
+        }
         if let diar = liveDiarizer {
             liveTranscriber?.applySpeakerLabels(diar.intervals)
+        }
+        // Manual names the user typed mid-recording were keyed to the online
+        // ids. Move them onto the corrected ids (deterministic: destination
+        // name wins, otherwise the lowest source id's name) so the label the
+        // user chose follows the speaker, and `finish` fires `onSpeakerNamed`
+        // for the id that actually persists.
+        if !reclusterMapping.isEmpty, let transcriber = liveTranscriber {
+            transcriber.speakerNames = Self.remapSpeakerNames(transcriber.speakerNames,
+                                                              through: reclusterMapping)
         }
         // The final Live-AI summary tick is deliberately NOT awaited here.
         // It used to run inline (feed the post-drain transcript, then
@@ -1171,9 +1208,36 @@ final class QuickActionsController: ObservableObject {
         finalizeTail(for: updated, liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative)
     }
 
+    /// Remap the live pane's manual speaker names through the recluster
+    /// correction. `mapping` only carries ids whose records share one
+    /// destination, so a split id is left where it was (no name is duplicated
+    /// across newly separated speakers). Deterministic when several old ids
+    /// fold into one destination: the destination's own name wins if one
+    /// exists, otherwise the lowest source id's name does.
+    static func remapSpeakerNames(_ names: [String: String],
+                                  through mapping: [String: String]) -> [String: String] {
+        var result: [String: String] = [:]
+        // A name already on a destination id is the name the user chose for
+        // that speaker, so it wins over any source folded into it. An
+        // identity mapping and an unmapped (split) id both mean "this id is
+        // its own destination".
+        for (id, name) in names {
+            let destination = mapping[id] ?? id
+            if destination == id, result[id] == nil {
+                result[id] = name
+            }
+        }
+        // Folded sources fill a destination only when it has no name of its
+        // own; lowest source id wins a tie (the sort makes that order).
+        for (oldID, name) in names.sorted(by: { $0.key < $1.key }) {
+            guard let destination = mapping[oldID], destination != oldID else { continue }
+            if result[destination] == nil { result[destination] = name }
+        }
+        return result
+    }
+
     /// Whether the offline re-diarize pass is worth running given how many
     /// distinct speakers the LIVE diarizer already found. Re-diarization
-    /// only corrects OVER-segmentation, which only happens when many
     /// speakers were minted; at or below `maxLiveSpeakersToSkipRediarize`
     /// the live labels are almost certainly already right, so we skip the
     /// heavy pyannote subprocess. `liveSpeakerCount == 0` (no labels at

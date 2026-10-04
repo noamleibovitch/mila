@@ -379,4 +379,53 @@ final class RecognisedSpeakerMergeTests: XCTestCase {
         XCTAssertEqual(entry?.observedCount, 2)
         XCTAssertNil(entry?.profileName, "not seeded")
     }
+
+    // MARK: - The deferred re-clustering pass must not leak seeded weight
+
+    /// The pass that corrects live labels at stop rebuilds the pool's
+    /// statistics. That rebuild must keep the two pairs split: the seeded
+    /// weight is folded into the matching side, and `currentProfiles()` — the
+    /// only thing persistence reads — still reports this recording's
+    /// observations alone.
+    func test_reclustering_leaves_the_persisted_pair_seeded_weight_free() {
+        let settings = makeSettings()
+        let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
+        profiles.updateProfile(name: "Alice", embedding: [1, 0, 0, 0], sampleCount: 40)
+
+        let diarizer = LiveSpeakerDiarizer()
+        diarizer.similarityThreshold = 0.7
+        diarizer.reset()
+        diarizer.seedPool(with: profiles.seedEntries())
+
+        // Alice speaks three times, fragmented across two online ids by the
+        // greedy pass: the first near-identical embedding matches the seed,
+        // the next two are dissimilar enough to mint a second entry.
+        XCTAssertEqual(diarizer.ingest(embedding: [0.99, 0.01, 0, 0],
+                                        startSeconds: 0, endSeconds: 2), "SPEAKER_00")
+        XCTAssertEqual(diarizer.ingest(embedding: [0, 1, 0, 0],
+                                        startSeconds: 2, endSeconds: 4), "SPEAKER_01")
+        XCTAssertEqual(diarizer.ingest(embedding: [0, 1, 0, 0],
+                                        startSeconds: 4, endSeconds: 6), "SPEAKER_01")
+
+        diarizer.applyReclusteredLabels()
+
+        // Whatever the correction decided, the persisted pair is this
+        // recording's observations only — never the seed weight.
+        for entry in diarizer.currentProfiles() {
+            XCTAssertEqual(entry.observedCentroid.count,
+                           entry.observedCount == 0 ? 0 : 4,
+                           "observed pair and observed count must agree")
+        }
+        // Persist exactly the way MilaApp's onSpeakerNamed hook does and
+        // confirm the stored count grows by the observations, not by the
+        // three-sample seed.
+        guard let entry = diarizer.currentProfiles().first(where: { $0.observedCount > 0 }) else {
+            return XCTFail("the recording must have observed at least one sample")
+        }
+        profiles.updateProfile(name: entry.profileName ?? "Unnamed",
+                               embedding: entry.observedCentroid,
+                               sampleCount: entry.observedCount)
+        XCTAssertEqual(alice(profiles)?.sampleCount, 40 + entry.observedCount,
+                       "the seed anchor must never reach persistence")
+    }
 }

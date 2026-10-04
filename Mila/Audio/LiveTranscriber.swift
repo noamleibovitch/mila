@@ -371,6 +371,42 @@ final class LiveTranscriber: ObservableObject {
         }
     }
 
+    /// Post-stop sibling of `applySpeakerLabels`, used after the deferred
+    /// re-clustering pass has rewritten the diarizer's intervals.
+    ///
+    /// `applySpeakerLabels` deliberately skips segments that already carry a
+    /// speaker, which keeps the live UI stable while intervals stream in — but
+    /// at stop every segment the diarizer already labelled is exactly the one
+    /// the correction needs to move. This reassigns by the same maximum-overlap
+    /// rule over *all* segments, so a merged or re-keyed speaker propagates
+    /// into the saved transcript. Segments with no overlapping interval are
+    /// left as they were.
+    func applyReclusteredSpeakerLabels(_ intervals: [(start: Double, end: Double, speaker: String)]) {
+        guard !intervals.isEmpty, !segments.isEmpty else { return }
+        var copy = segments
+        var changed = false
+        for i in 0..<copy.count {
+            let segStart = copy[i].startSeconds
+            let segEnd = copy[i].endSeconds
+            var bestOverlap: Double = 0
+            var bestSpeaker: String? = nil
+            for iv in intervals {
+                let overlap = min(segEnd, iv.end) - max(segStart, iv.start)
+                if overlap > bestOverlap {
+                    bestOverlap = overlap
+                    bestSpeaker = iv.speaker
+                }
+            }
+            if let bestSpeaker, copy[i].speaker != bestSpeaker {
+                copy[i].speaker = bestSpeaker
+                changed = true
+            }
+        }
+        if changed {
+            segments = copy
+        }
+    }
+
     /// Used by `LiveAISession` as the LLM-feed format. Newline-separated
     /// so the LLM can see utterance boundaries, with `[mm:ss]` prefix
     /// per line for time anchoring.
