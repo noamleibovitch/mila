@@ -749,7 +749,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
         // clear `similarityThreshold`. Ties keep `best` (deterministic).
         if let chosen = best,
            let previous = previousSpeakerID,
-           previous != chosen.id,
+           previous != pool[chosen.idx].id,
            let prevSim = similaritiesBySpeaker[previous],
            prevSim < chosen.sim,
            chosen.sim - prevSim < Self.stickinessMargin,

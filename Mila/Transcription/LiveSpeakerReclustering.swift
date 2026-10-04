@@ -203,10 +203,10 @@ enum LiveSpeakerReclustering {
                 // still persists nothing.
                 let observes = record.duration >= LiveSpeakerDiarizer.minObservationDuration
                     && bestSim >= similarityThreshold + LiveSpeakerDiarizer.observationConfidenceMargin
-                fold(into: &clusters[bestIndex], record.embedding, observation: observes)
+                fold(&clusters[bestIndex], record.embedding, observation: observes)
                 destinations[idx] = clusters[bestIndex].id
             } else if bestIndex >= 0, bestSim >= createThreshold {
-                fold(into: &clusters[bestIndex], record.embedding, observation: false)
+                fold(&clusters[bestIndex], record.embedding, observation: false)
                 destinations[idx] = clusters[bestIndex].id
             } else if record.duration >= 1.0 {
                 let newID = nextID(preferred: record.assignedID,
@@ -233,14 +233,14 @@ enum LiveSpeakerReclustering {
                 destinations[idx] = newID
             } else if bestIndex >= 0 {
                 // Too short to mint, but there is a cluster to attach to.
-                fold(into: &clusters[bestIndex], record.embedding, observation: false)
+                fold(&clusters[bestIndex], record.embedding, observation: false)
                 destinations[idx] = clusters[bestIndex].id
             } else if let existing = clusters.firstIndex(where: { $0.id == record.assignedID }) {
                 // Too short to mint, nothing scorable to attach to, but a
                 // cluster for this id already exists (a seeded entry of a
                 // different dimension, or one kept by an earlier record).
                 // Reuse it rather than minting a duplicate.
-                fold(into: &clusters[existing],
+                fold(&clusters[existing],
                      record.embedding,
                      observation: onlineObservation(record, pool: pool, threshold: similarityThreshold))
                 destinations[idx] = record.assignedID
