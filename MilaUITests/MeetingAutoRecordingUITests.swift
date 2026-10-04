@@ -68,6 +68,23 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         waitUntilGone(element(app, "meetingPrompt.primary"))
         waitForLabel(element(app, "meetingTest.counts"), "Starts: 0, stops: 0")
     }
+    func test_prompt_is_reachable_by_keyboard_and_escape_cancels() {
+        let app = launch()
+        defer { app.terminate() }
+        element(app, "meetingTest.auto").click()
+        element(app, "meetingTest.start").click()
+        let subtitle = element(app, "meetingPrompt.countdown")
+        XCTAssertTrue(subtitle.waitForExistence(timeout: 5))
+        for _ in 0..<4 {
+            app.typeKey("`", modifierFlags: .command)
+            if subtitle.label.contains("paused") { break }
+        }
+        XCTAssertTrue(subtitle.label.contains("paused"), "Keyboard window cycling must reach and pause the prompt")
+        app.typeKey(.escape, modifierFlags: [])
+        waitUntilGone(element(app, "meetingPrompt.primary"))
+        waitForLabel(element(app, "meetingTest.counts"), "Starts: 0, stops: 0")
+    }
+
     func test_cancel_start_and_keep_recording() {
         let app = launch()
         defer { app.terminate() }

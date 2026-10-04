@@ -70,6 +70,24 @@ final class MeetingAutoRecordingTests: XCTestCase {
         return try XCTUnwrap(recorder.meetingRecordingURL)
     }
 
+    func test_enable_auto_requires_a_fresh_countdown_before_capture() throws {
+        detector.meetingStarted.send(zoom)
+        let ask = try XCTUnwrap(coordinator.pending)
+        coordinator.performPrompt(id: ask.id, enableAuto: true)
+        let automatic = try XCTUnwrap(coordinator.pending)
+        XCTAssertTrue(automatic.automatic)
+        XCTAssertNotEqual(automatic.id, ask.id)
+        XCTAssertEqual(settings.mode(forBundleID: zoom.bundleID), .auto)
+        XCTAssertEqual(recorder.starts, 0, "Preference change must not immediately capture")
+        coordinator.cancelPrompt(id: automatic.id)
+        XCTAssertEqual(recorder.starts, 0)
+    }
+    func test_long_delivery_gap_cancels_even_when_interaction_was_paused() {
+        var countdown = MeetingPromptCountdown()
+        XCTAssertEqual(countdown.advance(by: 60, paused: true, automatic: true), .dismiss,
+                       "Sleep or a long interruption cancels unattended automation")
+    }
+
     func test_default_ask_and_off_never_schedule_automatic_recording() throws {
         detector.meetingStarted.send(zoom)
         XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
@@ -222,6 +240,7 @@ final class MeetingAutoRecordingTests: XCTestCase {
         detector.meetingStarted.send(zoom)
         let prompt = try XCTUnwrap(coordinator.pending)
         XCTAssertFalse(prompt.automatic)
+        XCTAssertTrue(prompt.startUnavailable)
         coordinator.performPrompt(id: prompt.id)
         XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
         XCTAssertEqual(recorder.starts, 0)
