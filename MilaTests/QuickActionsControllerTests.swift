@@ -57,6 +57,23 @@ final class QuickActionsControllerTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func test_meeting_start_never_toggles_an_existing_manual_recording() async throws {
+        let url = store.freshAudioURL(suggestedName: "Manual meeting safeguard")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        let result = await controller.startMeetingRecording(isStillValid: { true })
+        XCTAssertNil(result)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertEqual(session.fileURL, url)
+        await controller.discardFakeRecordingForTesting()
+    }
+
+    func test_revoked_meeting_start_does_not_request_capture() async {
+        let result = await controller.startMeetingRecording(isStillValid: { false })
+        XCTAssertNil(result)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertNil(session.fileURL)
+    }
+
     // MARK: - Pause / resume
 
     /// Pause and resume drive the session state through the controller.
@@ -899,22 +916,6 @@ final class ShortCapturePolicyTests: XCTestCase {
             source: .meeting, wallClock: wall, captured: wall * ratio))
         XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
             source: .meeting, wallClock: wall, captured: wall * ratio - 0.5))
-    }
-    func test_meeting_start_never_toggles_an_existing_manual_recording() async throws {
-        let url = store.freshAudioURL(suggestedName: "Manual meeting safeguard")
-        await controller.startFakeRecordingForTesting(outputURL: url)
-        let result = await controller.startMeetingRecording(isStillValid: { true })
-        XCTAssertNil(result)
-        XCTAssertTrue(controller.isRecording)
-        XCTAssertEqual(session.fileURL, url)
-        await controller.discardFakeRecordingForTesting()
-    }
-
-    func test_revoked_meeting_start_does_not_request_capture() async {
-        let result = await controller.startMeetingRecording(isStillValid: { false })
-        XCTAssertNil(result)
-        XCTAssertFalse(controller.isRecording)
-        XCTAssertNil(session.fileURL)
     }
 
 }
