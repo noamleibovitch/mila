@@ -16,7 +16,7 @@ final class MeetingAutoRecordingUITests: XCTestCase {
     }
     private func launch() -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = ["--ui-test-clean-store", "--ui-test-meeting-auto"]
+        app.launchArguments = ["--ui-test-clean-store", "--ui-test-meeting-auto", "--ui-test-reset-meeting-auto"]
         app.launch()
         XCTAssertTrue(element(app, "meetingTest.start").waitForExistence(timeout: 20))
         return app
@@ -106,6 +106,7 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         auto.click()
         screenshot(app, containing: "meetings.mode.us.zoom.xos", name: "meeting-auto-settings")
         app.terminate()
+        app.launchArguments.removeAll { $0 == "--ui-test-reset-meeting-auto" }
         app.launch()
         XCTAssertTrue(element(app, "meetingTest.start").waitForExistence(timeout: 20))
         element(app, "meetingTest.start").click()
