@@ -562,7 +562,7 @@ final class LiveSpeakerReclusteringTests: XCTestCase {
         // cos 0.5 to voice A: below the 0.55 match bar, above the 0.40
         // floor, so it attaches online and in the corrected pass without
         // ever entering the persisted observation set.
-        let borderline = zip(a, b).map { $0 * 0.5 + $1 * 0.866 }
+        let borderline = zip(a, baseB()).map { $0 * 0.5 + $1 * 0.866 }
         diarizer.ingest(embedding: borderline, startSeconds: 2, endSeconds: 4)
 
         let result = diarizer.applyReclusteredLabels()
