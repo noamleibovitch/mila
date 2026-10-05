@@ -476,8 +476,10 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
             }
             let converted = try converter?.convert(buffer)
                 ?? AudioConvert.toWhisperFormat(buffer)
-            continuation?.yield(converted)
+            // Finish all producer-side access before handing this mutable
+            // AVAudioPCMBuffer to the asynchronous recording consumer.
             let level = AudioMeter.level(from: converted)
+            continuation?.yield(converted)
             Task { @MainActor [weak parent] in
                 parent?.publishLevel(level)
             }
