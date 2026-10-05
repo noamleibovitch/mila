@@ -253,6 +253,8 @@ still required. Saving and post-recording processing follow your existing settin
 
 ## Changelog
 
+- **Unreleased** — Harden system-audio PCM copying and sample reads against empty or malformed buffers that can crash an in-progress recording; preserve support for planar and interleaved audio.
+
 - **Unreleased** — Quitting during remote transcription safely cancels uploads and leaves unfinished recordings available for automatic retry on the next launch.
 
 - **Unreleased** — Per-app Ask/Auto/Off meeting recording, cancellable start/stop
