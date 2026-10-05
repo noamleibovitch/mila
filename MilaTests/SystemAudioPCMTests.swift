@@ -39,19 +39,31 @@ final class SystemAudioPCMTests: XCTestCase {
         XCTAssertNil(SystemAudioPCM.buffer(from: empty))
     }
 
-    func test_nil_and_truncated_float_storage_does_not_crash_or_meter_garbage() throws {
-        let input = try makePCM(channels: 1, interleaved: false)
-        let list = UnsafeMutableAudioBufferListPointer(input.mutableAudioBufferList)
-        let original = list[0]
-        defer { list[0] = original }
-        // Retain the buffer's allocation and restore before destruction.
-        list[0].mData = nil
-        XCTAssertTrue(AudioConvert.samples(from: input).isEmpty)
-        XCTAssertEqual(AudioMeter.level(from: input), 0)
-        list[0] = original
-        list[0].mDataByteSize = 3
-        XCTAssertTrue(AudioConvert.samples(from: input).isEmpty)
-        XCTAssertEqual(AudioMeter.level(from: input), 0)
+    func test_invalid_float_storage_is_rejected_before_reading_samples() {
+        var values = [Float](repeating: 0.25, count: 32)
+        values.withUnsafeMutableBytes { bytes in
+            let valid = AudioBuffer(mNumberChannels: 1, mDataByteSize: UInt32(bytes.count), mData: bytes.baseAddress)
+            var invalid = [valid, valid, valid]
+            invalid[0].mData = nil
+            invalid[1].mDataByteSize = 3
+            invalid[2].mNumberChannels = 2
+            for storage in invalid {
+                let result: Bool? = AudioConvert.withFloatChannel(from: storage, frameCount: 32, stride: 1) { _, _, _ in
+                    XCTFail("Malformed storage must never reach a sample consumer")
+                    return true
+                }
+                XCTAssertNil(result)
+            }
+            let overflow: Bool? = AudioConvert.withFloatChannel(from: valid, frameCount: Int.max, stride: 1) { _, _, _ in
+                XCTFail("Overflowing extent must never reach a sample consumer")
+                return true
+            }
+            XCTAssertNil(overflow)
+            let actual = AudioConvert.withFloatChannel(from: valid, frameCount: 32, stride: 1) { data, frames, _ in
+                Array(UnsafeBufferPointer(start: data, count: frames))
+            }
+            XCTAssertEqual(actual, Array(repeating: 0.25, count: 32))
+        }
     }
 
     func test_channel_zero_meter_still_handles_planar_and_interleaved_stereo() throws {

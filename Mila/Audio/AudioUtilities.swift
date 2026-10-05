@@ -65,14 +65,22 @@ enum AudioConvert {
                   frames > 0, frames <= Int(buffer.frameCapacity), channels > 0 else { return nil }
             let list = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
             let stride = buffer.format.isInterleaved ? channels : 1
-            guard list.count >= (buffer.format.isInterleaved ? 1 : channels),
-                  list[0].mNumberChannels == UInt32(stride),
-                  let data = list[0].mData else { return nil }
-            let (samples, sampleOverflow) = frames.multipliedReportingOverflow(by: stride)
-            let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
-            guard !sampleOverflow, !byteOverflow, bytes <= Int(list[0].mDataByteSize) else { return nil }
-            return body(UnsafePointer(data.assumingMemoryBound(to: Float.self)), frames, stride)
+            guard list.count >= (buffer.format.isInterleaved ? 1 : channels) else { return nil }
+            return withFloatChannel(from: list[0], frameCount: frames, stride: stride, body)
         }
+    }
+
+    /// Validate the raw Float32 storage at the boundary before constructing any
+    /// typed sample view. Kept separate so malformed packets can be tested
+    /// without AVAudioPCMBuffer normalizing its buffer-list metadata on access.
+    static func withFloatChannel<R>(from storage: AudioBuffer, frameCount: Int, stride: Int,
+                                    _ body: (UnsafePointer<Float>, Int, Int) -> R) -> R? {
+        guard frameCount > 0, stride > 0, Int(storage.mNumberChannels) == stride,
+              let data = storage.mData else { return nil }
+        let (samples, sampleOverflow) = frameCount.multipliedReportingOverflow(by: stride)
+        let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        guard !sampleOverflow, !byteOverflow, bytes <= Int(storage.mDataByteSize) else { return nil }
+        return body(UnsafePointer(data.assumingMemoryBound(to: Float.self)), frameCount, stride)
     }
 
     /// Pull channel-zero float samples (normally mono, Whisper-shaped).
