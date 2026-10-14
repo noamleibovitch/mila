@@ -30,20 +30,18 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     /// Lives here, not in a side ledger, so deleting the profile forgets
     /// them too (see `ImportedShareToken`).
     var importedShares: [ImportedShareToken]
-
-    init(id: UUID, name: String, embedding: [Float], sampleCount: Int,
-         createdAt: Date, lastSeenAt: Date,
-         embeddingModel: String? = nil,
-         importedShares: [ImportedShareToken] = []) {
-        self.id = id
-        self.name = name
-        self.embedding = embedding
-        self.sampleCount = sampleCount
-        self.createdAt = createdAt
-        self.lastSeenAt = lastSeenAt
-        self.embeddingModel = embeddingModel
-        self.importedShares = importedShares
-    }
+    /// The centroid observed in the **most recent recording** that named this
+    /// speaker, or nil for a profile written before this field existed. The
+    /// long-run `embedding` averages every acoustics the speaker was ever
+    /// recorded in, so a headset-then-room history points at a mix that may
+    /// match neither; keeping today's centroid too lets `match` accept
+    /// `max(stored, recent)` and so only ever helps a returning speaker.
+    /// Metadata only — it never joins the running mean and never affects
+    /// `sampleCount`.
+    var recentCentroid: [Float]?
+    /// How many observations `recentCentroid` came from. 0 exactly when
+    /// `recentCentroid` is nil; positive otherwise.
+    var recentCount: Int
 
     /// The stamp, with legacy rows resolved to the only model that has ever
     /// shipped. Valid for exactly as long as that stays true — see
@@ -52,42 +50,37 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
         embeddingModel ?? SpeakerEmbeddingModel.current.id
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case id, name, embedding, sampleCount, createdAt, lastSeenAt, embeddingModel, importedShares
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(UUID.self, forKey: .id)
-        name = try c.decode(String.self, forKey: .name)
-        embedding = try c.decode([Float].self, forKey: .embedding)
-        sampleCount = try c.decode(Int.self, forKey: .sampleCount)
-        createdAt = try c.decode(Date.self, forKey: .createdAt)
-        lastSeenAt = try c.decode(Date.self, forKey: .lastSeenAt)
-        embeddingModel = try c.decodeIfPresent(String.self, forKey: .embeddingModel)
-        importedShares = try c.decodeIfPresent([ImportedShareToken].self, forKey: .importedShares) ?? []
-    }
-
-    /// The two new keys are written only when they carry something, so a
-    /// `speaker-profiles.json` nobody has imported into stays byte-identical
-    /// to what earlier builds wrote — and an earlier build reading a newer
-    /// file ignores the keys it doesn't know.
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(id, forKey: .id)
-        try c.encode(name, forKey: .name)
-        try c.encode(embedding, forKey: .embedding)
-        try c.encode(sampleCount, forKey: .sampleCount)
-        try c.encode(createdAt, forKey: .createdAt)
-        try c.encode(lastSeenAt, forKey: .lastSeenAt)
-        try c.encodeIfPresent(embeddingModel, forKey: .embeddingModel)
-        if !importedShares.isEmpty {
-            try c.encode(importedShares, forKey: .importedShares)
-        }
-    }
-
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: VoiceProfile, rhs: VoiceProfile) -> Bool { lhs.id == rhs.id }
+
+    /// Keys are declared explicitly so the two recent fields can be decoded
+    /// leniently (see `init(from:)`) while everything else — including the
+    /// model stamp and import tokens — keeps the synthesized shape.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, embedding, sampleCount, createdAt, lastSeenAt
+        case embeddingModel, importedShares, recentCentroid, recentCount
+    }
+
+    /// Explicit memberwise initializer, because defining `init(from:)` below
+    /// suppresses the synthesized one. The optional tail all defaults, so
+    /// every existing call site — legacy four-field, model/import, or
+    /// recent-pair — keeps compiling unchanged.
+    init(id: UUID, name: String, embedding: [Float], sampleCount: Int,
+         createdAt: Date, lastSeenAt: Date,
+         embeddingModel: String? = nil,
+         importedShares: [ImportedShareToken] = [],
+         recentCentroid: [Float]? = nil, recentCount: Int = 0) {
+        self.id = id
+        self.name = name
+        self.embedding = embedding
+        self.sampleCount = sampleCount
+        self.createdAt = createdAt
+        self.lastSeenAt = lastSeenAt
+        self.embeddingModel = embeddingModel
+        self.importedShares = importedShares
+        self.recentCentroid = recentCentroid
+        self.recentCount = recentCount
+    }
 
     /// Ceiling on `sampleCount`. Not a capacity limit in any meaningful sense
     /// — it is roughly 4.6 × 10¹⁸ utterances — but a guarantee that **any two
@@ -180,6 +173,14 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     /// 256 here and nowhere else would also make the store refuse to read
     /// back exactly what `updateProfile` accepts, and quietly drop a user's
     /// profiles on any future model change.
+    ///
+    /// The two recent fields are validated **separately** by
+    /// `recentUnusableReason`, and *not* rolled into this property: a profile
+    /// whose stored centroid is sound must never become unusable just
+    /// because its recent pair is corrupt. `load()` drops the bad recent pair
+    /// (via `droppingInvalidRecentPair()`) and keeps the profile; this
+    /// property answers only the question "is the stored voice itself
+    /// sound?".
     var unusableReason: String? {
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "empty name" }
         if embedding.isEmpty { return "empty embedding" }
@@ -188,6 +189,94 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
         if sampleCount <= 0 { return "non-positive sampleCount (\(sampleCount))" }
         if sampleCount > Self.maxSampleCount { return "sampleCount out of range (\(sampleCount))" }
         return nil
+    }
+
+    /// Why the *recent pair* is unusable, or nil when it is sound. Kept
+    /// separate from `unusableReason` on purpose: a bad recent pair is
+    /// repairable by dropping it, while the stored centroid remains sound, so
+    /// `load()` must not reject the whole profile over it (mirroring the
+    /// per-entry drop it already performs for a wholly bad entry).
+    ///
+    /// * an absent centroid requires `recentCount == 0` — a count with
+    ///   nothing behind it describes observations that do not exist;
+    /// * a present centroid must be non-empty, all-finite (the same NaN
+    ///   poisoning `unusableReason` documents), within `maxEmbeddingMagnitude`
+    ///   (the same fold-overflow bound the stored embedding carries), and
+    ///   carry a positive count within `1...maxSampleCount` (the same overflow
+    ///   bound the stored count carries, because `recentCount` is eventually
+    ///   copied into a pool seed);
+    /// * a recent centroid of a *different* width than the stored embedding
+    ///   is deliberately tolerated: it only ever reaches `cosineSimilarity`,
+    ///   which returns 0 on a dimension mismatch, so it is inert rather than
+    ///   dangerous.
+    var recentUnusableReason: String? {
+        guard let recent = recentCentroid else {
+            if recentCount != 0 { return "recentCount without recentCentroid (\(recentCount))" }
+            return nil
+        }
+        if recent.isEmpty { return "empty recentCentroid" }
+        if recent.contains(where: { !$0.isFinite }) { return "non-finite recentCentroid value" }
+        if recent.contains(where: { abs($0) > Self.maxEmbeddingMagnitude }) { return "recentCentroid value out of range" }
+        if recentCount <= 0 { return "non-positive recentCount (\(recentCount))" }
+        if recentCount > Self.maxSampleCount { return "recentCount out of range (\(recentCount))" }
+        return nil
+    }
+
+    /// A copy with the recent pair cleared, leaving the stored centroid
+    /// untouched. Used by `load()`'s per-entry repair.
+    func droppingInvalidRecentPair() -> VoiceProfile {
+        var copy = self
+        copy.recentCentroid = nil
+        copy.recentCount = 0
+        return copy
+    }
+
+    /// Decode every stored field as before, then read the optional tail. The
+    /// model stamp and import tokens keep the synthesized shape — absent
+    /// keys are the ordinary case and load as `nil`/`[]`. The two recent
+    /// fields are read **leniently**: `speaker-profiles.json` is a
+    /// user-editable plain file, so an **absence** of both keys is the
+    /// ordinary case and must load as `nil`/`0`; a malformed *presence*
+    /// (wrong type) also degrades to `nil`/`0` here rather than failing the
+    /// whole document, so a single bad field cannot cost the user every other
+    /// voice they trained. A type-correct but semantically-bad recent pair
+    /// (NaN, negative or out-of-range count, over-magnitude component)
+    /// survives this decode and is caught by `load()` through
+    /// `recentUnusableReason`, which drops only the recent pair.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        embedding = try container.decode([Float].self, forKey: .embedding)
+        sampleCount = try container.decode(Int.self, forKey: .sampleCount)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        lastSeenAt = try container.decode(Date.self, forKey: .lastSeenAt)
+        embeddingModel = try container.decodeIfPresent(String.self, forKey: .embeddingModel)
+        importedShares = try container.decodeIfPresent([ImportedShareToken].self, forKey: .importedShares) ?? []
+        recentCentroid = try? container.decodeIfPresent([Float].self, forKey: .recentCentroid)
+        recentCount = (try? container.decodeIfPresent(Int.self, forKey: .recentCount)) ?? 0
+    }
+
+    /// The optional tail is written only when it carries something, so a
+    /// `speaker-profiles.json` nobody has imported into and no recent pair has
+    /// touched stays byte-identical to what earlier builds wrote — and an
+    /// earlier build reading a newer file ignores the keys it doesn't know.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(embedding, forKey: .embedding)
+        try c.encode(sampleCount, forKey: .sampleCount)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(lastSeenAt, forKey: .lastSeenAt)
+        try c.encodeIfPresent(embeddingModel, forKey: .embeddingModel)
+        if !importedShares.isEmpty {
+            try c.encode(importedShares, forKey: .importedShares)
+        }
+        try c.encodeIfPresent(recentCentroid, forKey: .recentCentroid)
+        if recentCentroid != nil {
+            try c.encode(recentCount, forKey: .recentCount)
+        }
     }
 }
 
@@ -461,6 +550,14 @@ final class SpeakerProfileStore: ObservableObject {
             }
             profiles[idx].embedding = merged
             profiles[idx].sampleCount = storedCount
+            // Refresh the recent pair to **this recording's** centroid and
+            // count. `embedding`/`sampleCount` here are exactly the observed
+            // delta the caller passed (`MilaApp`'s `onSpeakerNamed` hook), so
+            // the pair is always the latest recording, never an accumulation.
+            // It is metadata only: the `rawTotal`/`storedCount` arithmetic
+            // above is deliberately untouched by it.
+            profiles[idx].recentCentroid = embedding
+            profiles[idx].recentCount = sampleCount
             profiles[idx].lastSeenAt = Date()
             // A legacy row gets its stamp the first time it is touched.
             if profiles[idx].embeddingModel == nil { profiles[idx].embeddingModel = embeddingModel }
@@ -474,7 +571,9 @@ final class SpeakerProfileStore: ObservableObject {
                 sampleCount: sampleCount,
                 createdAt: Date(),
                 lastSeenAt: Date(),
-                embeddingModel: embeddingModel
+                embeddingModel: embeddingModel,
+                recentCentroid: embedding,
+                recentCount: sampleCount
             )
             profiles.append(profile)
             profileLog.log("updateProfile: created \(trimmed, privacy: .private) (\(sampleCount) samples)")
@@ -529,6 +628,24 @@ final class SpeakerProfileStore: ObservableObject {
 
         profiles[idx].embedding = restored
         profiles[idx].sampleCount = remaining
+        // The recording this observation came from is the one the recent pair
+        // records. If it is *this* observation — same count, same dimension,
+        // and cosine ~1 — then un-naming it invalidates the recent pair too,
+        // so clear it. Do not try to reconstruct an earlier "recent": which
+        // recording was second-most-recent is unknowable from here, and
+        // guessing would be worse than nil, which degrades to stored-only
+        // matching. A recent centroid of a different dimension can never be
+        // this observation (the stored-dimension guard above already passed
+        // for the *stored* pair, but the recent pair is separate), and a
+        // non-matching pair is left alone.
+        if let recent = existing.recentCentroid,
+           existing.recentCount == sampleCount,
+           recent.count == embedding.count,
+           cosineSimilarity(recent, embedding) >= 1.0 - 1e-6 {
+            profiles[idx].recentCentroid = nil
+            profiles[idx].recentCount = 0
+            profileLog.log("subtractObservation: cleared recent pair for \(trimmed, privacy: .private)")
+        }
         profileLog.log("subtractObservation: corrected \(trimmed, privacy: .private) (now \(remaining) samples)")
         save()
     }
@@ -796,6 +913,12 @@ final class SpeakerProfileStore: ObservableObject {
         for token in absorb.importedShares where !profiles[keepIdx].importedShares.contains(token) {
             profiles[keepIdx].importedShares.append(token)
         }
+        // The absorbed profile's recent pair goes with it — discarding it is
+        // correct and deliberate. The merged `embedding` above represents the
+        // same person's full history, while a recent pair is per-last-
+        // recording and the kept profile's is the only one still evidenced by
+        // an actual recording. Reconstructing a combined "recent" would mean
+        // inventing acoustics no recording stands behind.
         profiles.removeAll { $0.id == absorb.id }
         profileLog.log("mergeProfiles: merged \(absorbName, privacy: .private) into \(keepName, privacy: .private)")
         save()
@@ -804,11 +927,22 @@ final class SpeakerProfileStore: ObservableObject {
 
     /// Match an embedding against all stored profiles. Returns the best
     /// match above the threshold, or nil.
+    ///
+    /// Similarity to a profile is `max` of the long-run stored centroid and
+    /// the most recent recording's centroid (when there is one). The recent
+    /// pair can only ever *raise* a profile's score, so this degrades safely:
+    /// a returning speaker whose acoustics shifted is recognised where
+    /// stored-only would have missed, and nobody who matched before stops
+    /// matching. A recent centroid of a different width is tolerated —
+    /// `cosineSimilarity` returns 0 for a mismatch, so it simply does not
+    /// help. Threshold and best-choice logic are unchanged.
     func match(embedding: [Float], threshold: Double = 0.55) -> VoiceProfile? {
         guard settings.isConfigured else { return nil }
         var best: (profile: VoiceProfile, sim: Double)?
         for profile in profiles {
-            let sim = cosineSimilarity(embedding, profile.embedding)
+            let storedSim = cosineSimilarity(embedding, profile.embedding)
+            let recentSim = profile.recentCentroid.map { cosineSimilarity(embedding, $0) } ?? -1.0
+            let sim = max(storedSim, recentSim)
             if sim >= threshold, best == nil || sim > best!.sim {
                 best = (profile, sim)
             }
@@ -820,10 +954,18 @@ final class SpeakerProfileStore: ObservableObject {
     ///
     /// The seed gate. Returns nothing while the feature is off — and while
     /// off `profiles` is empty anyway, since the file was never parsed.
-    func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int)] {
+    ///
+    /// The recent pair rides along as two extra tuple fields so the metadata
+    /// is available to the diarizer's pool entry. It is **not** matched
+    /// against yet: `LiveSpeakerDiarizer.seedPool` stores it but `assign`
+    /// still compares only the stored centroid. Carrying the recent pair into
+    /// the live pool's matching is a deliberately separate change (#206).
+    func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int,
+                            recentCentroid: [Float]?, recentCount: Int)] {
         guard settings.isConfigured else { return [] }
         return profiles.map { p in
-            (id: p.name, name: p.name, centroid: p.embedding, sampleCount: p.sampleCount)
+            (id: p.name, name: p.name, centroid: p.embedding, sampleCount: p.sampleCount,
+             recentCentroid: p.recentCentroid, recentCount: p.recentCount)
         }
     }
 
@@ -1188,6 +1330,14 @@ final class SpeakerProfileStore: ObservableObject {
     /// until the next legitimate `save()` and can still be repaired by hand
     /// until then.
     ///
+    /// **A bad recent pair is repaired, not rejected.** The stored centroid of
+    /// a profile whose only fault is its `recentCentroid`/`recentCount` is
+    /// still sound and still perfectly usable, so this drops the recent pair
+    /// to `nil`/`0` and keeps the profile — the same per-entry,
+    /// drop-what-is-broken spirit as the whole-entry drop above, applied one
+    /// level finer. Rejecting the profile outright would throw away a good
+    /// voice over an optional matching aid.
+    ///
     /// Per-entry granularity is only available for *semantic* invalidity.
     /// Malformed JSON, or a number too large for its Swift type, fails inside
     /// `decode` before any entry exists, so those stay all-or-nothing — the
@@ -1207,10 +1357,15 @@ final class SpeakerProfileStore: ObservableObject {
             let decoded = try decoder.decode([VoiceProfile].self, from: data)
             var accepted: [VoiceProfile] = []
             accepted.reserveCapacity(decoded.count)
-            for profile in decoded {
+            for decodedProfile in decoded {
+                var profile = decodedProfile
                 if let reason = profile.unusableReason {
                     profileLog.log("load: dropped \(profile.name, privacy: .private) — \(reason, privacy: .public)")
                     continue
+                }
+                if let recentReason = profile.recentUnusableReason {
+                    profileLog.log("load: cleared recent pair for \(profile.name, privacy: .private) — \(recentReason, privacy: .public)")
+                    profile = profile.droppingInvalidRecentPair()
                 }
                 accepted.append(profile)
             }

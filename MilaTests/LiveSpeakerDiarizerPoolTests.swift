@@ -239,7 +239,10 @@ final class LiveSpeakerDiarizerPoolTests: XCTestCase {
         XCTAssertEqual(d.assign(embedding: [0, 1, 0, 0]), "SPEAKER_00",
             "sim 0 clears a 0 threshold, so a same-dimension entry is still a confident match")
         let profile = d.currentProfiles().first
-        XCTAssertEqual(profile?.observedCount, 2, "Both embeddings must have folded in")
+        XCTAssertEqual(profile?.observedCount, 1,
+            "sim 0 clears the 0 threshold for matching, but learning is gated by the 0.03 margin — only the enrollment utterance observes")
+        XCTAssertEqual(d.matchingSampleCount(forSpeaker: "SPEAKER_00"), 2,
+            "the confident match still folds the matching representation — the dimension guard's fold is intact")
         XCTAssertEqual(profile?.observedCentroid.count, 4)
     }
 
