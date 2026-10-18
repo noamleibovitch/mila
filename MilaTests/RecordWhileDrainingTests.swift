@@ -99,7 +99,7 @@ final class RecordWhileDrainingTests: XCTestCase {
         transcriber?.stop()
         if session?.state != .idle { _ = await session?.stop() }
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        for suffix in ["diarization", "language", "llm", "liveAI"] {
+        for suffix in ["diarization", "language", "llm", "liveAI", "storage"] {
             UserDefaults().removePersistentDomain(forName: "\(suitePrefix).\(suffix)")
         }
         try await super.tearDown()
@@ -260,6 +260,38 @@ final class RecordWhileDrainingTests: XCTestCase {
         XCTAssertTrue(transcriber.segments.isEmpty)
         XCTAssertFalse(controller.isAwaitingLivePipeline)
 
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    /// Auto-save must apply even when this capture stops before receiving the
+    /// shared live pipeline. It reveals only its own saved row and cannot
+    /// snapshot, close or cancel the previous recording's pipeline.
+    func test_auto_save_before_live_handover_reveals_own_row_and_preserves_previous_drain() async throws {
+        simulatePreviousRecordingDraining()
+        let defaults = UserDefaults(suiteName: "\(suitePrefix).storage")!
+        defaults.removePersistentDomain(forName: "\(suitePrefix).storage")
+        let storage = RecordingStorageSettings(defaults: defaults)
+        storage.autoSaveRecordings = true
+        controller.storageSettings = storage
+        let url = try freshWAV("AutoSaveBeforeHandover")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isAwaitingLivePipeline)
+
+        await controller.stopRecording()
+
+        let saved = try XCTUnwrap(row(for: url))
+        XCTAssertNil(postRecording.pending, "Auto-save must skip the naming sheet")
+        XCTAssertEqual(controller.consumeAutoSaveReveal(), saved.id)
+        XCTAssertNil(controller.consumeAutoSaveReveal(), "Reveal must be consumed only once")
+        XCTAssertTrue(saved.fullText.isEmpty)
+        XCTAssertTrue(saved.segments.isEmpty)
+        XCTAssertEqual(saved.status, .pending, "The saved WAV must go to the batch pass")
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertTrue(controller.isFinalizingRecording)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"])
+        XCTAssertEqual(LiveTranscriptSnapshot.read(root: sidecarRoot)?.state, .recording)
+        controller.isFinalizingRecording = false
         await controller.awaitFinalizeTails()
         await service.waitForIdle()
     }
