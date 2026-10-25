@@ -44,7 +44,7 @@ final class AutoSaveRecordingUITests: XCTestCase {
         let enabled = launch(wav: wav, tiny: tiny)
         let restoredOn = openAudioSettings(enabled)
         assertToggle(restoredOn, isOn: true)
-        enabled.typeKey("w", modifierFlags: .command) // Close Settings, keep main window.
+        closeAudioSettings(enabled)
         let transcriptAnchor = stopFixture(enabled)
 
         let title = element(enabled, "detail.title.label")
@@ -93,7 +93,7 @@ final class AutoSaveRecordingUITests: XCTestCase {
         let disabled = launch(wav: wav, tiny: tiny)
         let restoredOff = openAudioSettings(disabled)
         assertToggle(restoredOff, isOn: false)
-        disabled.typeKey("w", modifierFlags: .command)
+        closeAudioSettings(disabled)
         _ = stopFixture(disabled)
         XCTAssertTrue(namingSheet(disabled).waitForExistence(timeout: 60),
                       "With auto-save disabled, ordinary Stop must still ask for a name")
@@ -148,6 +148,20 @@ final class AutoSaveRecordingUITests: XCTestCase {
         // layout wrapper. Reachability and operation are checked on the switch;
         // an AX control-frame size is not a layout-wrapper measurement.
         return toggle
+    }
+
+    private func closeAudioSettings(_ application: XCUIApplication) {
+        // Target the native Settings window rather than sending a keyboard
+        // shortcut whose recipient can change as the fixture starts recording.
+        let settings = application.windows["com_apple_SwiftUI_Settings_window"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        let close = settings.buttons["_XCUI:CloseWindow"]
+        XCTAssertTrue(close.isHittable, "Settings must offer its native close control")
+        close.click()
+        let closed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: settings)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed,
+                       "Settings must close before reaching the recording controls")
     }
 
     private func assertToggle(_ toggle: XCUIElement, isOn: Bool) {
