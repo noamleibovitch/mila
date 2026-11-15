@@ -1496,6 +1496,63 @@ private struct AIFeatureRow<Content: View>: View {
 /// those overwrites, however they reach the binding. `⌘Z` is what users try
 /// first; the "Undo" link is here because a recovery path you can see beats one
 /// that depends on where first responder happens to be.
+/// The optional context file for the automatic summary: a path field, a
+/// Choose button, and one line saying what state the file is in. The state is
+/// read from disk on every render of an expanded section, which is a single
+/// small read behind a disclosure the user opened on purpose.
+private struct SummaryContextFileRow: View {
+    @Binding var path: String
+    var isEnabled = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Context file")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            HStack {
+                TextField("(none) e.g. ~/notes/meeting-context.md", text: $path)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .accessibilityIdentifier("llm.summary.contextFile.field")
+                Button("Choose\u{2026}") { choose() }
+                    .accessibilityIdentifier("llm.summary.contextFile.choose")
+            }
+            .disabled(!isEnabled)
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var caption: String {
+        switch SummaryPromptContext.loadContextFile(at: path) {
+        case .notSet:
+            return "Optional. A text or Markdown file sent before the prompt on every summary: who the people are, product names, house style. Only its text is sent, to the same provider as the transcript."
+        case .ready(let text):
+            return "Sent before the prompt on every summary (\(text.count) characters). Read again each time, so edits apply to the next summary."
+        case .missing:
+            return "No file at this path. Summaries run without it."
+        case .unreadable:
+            return "This file can\u{2019}t be read as UTF-8 text. Summaries run without it."
+        case .tooLarge:
+            return "This file is over \(SummaryPromptContext.maxContextFileBytes / 1024) KB. Summaries run without it."
+        case .empty:
+            return "This file is empty. Summaries run without it."
+        }
+    }
+
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            path = url.path
+        }
+    }
+}
+
 private struct AIPromptEditor: View {
     let title: String
     @Binding var text: String
@@ -1879,8 +1936,10 @@ private struct AIFeaturesSettingsTab: View {
                                    // user wonder where the extra list came
                                    // from — or delete it from their own prompt
                                    // and find it still arriving.
-                                   caption: "Sent with the full transcript. Mila also asks for the action items alongside it. `{{LANGUAGE}}` becomes the output language above.",
+                                   caption: "Sent with the full transcript. Mila also asks for the action items alongside it. `{{LANGUAGE}}` becomes the output language above. Also available: `{{TITLE}}`, `{{DATE}}`, `{{DURATION}}`, `{{SPEAKERS}}`, `{{MY_NAME}}`.",
                                    isEnabled: settings.summaryEnabled)
+                    SummaryContextFileRow(path: $settings.summaryContextFile,
+                                          isEnabled: settings.summaryEnabled)
                 }
                 Divider()
 

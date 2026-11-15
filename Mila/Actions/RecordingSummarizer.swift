@@ -62,6 +62,11 @@ final class RecordingSummarizer: ObservableObject {
 
     private let runLLM: RunLLM
 
+    /// The user's own name ("Your name", Settings → Speakers), for the
+    /// summary prompt's `{{MY_NAME}}`. A closure so the summarizer does not
+    /// hold a settings object it has no other use for.
+    private let myName: @MainActor () -> String?
+
     /// Background work tracked per-recording so a second `summarizeIfNeeded`
     /// call for the same id (e.g. a re-transcribe trigger) doesn't spawn
     /// two overlapping CLI invocations.
@@ -209,6 +214,7 @@ final class RecordingSummarizer: ObservableObject {
     init(store: RecordingStore,
          llmSettings: LLMSettings,
          liveAISettings: LiveAISettings,
+         myName: @escaping @MainActor () -> String? = { nil },
          runLLM: @escaping RunLLM = { tool, prompt, transcript, executableOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport in
              try await LLMRunner.run(
                  tool: tool,
@@ -230,6 +236,7 @@ final class RecordingSummarizer: ObservableObject {
         self.store = store
         self.llmSettings = llmSettings
         self.liveAISettings = liveAISettings
+        self.myName = myName
         self.runLLM = runLLM
 
         // Backfill on off→on transitions of LLM configured-ness. The
@@ -784,8 +791,22 @@ final class RecordingSummarizer: ObservableObject {
         // pick while the call is out is caught by the completion.
         let promptLanguageName = Self.promptLanguageName(for: recording,
                                                          global: liveAISettings.outputLanguage)
-        let basePrompt = liveAISettings.summaryPrompt
-            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // The user's prompt with this recording's facts filled in, behind
+        // the optional context file. Both are resolved per run: the file is
+        // re-read each time, so an edit to it reaches the next summary, and
+        // either one changing makes a `regenerate` a different call.
+        let facts = SummaryPromptContext.resolveVariables(
+            in: liveAISettings.summaryPrompt
+                .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
+            recording: recording,
+            myName: myName())
+        let context = SummaryPromptContext.loadContextFile(at: llmSettings.summaryContextFile)
+        if context != .notSet, context.text == nil {
+            // The state names the failure and nothing else: the path is the
+            // user's and stays out of the log.
+            summarizerLog.log("context file not sent for \(self.shortID(recording.id), privacy: .public): \(String(describing: context), privacy: .public)")
+        }
+        let basePrompt = SummaryPromptContext.prompt(facts, withContext: context.text)
         // Wrap the user's plain-text summary prompt so the one-shot call
         // also returns action items. Restores the summary + action-items
         // pair the pre-#87 inline final Live-AI tick used to produce. See

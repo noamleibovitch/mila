@@ -563,9 +563,11 @@ struct MilaApp: App {
         }
         let liveDiar = LiveSpeakerDiarizer()
         let liveSession = LiveAISession(llmSettings: llm, liveAISettings: liveAI)
+        let speakerIdentity = SpeakerIdentitySettings()
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
-                                             liveAISettings: liveAI)
+                                             liveAISettings: liveAI,
+                                             myName: { [speakerIdentity] in speakerIdentity.resolvedName })
         // Speaker-name SUGGESTIONS (issue #348): "Your name" for the one voice
         // on a mic-only recording, and names the transcript states, offered
         // for one-click accept. Runs once per fresh completion, after that
@@ -573,7 +575,6 @@ struct MilaApp: App {
         // `finalizeTail`, `suggestIfPending` in `onSummaryFinished`). Owned
         // by `actions` (strong, like its other late-bound collaborators);
         // every closure here holds it weakly.
-        let speakerIdentity = SpeakerIdentitySettings()
         let nameSuggester = SpeakerNameSuggester(store: store,
                                                  llmSettings: llm,
                                                  liveAISettings: liveAI,

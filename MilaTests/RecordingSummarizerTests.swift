@@ -295,6 +295,83 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(final.summary, "SECOND", "the stale-name output must never be stored")
     }
 
+    // MARK: - Prompt variables and context file
+
+    /// The user's prompt gets this recording's facts before it is sent.
+    func test_summarize_fills_prompt_variables_from_the_recording() async throws {
+        llm.tool = .claude
+        liveAI.summaryPrompt = "Meeting {{TITLE}} with {{SPEAKERS}}, {{DURATION}}. I am {{MY_NAME}}."
+        var prompts: [String] = []
+        summarizer = RecordingSummarizer(store: store, llmSettings: llm, liveAISettings: liveAI,
+                                         myName: { "Dana" },
+                                         runLLM: { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            return "summary"
+        })
+
+        var rec = try addDiarizedRecording(names: ["SPEAKER_00": "Dana", "SPEAKER_01": "Yossi"])
+        rec.duration = 600
+        XCTAssertTrue(store.update(rec))
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let prompt = try XCTUnwrap(prompts.first)
+        XCTAssertTrue(prompt.hasPrefix("Meeting Diarized with Dana, Yossi, 10 min. I am Dana."),
+                      "got: \(prompt.prefix(120))")
+    }
+
+    /// A configured context file travels ahead of the prompt; the prompt
+    /// itself still ends with the action-items contract.
+    func test_summarize_sends_the_context_file_before_the_prompt() async throws {
+        llm.tool = .claude
+        let file = tempRoot.appendingPathComponent("context.md")
+        try Data("Dana leads Platform.".utf8).write(to: file)
+        llm.summaryContextFile = file.path
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            return "summary"
+        }
+
+        let rec = try addRecording(named: "Ctx", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let prompt = try XCTUnwrap(prompts.first)
+        let context = try XCTUnwrap(prompt.range(of: "<context>\nDana leads Platform.\n</context>"))
+        let instructions = try XCTUnwrap(prompt.range(of: "You are summarizing a meeting transcript."))
+        XCTAssertLessThan(context.upperBound, instructions.lowerBound)
+        XCTAssertTrue(prompt.contains(RecordingSummarizer.actionItemsSentinel))
+    }
+
+    /// A context file that has gone missing must not cost the user their
+    /// summary: the call goes out exactly as it would with no file set.
+    func test_summarize_still_runs_when_the_context_file_is_missing() async throws {
+        llm.tool = .claude
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            return "summary"
+        }
+        let rec = try addRecording(named: "NoCtx", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        llm.summaryContextFile = tempRoot.appendingPathComponent("gone.md").path
+        summarizer.regenerate(try XCTUnwrap(store.recordings.first { $0.id == rec.id }))
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertEqual(prompts[0], prompts[1])
+        XCTAssertFalse(prompts[1].contains("<context>"))
+    }
+
+    func test_summary_context_file_persists() {
+        llm.summaryContextFile = "~/notes/context.md"
+        XCTAssertEqual(LLMSettings(defaults: llmDefaults).summaryContextFile, "~/notes/context.md")
+        XCTAssertEqual(llmDefaults.string(forKey: "llm.summary.contextFile"), "~/notes/context.md")
+    }
+
     /// Empty CLI output must NOT clobber a (currently nil) summary — we
     /// don't want a wedged CLI to mask the recording as "summarized".
     func test_summarize_drops_empty_output() async throws {
