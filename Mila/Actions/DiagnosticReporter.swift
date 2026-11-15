@@ -216,7 +216,7 @@ enum DiagnosticReporter {
     static let exportedSettingsPrefixes: [String] = [
         "audio.", "audioInput.", "bundle.", "claudeSetup.", "coreml.",
         "detail.", "diarization.", "downloads.", "home.", "hotkeys.", "liveAI.", "llm.",
-        "mcp.", "meetingDetection.", "model.", "obsidian.", "recording.",
+        "mcp.", "meetingDetection.", "model.", "obsidian.", "postCommand.", "recording.",
         "recordings.", "remote.", "rename.", "speakers.", "storage.",
         "transcription.", "updates.", "voiceMemos.", "whatsNew.",
         "selectedModelName"
@@ -236,6 +236,8 @@ enum DiagnosticReporter {
     ///     (that is how "the summary mentions last week's call" reports
     ///     usually resolve). The length still shows whether one is set and
     ///     whether it is the default's size;
+    ///   - `postCommand.command` is a path the user chose plus arguments that
+    ///     can carry a webhook URL or a token — reported as `<N chars>`;
     ///   - `obsidian.writtenIndex` maps recording ids to vault paths derived
     ///     from recording titles — reported as an entry count;
     ///   - everything else goes through `sanitizedValue` (Data, i.e.
@@ -249,6 +251,8 @@ enum DiagnosticReporter {
                 || lower.contains("apikey") || lower.contains("password") {
                 scoped[key] = "<redacted>"
             } else if lower.contains("prompt"), let text = value as? String {
+                scoped[key] = "<\(text.count) chars>"
+            } else if key == PostRecordingCommandSettings.commandKey, let text = value as? String {
                 scoped[key] = "<\(text.count) chars>"
             } else if key == "obsidian.writtenIndex" {
                 let count = (value as? [String: Any])?.count ?? (value as? [Any])?.count ?? 0
