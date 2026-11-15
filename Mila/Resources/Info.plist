@@ -55,6 +55,8 @@
 	<false/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Mila uses AppleEvents to paste dictated text into the active app.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Mila reads the calendars you choose to name a recording after the meeting it was made in. Calendar data stays on your Mac.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Written by Uri Harduf from Island</string>
 	<key>NSMicrophoneUsageDescription</key>

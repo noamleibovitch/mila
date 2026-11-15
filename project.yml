@@ -193,6 +193,10 @@ targets:
         NSScreenCaptureUsageDescription: "Mila needs screen recording permission to capture audio from apps like Zoom."
         NSAppleEventsUsageDescription: "Mila uses AppleEvents to paste dictated text into the active app."
         NSSpeechRecognitionUsageDescription: "Mila transcribes locally on your Mac; no audio is sent to the cloud."
+        # Asked for only when the user turns on Settings ▸ Meetings ▸ "Match
+        # recordings to calendar events". macOS 14+ needs the FullAccess key
+        # to read events (EKEventStore.requestFullAccessToEvents).
+        NSCalendarsFullAccessUsageDescription: "Mila reads the calendars you choose to name a recording after the meeting it was made in. Calendar data stays on your Mac."
         NSPrincipalClass: NSApplication
         LSUIElement: false
         # Custom UTI used by the in-app drag-and-drop payload that moves a
@@ -259,6 +263,9 @@ targets:
         com.apple.security.device.microphone: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.network.client: true
+        # Hardened runtime denies calendar access without this, prompt or no
+        # prompt. Inert until the user turns the calendar match on.
+        com.apple.security.personal-information.calendars: true
         com.apple.security.cs.allow-jit: true
         com.apple.security.cs.disable-library-validation: true
     dependencies:
