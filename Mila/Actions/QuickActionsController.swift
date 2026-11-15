@@ -377,6 +377,10 @@ final class QuickActionsController: ObservableObject {
     /// completion hook writes the note once the summary is ready.
     var obsidianSettings: ObsidianVaultSettings?
     var obsidianExporter: ObsidianExporter?
+    /// The post-recording command hook, late-bound like the exporter and
+    /// marked pending at the same point in `finalizeTail`.
+    var postCommandSettings: PostRecordingCommandSettings?
+    var postCommandRunner: PostRecordingCommandRunner?
 
     /// Late-bound by MilaApp, which hands ownership here. Same reason as the
     /// summarizer above: the live-transcript save path never reaches
@@ -1931,6 +1935,11 @@ final class QuickActionsController: ObservableObject {
                     self.speakerNameSuggester?.markPending(updated.id)
                 } else {
                     self.speakerNameSuggester?.suggest(recordingID: updated.id)
+                }
+                // The post-recording command waits on the same hook, so it is
+                // marked at the same point and for the same reason.
+                if self.postCommandSettings?.isReady == true {
+                    self.postCommandRunner?.markPending(updated.id)
                 }
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {

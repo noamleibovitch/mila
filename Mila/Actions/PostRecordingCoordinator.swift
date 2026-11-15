@@ -37,6 +37,10 @@ final class PostRecordingCoordinator: ObservableObject {
     /// user throwing the recording away.
     var obsidianExporter: ObsidianExporter?
 
+    /// Late-bound by `MilaApp`. Discard has to stop the user's post-recording
+    /// command as well: it is queued off the same completion hook.
+    var postCommandRunner: PostRecordingCommandRunner?
+
     /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
     /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
     /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
@@ -685,7 +689,8 @@ final class PostRecordingCoordinator: ObservableObject {
     ///     unwinds within ~100ms instead of finishing
     ///  3. permanently delete the recording + its audio file
     ///  4. un-export it from the Obsidian vault
-    ///  5. dismiss the sheet
+    ///  5. stop the post-recording command for it and remove its handoff
+    ///  6. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
         // The `permanentlyDeleted` hook installed in `init` does this too,
@@ -701,6 +706,10 @@ final class PostRecordingCoordinator: ObservableObject {
         // title is what named the note on disk, and the `pending` snapshot's
         // may predate a rename made in the sheet.
         obsidianExporter?.discardNote(for: stored ?? recording)
+        // The runner's own `permanentlyDeleted` hook covers a row that was
+        // still in the store. This covers one that was already gone, whose
+        // `finalizeTail` can still mark it pending.
+        postCommandRunner?.discard(recording.id)
         pending = nil
     }
 
