@@ -373,6 +373,7 @@ struct MilaApp: App {
     /// Settings → Speakers → "Your name" (issue #348). Read by the speaker
     /// name suggester; one publish per edit, never per audio buffer.
     @StateObject private var speakerIdentitySettings: SpeakerIdentitySettings
+    @StateObject private var calendarSettings: CalendarSettings
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     /// Imports double-clicked `.milashare` bundles — a recording another Mila
@@ -450,7 +451,12 @@ struct MilaApp: App {
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
         let llm = LLMSettings()
-        let coordinator = PostRecordingCoordinator(store: store, transcription: svc, llm: llm)
+        // Calendar match (off by default). Constructing this reads no
+        // calendar and raises no prompt: the EventKit store is created on
+        // first use, and access is requested only from the Settings toggle.
+        let calendar = CalendarSettings()
+        let coordinator = PostRecordingCoordinator(store: store, transcription: svc, llm: llm,
+                                                   calendar: CalendarEventLookup(settings: calendar))
         let actions = QuickActionsController(session: session,
                                              store: store,
                                              transcription: svc,
@@ -1014,6 +1020,7 @@ struct MilaApp: App {
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: speakerDirectory)
         _speakerIdentitySettings = StateObject(wrappedValue: speakerIdentity)
+        _calendarSettings = StateObject(wrappedValue: calendar)
         _configImporter = StateObject(wrappedValue: configImporter)
         _shareImporter = StateObject(wrappedValue: shareImporter)
         _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
@@ -1065,6 +1072,7 @@ struct MilaApp: App {
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
                 .of("speakerIdentitySettings", speakerIdentity),
+                .of("calendarSettings", calendar),
                 .of("configImporter", configImporter),
                 .of("shareImporter", shareImporter),
                 .of("liveSidecarWriter", sidecarWriter),
@@ -1127,6 +1135,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(speakerIdentitySettings)
+                .environmentObject(calendarSettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
@@ -1248,6 +1257,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(speakerIdentitySettings)
+                .environmentObject(calendarSettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
