@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 @testable import Mila
 
 /// Tests for the post-record summarizer that runs whenever the LLM CLI
@@ -205,6 +206,93 @@ final class RecordingSummarizerTests: XCTestCase {
                                    "the transcript must be embedded in the prompt; argv=\(capturedArgs)")
         XCTAssertTrue(prompt.contains("Transcript:"),
                       "prompt should use LLMRunner.composedPrompt's labelled format")
+    }
+
+    /// A diarized recording is summarized from the speaker-named rendering,
+    /// not from `fullText`. `fullText` is the plain join with no labels, so a
+    /// model given it alone cannot say who decided or who owes what — it
+    /// writes "the main speaker" for a recording whose speakers are named.
+    func test_summarize_sends_speaker_names_for_a_diarized_recording() async throws {
+        llm.tool = .claude
+        var sent: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            sent.append(transcript)
+            return "summary"
+        }
+
+        let rec = try addDiarizedRecording(names: ["SPEAKER_00": "Dana", "SPEAKER_01": "Yossi"])
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(sent, ["Dana: I will send the contract\nYossi: by Tuesday please"])
+    }
+
+    /// An unnamed speaker keeps its raw `SPEAKER_NN` label, so turns stay
+    /// separable even before the user has named anyone.
+    func test_summarize_keeps_raw_labels_for_unnamed_speakers() async throws {
+        llm.tool = .claude
+        var sent: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            sent.append(transcript)
+            return "summary"
+        }
+
+        let rec = try addDiarizedRecording(names: ["SPEAKER_00": "Dana"])
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(sent, ["Dana: I will send the contract\nSPEAKER_01: by Tuesday please"])
+    }
+
+    /// No speaker labels at all (diarization off): the plain `fullText` is
+    /// sent unchanged, as before.
+    func test_summarize_sends_fullText_when_no_segment_has_a_speaker() async throws {
+        llm.tool = .claude
+        var sent: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            sent.append(transcript)
+            return "summary"
+        }
+
+        let rec = try addRecording(named: "Plain", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(sent, ["we discussed the roadmap"])
+    }
+
+    /// Naming a speaker while a summary is out makes that run stale: its
+    /// transcript said `SPEAKER_01`, the row now says "Yossi". The staleness
+    /// check compares the same rendering the call was built from, so the
+    /// output is discarded and one follow-up runs with the name in it.
+    func test_summarize_reruns_when_a_speaker_is_named_mid_flight() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var sent: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            sent.append(transcript)
+            if sent.count == 1 {
+                await gate.wait()
+                return "FIRST (stale names)"
+            }
+            return "SECOND"
+        }
+
+        let rec = try addDiarizedRecording(names: ["SPEAKER_00": "Dana"])
+        summarizer.summarizeIfNeeded(rec)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+
+        store.setSpeakerName("Yossi", forSpeaker: "SPEAKER_01", recordingID: rec.id)
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await waitUntil { sent.count == 2 }
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(sent.count, 2, "exactly one re-run")
+        XCTAssertTrue(sent[0].contains("SPEAKER_01:"))
+        XCTAssertTrue(sent[1].contains("Yossi:"), "the re-run must carry the new name")
+        let final = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(final.summary, "SECOND", "the stale-name output must never be stored")
     }
 
     /// Empty CLI output must NOT clobber a (currently nil) summary — we
@@ -2139,6 +2227,27 @@ final class RecordingSummarizerTests: XCTestCase {
     /// Rebuild `summarizer` with a deterministic `runLLM` stub so the
     /// end-to-end tests don't depend on a real subprocess. Call after
     /// configuring `llm` / `liveAI` for the test.
+    /// A completed two-speaker recording whose `fullText` is the plain join
+    /// of its segments, the way the transcription pipeline stores it.
+    private func addDiarizedRecording(names: [String: String]) throws -> Recording {
+        let audioURL = store.freshAudioURL(suggestedName: "Diarized")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Diarized",
+            source: .meeting,
+            audioFileName: audioURL.lastPathComponent,
+            status: .completed,
+            segments: [
+                TranscriptSegment(start: 0, end: 2, text: "I will send the contract", speaker: "SPEAKER_00"),
+                TranscriptSegment(start: 2, end: 4, text: "by Tuesday please", speaker: "SPEAKER_01")
+            ],
+            fullText: "I will send the contract by Tuesday please",
+            speakerNames: names
+        )
+        store.add(rec)
+        return rec
+    }
+
     private func useStubRunner(_ run: @escaping RecordingSummarizer.RunLLM) {
         summarizer = RecordingSummarizer(store: store,
                                          llmSettings: llm,

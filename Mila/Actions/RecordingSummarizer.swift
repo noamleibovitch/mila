@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let summarizerLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                    category: "RecordingSummarizer")
@@ -78,7 +79,8 @@ final class RecordingSummarizer: ObservableObject {
     /// transcript, a summary-language pick, a `.milashare` re-import — any of
     /// them can change the row while the call is out, and requests that
     /// arrive meanwhile hit the dedup guard. So the completion compares the
-    /// LIVE row's `fullText` and summary-language override against the
+    /// LIVE row's prompt transcript (`promptTranscript(for:)`) and
+    /// summary-language override against the
     /// snapshot (`completion(of:token:produced:)`): if either moved, the
     /// output is discarded and one follow-up runs from the live row. That
     /// replaces #313's language-only `replayIfSummaryLanguageChanged` rather
@@ -797,8 +799,33 @@ final class RecordingSummarizer: ObservableObject {
                              extraArgs: llmSettings.extraArgsTokens,
                              promptLanguageName: promptLanguageName,
                              prompt: prompt,
-                             transcript: recording.fullText,
+                             transcript: Self.promptTranscript(for: recording),
                              openAIBaseURL: llmSettings.openAIBaseURL)
+    }
+
+    /// The transcript a summary call is built from: one line per speaker
+    /// turn, prefixed with the speaker's display name when the recording was
+    /// diarized. Same rendering the Send action and the MCP server use
+    /// (`TranscriptFormatter.plainText`), so the summary can attribute a
+    /// decision or a task to the person who said it. `fullText` alone is the
+    /// plain join with no labels, which left the model writing "the main
+    /// speaker" for a recording whose speakers were all named.
+    ///
+    /// Falls back to `fullText` for a recording with no speaker labels, and
+    /// when the labelled rendering comes out empty (segments that carry a
+    /// speaker but no text), so the "is there anything to summarize" gates,
+    /// which read `fullText`, never disagree with what is sent.
+    ///
+    /// The staleness check in `completion(of:token:produced:)` compares this
+    /// same rendering, so renaming a speaker while a call is out counts as
+    /// the row having moved on: the follow-up carries the new name.
+    static func promptTranscript(for recording: Recording) -> String {
+        let labelled = TranscriptFormatter.plainText(segments: recording.segments,
+                                                     fallback: recording.fullText,
+                                                     names: recording.speakerNames)
+        return labelled.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? recording.fullText
+            : labelled
     }
 
     /// Decide what a completed call (`token`) does with its output. Called
@@ -827,7 +854,8 @@ final class RecordingSummarizer: ObservableObject {
         guard let live = liveRecording(id) else { return .proceed(run) }
         let reason: String
         let liveLanguage = Self.promptLanguageName(for: live, global: run.globalLanguage)
-        if live.fullText != run.inputs.transcript || liveLanguage != run.inputs.promptLanguageName {
+        if Self.promptTranscript(for: live) != run.inputs.transcript
+            || liveLanguage != run.inputs.promptLanguageName {
             reason = "transcript or summary language changed mid-flight"
         } else if run.regenerateWithNewInputs {
             reason = "regenerate with new inputs requested mid-flight"
