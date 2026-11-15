@@ -42,10 +42,28 @@ enum SummaryPromptContext {
             "SPEAKERS": speakerList(for: recording),
             "MY_NAME": singleLine(myName ?? "")
         ]
-        var resolved = prompt
-        for (name, value) in values {
-            resolved = resolved.replacingOccurrences(of: "{{\(name)}}", with: value)
+        // One pass over the TEMPLATE, never over substituted text. Replacing
+        // token by token would re-scan what an earlier token put in, so a
+        // recording titled "{{SPEAKERS}}" would have its title expanded into
+        // the speaker list, in an order that depends on dictionary iteration.
+        var resolved = ""
+        var rest = Substring(prompt)
+        while let open = rest.range(of: "{{") {
+            resolved += rest[..<open.lowerBound]
+            let afterOpen = rest[open.upperBound...]
+            if let close = afterOpen.range(of: "}}"),
+               let value = values[String(afterOpen[..<close.lowerBound])] {
+                resolved += value
+                rest = afterOpen[close.upperBound...]
+            } else {
+                // Not one of ours ("{{LANGUAGE}}" the caller has not resolved,
+                // a literal "{{" in the user's prose): keep the braces and
+                // carry on scanning after them.
+                resolved += "{{"
+                rest = afterOpen
+            }
         }
+        resolved += rest
         return resolved
     }
 

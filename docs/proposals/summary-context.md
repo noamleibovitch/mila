@@ -8,7 +8,7 @@ Not filed. Two changes, on two stacked branches.
 
 **Change.** Send `TranscriptFormatter.plainText(segments:fallback:names:)`. The staleness check in `completion(of:token:produced:)` compares the same rendering, so naming a speaker while a call is out re-runs it once.
 
-**Behaviour change to review.** A rename mid-flight now costs one follow-up call. A rename after the summary landed still does not regenerate it.
+**Behaviour change to review.** A rename mid-flight now costs one follow-up call. A rename after the summary landed still does not regenerate it, and summaries stored before this change are not rebuilt; both need "Regenerate summary". Marking a summary stale on rename is a separate decision.
 
 ## 2. Prompt variables and a context file (`feat/summary-context`)
 
@@ -20,4 +20,4 @@ Not filed. Two changes, on two stacked branches.
 
 **Deliberately left out.** Path delivery for the context file (the unattended summary stays inline, same reasoning as #179). `.milaconfig` / MDM support. Per-folder prompts. Calendar attendees (`{{ATTENDEES}}` belongs with #384).
 
-**Privacy.** The file's text goes to the same provider the transcript already goes to. The path is exported in diagnostic `settings.json` like `llm.executablePath` is; say if it should be reduced to a set/unset flag.
+**Privacy.** The file's text goes to the same provider the transcript already goes to. The diagnostic report exports the setting as `<set>` / `<not set>`, never the path.

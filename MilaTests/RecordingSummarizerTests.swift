@@ -366,6 +366,61 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertFalse(prompts[1].contains("<context>"))
     }
 
+    /// Every unusable state of the file, not just a missing one, leaves the
+    /// call exactly as it is with no file set.
+    func test_summarize_skips_an_empty_or_oversized_context_file() async throws {
+        llm.tool = .claude
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            return "summary"
+        }
+        let rec = try addRecording(named: "States", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let file = tempRoot.appendingPathComponent("context.md")
+        llm.summaryContextFile = file.path
+        let unusable: [Data] = [
+            Data(" \n".utf8),
+            Data(repeating: 0x61, count: SummaryPromptContext.maxContextFileBytes + 1),
+            Data([0xFF, 0xFE, 0x80])
+        ]
+        for contents in unusable {
+            try contents.write(to: file)
+            summarizer.regenerate(try XCTUnwrap(store.recordings.first { $0.id == rec.id }))
+            await summarizer.awaitInFlight(rec.id)
+        }
+
+        XCTAssertEqual(prompts.count, 1 + unusable.count)
+        XCTAssertEqual(Set(prompts).count, 1, "an unusable file must not change the prompt")
+    }
+
+    /// The HTTP provider has no filesystem, so the facts and the file have to
+    /// be in the prompt text it is handed, same as for a CLI.
+    func test_summarize_inlines_facts_and_context_for_the_openai_compatible_path() async throws {
+        llm.tool = .openaiCompatible
+        llm.openAIBaseURL = "https://api.openai.com/v1"
+        llm.openAIModelName = "gpt-4o-mini"
+        liveAI.summaryPrompt = "Summarize {{TITLE}}."
+        let file = tempRoot.appendingPathComponent("context.md")
+        try Data("Dana leads Platform.".utf8).write(to: file)
+        llm.summaryContextFile = file.path
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            return "summary"
+        }
+
+        let rec = try addRecording(named: "Roadmap", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let prompt = try XCTUnwrap(prompts.first)
+        XCTAssertTrue(prompt.contains("Dana leads Platform."))
+        XCTAssertTrue(prompt.contains("Summarize Roadmap."))
+    }
+
     func test_summary_context_file_persists() {
         llm.summaryContextFile = "~/notes/context.md"
         XCTAssertEqual(LLMSettings(defaults: llmDefaults).summaryContextFile, "~/notes/context.md")

@@ -59,6 +59,29 @@ final class SummaryPromptContextTests: XCTestCase {
         XCTAssertEqual(out, "[][][]")
     }
 
+    /// Substitution is one pass over the template. A value that itself
+    /// looks like a token is user text and must come through literally:
+    /// replacing token by token would expand a title of "{{SPEAKERS}}" into
+    /// the speaker list, depending on which token happened to go first.
+    func test_a_value_that_looks_like_a_token_is_not_expanded() {
+        let rec = recording(title: "{{SPEAKERS}} and {{MY_NAME}}", segments: [
+            TranscriptSegment(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")
+        ], names: ["SPEAKER_00": "{{TITLE}}"])
+        let out = SummaryPromptContext.resolveVariables(
+            in: "T={{TITLE}} S={{SPEAKERS}} M={{MY_NAME}}", recording: rec,
+            myName: "{{DURATION}}", timeZone: utc)
+        XCTAssertEqual(out, "T={{SPEAKERS}} and {{MY_NAME}} S={{TITLE}} M={{DURATION}}")
+    }
+
+    /// Tokens that are not ours stay exactly as written: `{{LANGUAGE}}`
+    /// belongs to the summarizer, and braces in the user's prose are prose.
+    func test_unknown_tokens_and_stray_braces_are_left_alone() {
+        let prompt = "{{LANGUAGE}} {{ TITLE }} {{nope}} {{TITLE {{TITLE}} tail {{"
+        XCTAssertEqual(SummaryPromptContext.resolveVariables(in: prompt, recording: recording(title: "X"),
+                                                             myName: nil, timeZone: utc),
+                       "{{LANGUAGE}} {{ TITLE }} {{nope}} {{TITLE X tail {{")
+    }
+
     /// A Voice Memo keeps the memo's own date, which is already its start.
     func test_date_is_not_shifted_for_a_voice_memo() {
         let rec = recording(source: .voiceMemo)

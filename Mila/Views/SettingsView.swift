@@ -1497,12 +1497,14 @@ private struct AIFeatureRow<Content: View>: View {
 /// first; the "Undo" link is here because a recovery path you can see beats one
 /// that depends on where first responder happens to be.
 /// The optional context file for the automatic summary: a path field, a
-/// Choose button, and one line saying what state the file is in. The state is
-/// read from disk on every render of an expanded section, which is a single
-/// small read behind a disclosure the user opened on purpose.
+/// Choose button, and one line saying what state the file is in. The file is
+/// read off the main actor when the path changes, never in `body`: this row
+/// re-renders with the rest of Settings, and a path on a slow or unmounted
+/// volume must not stall that.
 private struct SummaryContextFileRow: View {
     @Binding var path: String
     var isEnabled = true
+    @State private var state: SummaryPromptContext.ContextFileState = .notSet
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1523,10 +1525,22 @@ private struct SummaryContextFileRow: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        // Keyed on the path, so typing re-checks and a superseded read is
+        // cancelled; the short pause keeps a keystroke from costing a read.
+        .task(id: path) {
+            let current = path
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            let loaded = await Task.detached(priority: .utility) {
+                SummaryPromptContext.loadContextFile(at: current)
+            }.value
+            guard !Task.isCancelled else { return }
+            state = loaded
+        }
     }
 
     private var caption: String {
-        switch SummaryPromptContext.loadContextFile(at: path) {
+        switch state {
         case .notSet:
             return "Optional. A text or Markdown file sent before the prompt on every summary: who the people are, product names, house style. Only its text is sent, to the same provider as the transcript."
         case .ready(let text):
