@@ -1382,10 +1382,20 @@ enum LLMRunner {
         let cancelled: Bool
     }
 
-    private static func executeProcess(executable: URL,
-                                       arguments: [String],
-                                       timeout: TimeInterval,
-                                       handle: ProcessHandle) throws -> ProcessOutcome {
+    /// Run one child process to completion, draining its pipes, and report
+    /// what happened. Blocks the calling thread for the child's whole life.
+    ///
+    /// `environment` and `workingDirectory` are for the one caller that is
+    /// not an LLM CLI, `PostRecordingCommandRunner`: it adds its `MILA_*`
+    /// variables to the child's environment and runs in a directory of its
+    /// own, so it takes no lease on the shared LLM sandbox. Every LLM path
+    /// leaves both nil and behaves exactly as before.
+    static func executeProcess(executable: URL,
+                               arguments: [String],
+                               timeout: TimeInterval,
+                               handle: ProcessHandle,
+                               environment: [String: String]? = nil,
+                               workingDirectory: URL? = nil) throws -> ProcessOutcome {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -1394,7 +1404,7 @@ enum LLMRunner {
         // to, but AUGMENT PATH so node-shebang CLIs find their interpreter.
         // Spawning a Process from a sandboxed-style minimal environment
         // surprises users whose claude/cursor wrappers source nvm/asdf/etc.
-        process.environment = childEnvironment(for: executable)
+        process.environment = environment ?? childEnvironment(for: executable)
 
         // CRITICAL: spawn in a directory Mila owns that holds nothing — never
         // $HOME, `/`, or a user folder. macOS attributes any file access by the
@@ -1417,9 +1427,9 @@ enum LLMRunner {
         // while nothing else is running still starts in an empty directory. The
         // `defer` must span the child's whole life — the lease is what stops a
         // concurrent invocation's sweep from deleting a file this one is using.
-        let sandbox = acquireSandbox()
-        defer { releaseSandbox(sandbox) }
-        process.currentDirectoryURL = sandbox
+        let sandbox = workingDirectory == nil ? acquireSandbox() : nil
+        defer { if let sandbox { releaseSandbox(sandbox) } }
+        process.currentDirectoryURL = workingDirectory ?? sandbox
 
         // Close stdin immediately. Some CLIs (claude) read both stdin AND
         // argv; some (cursor-agent) ignore stdin entirely. We standardised
