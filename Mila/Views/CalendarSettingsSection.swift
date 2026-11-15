@@ -34,7 +34,17 @@ struct CalendarSettingsSection: View {
                 case .fullAccess:
                     calendarChecklist
                 case .notDetermined:
-                    status("Waiting for calendar access.", systemImage: "hourglass")
+                    // Reached when the prompt is still up, and when the
+                    // switch was restored on but the system has forgotten the
+                    // answer (a privacy reset): the button asks again.
+                    VStack(alignment: .leading, spacing: 6) {
+                        status("Mila hasn't been given calendar access yet.",
+                               systemImage: "hourglass")
+                        Button("Allow Calendar Access…") {
+                            Task { await settings.setEnabled(true) }
+                        }
+                        .controlSize(.small)
+                    }
                 case .denied:
                     deniedNote
                 }
