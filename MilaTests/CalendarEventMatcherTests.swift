@@ -99,6 +99,33 @@ final class CalendarEventMatcherTests: XCTestCase {
         XCTAssertEqual(match(window(0, 30), [a, b])?.title, "Alpha")
     }
 
+    /// Overlap, distance and title all equal: the order is still total, so
+    /// EventKit handing the events back in another order changes nothing.
+    func test_events_equal_in_overlap_distance_and_title_still_resolve_one_way() {
+        let allowed: Set<String> = ["cal-a", "cal-b"]
+        // Same title and same overlap of the 10–40 recording, starting 5
+        // minutes either side of its start.
+        let earlier = event("Sync", 5, 40, calendar: "cal-b")
+        let later = event("Sync", 15, 45, calendar: "cal-a")
+        XCTAssertEqual(match(window(10, 45), [earlier, later], allowed: allowed)?.start, at(5))
+        XCTAssertEqual(match(window(10, 45), [later, earlier], allowed: allowed)?.start, at(5),
+                       "the earlier start wins whichever comes first")
+
+        // Identical but for the calendar they are in.
+        var inA = event("Sync", 0, 30, calendar: "cal-a")
+        inA.calendarName = "A"
+        var inB = event("Sync", 0, 30, calendar: "cal-b")
+        inB.calendarName = "B"
+        XCTAssertEqual(match(window(0, 30), [inA, inB], allowed: allowed)?.calendarName, "A")
+        XCTAssertEqual(match(window(0, 30), [inB, inA], allowed: allowed)?.calendarName, "A")
+
+        // Same start, different end, same overlap inside the recording.
+        let short = event("Sync", 0, 40, calendar: "cal-a")
+        let long = event("Sync", 0, 90, calendar: "cal-a")
+        XCTAssertEqual(match(window(0, 30), [long, short], allowed: allowed)?.end, at(40))
+        XCTAssertEqual(match(window(0, 30), [short, long], allowed: allowed)?.end, at(40))
+    }
+
     // MARK: - Minimum overlap
 
     /// A long recording needs five minutes, not 20% of itself.

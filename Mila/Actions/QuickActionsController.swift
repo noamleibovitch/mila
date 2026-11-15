@@ -1385,9 +1385,12 @@ final class QuickActionsController: ObservableObject {
                 wasOnBattery: !SleepGuard.isOnACPower()
             )
         }
-        if sleepReason == nil {
-            postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
-        }
+        // Always called; only the rename sheet is withheld after a sleep
+        // stop (the wake-up alert above stands in for it). The calendar
+        // match it arms belongs to every finished recording.
+        postRecording.recordingFinished(recording,
+                                        titleWasUserProvided: titleWasUserProvided,
+                                        showsRenameSheet: sleepReason == nil)
 
         // A recording that never had the live pipeline has nothing to drain,
         // no live sidecar of its own (it was never `begin`-ed, and the one on

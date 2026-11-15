@@ -61,8 +61,9 @@ enum CalendarEventMatcher {
     /// decline and nobody cancelled. The largest absolute overlap wins, and it
     /// must reach `min(minimumOverlap, minimumOverlapFraction × window)`. Two
     /// events with the same overlap go to the one starting nearer the
-    /// recording's start, then to the earlier title, so the answer never
-    /// depends on the order the calendar returned them in.
+    /// recording's start, then to the earlier title, start, end and calendar
+    /// id (`isBetter`), so the answer never depends on the order the
+    /// calendar returned them in.
     static func bestMatch(window: DateInterval,
                           candidates: [CalendarEventCandidate],
                           allowedCalendarIDs: Set<String>) -> CalendarEventMatch? {
@@ -100,7 +101,14 @@ enum CalendarEventMatcher {
         let distance = abs(event.start.timeIntervalSince(window.start))
         let currentDistance = abs(current.event.start.timeIntervalSince(window.start))
         if distance != currentDistance { return distance < currentDistance }
-        return event.title < current.event.title
+        // Nothing left to prefer one by; the rest only makes the order total.
+        // Two events still equal after this differ at most in attendees.
+        let other = current.event
+        if event.title != other.title { return event.title < other.title }
+        if event.start != other.start { return event.start < other.start }
+        if event.end != other.end { return event.end < other.end }
+        if event.calendarID != other.calendarID { return event.calendarID < other.calendarID }
+        return event.calendarName < other.calendarName
     }
 
     // MARK: - Attendees

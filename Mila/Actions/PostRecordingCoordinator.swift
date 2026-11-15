@@ -208,12 +208,36 @@ final class PostRecordingCoordinator: ObservableObject {
         if CommandLine.arguments.contains("--ui-test-finalize-regression") { return }
         guard pending == nil else { return }
         pending = recording
-        // Armed for a user-named recording too: the event is still worth
-        // storing, it just must not become the title.
-        let calendarMatch = armCalendarMatch(for: recording,
-                                             mayTitle: !titleWasUserProvided)
         guard !titleWasUserProvided else { return }
-        armAutoSuggestTitle(for: recording, after: calendarMatch)
+        // The recording's calendar match, when `recordingFinished` armed one.
+        armAutoSuggestTitle(for: recording, after: calendarTasks[recording.id])
+    }
+
+    /// Every recording Mila itself finished comes through here, once, from
+    /// `QuickActionsController.stopRecording` right after `store.add(...)`.
+    ///
+    /// This — not `present` — is where the calendar match is armed, because
+    /// `present` is not reached by every recording: a stop caused by the Mac
+    /// going to sleep shows no rename sheet (`showsRenameSheet` false), and
+    /// a recording that finishes while the sheet is still up for the
+    /// previous one is dropped by `present`'s `pending == nil` guard. Both
+    /// happened during a meeting like any other, and both used to be left
+    /// without their event.
+    ///
+    /// The match is armed BEFORE the sheet so `present`'s auto-title job can
+    /// wait on it. It is armed for a user-named recording too: the event is
+    /// still worth storing, it just must not become the title.
+    ///
+    /// Imports (audio files, Voice Memos, `.milashare`) deliberately do not
+    /// come here: their `createdAt` is not the moment a recording stopped,
+    /// which is what the match window is built on.
+    func recordingFinished(_ recording: Recording,
+                           titleWasUserProvided: Bool = false,
+                           showsRenameSheet: Bool = true) {
+        armCalendarMatch(for: recording, mayTitle: !titleWasUserProvided)
+        if showsRenameSheet {
+            present(recording, titleWasUserProvided: titleWasUserProvided)
+        }
     }
 
     // MARK: - Calendar match
@@ -223,19 +247,23 @@ final class PostRecordingCoordinator: ObservableObject {
     /// its machine-default title, the event's title replaces it.
     ///
     /// Returns nil when the calendar match is off or not ready — the common
-    /// case, which starts nothing. Otherwise the task's value is whether the
-    /// event titled the recording; `armAutoSuggestTitle` awaits it and skips
-    /// the LLM call on `true`, so the two can never both write a title.
+    /// case, which starts nothing. Otherwise the task (also kept in
+    /// `calendarTasks`, where `present` finds it) has as its value whether
+    /// the event titled the recording; `armAutoSuggestTitle` awaits it and
+    /// skips the LLM call on `true`, so the two can never both write a title.
     ///
     /// The lookup needs only the recording's times, but the WRITE waits for
     /// the row to settle, like the title job's: until transcription and the
     /// offline speaker pass are done, `QuickActionsController`'s drain and
     /// `TranscriptionService` are still writing the row from copies taken
     /// earlier, and a field added in between would be written over.
+    @discardableResult
     private func armCalendarMatch(for recording: Recording,
                                   mayTitle: Bool) -> Task<Bool, Never>? {
         guard let calendar, calendar.isReady else { return nil }
         let id = recording.id
+        // Once per recording: a match already in flight is the match.
+        if let inFlight = calendarTasks[id] { return inFlight }
         // Same baseline rule as `armAutoSuggestTitle`: the title is replaced
         // only while it is still the default the recording was saved under.
         let baselineTitle = recording.title

@@ -132,7 +132,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         try await settle()
 
@@ -152,7 +152,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "Weekly sync")
         XCTAssertNotNil(stored(rec)?.calendarEvent)
         XCTAssertEqual(llmCalls, 0)
@@ -164,7 +164,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent, "no match is nil, never a guess")
         XCTAssertEqual(llmCalls, 1)
@@ -177,7 +177,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertTrue(provider.eventQueries.isEmpty)
@@ -189,7 +189,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.llmCalls == 1)
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertTrue(provider.eventQueries.isEmpty)
@@ -200,7 +200,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator(withCalendar: false)
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent)
     }
@@ -210,7 +210,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording()
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNotNil(stored(rec)?.calendarEvent, "the event is still the recording's event")
         XCTAssertEqual(llmCalls, 1)
@@ -225,7 +225,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         rec.title = "Budget review with Dana"
         store.update(rec)
 
-        coordinator.present(rec, titleWasUserProvided: true)
+        coordinator.recordingFinished(rec, titleWasUserProvided: true)
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         try await settle()
 
@@ -241,7 +241,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording(status: .running, text: "")
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await settle()
         var current = try XCTUnwrap(stored(rec))
         XCTAssertNil(current.calendarEvent, "nothing is written while the row is still in flight")
@@ -265,7 +265,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
         service.beginSpeakerFinalization(rec.id)
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await settle()
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertEqual(stored(rec)?.title, defaultTitle)
@@ -283,7 +283,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         coordinator.transcriptWaitTimeout = 0.3
         let rec = addRecording(status: .running, text: "")
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await Task.sleep(nanoseconds: 1_000_000_000)
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertEqual(stored(rec)?.title, defaultTitle)
@@ -296,7 +296,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording(status: .failed, text: "")
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await waitFor(self.stored(rec)?.title == "Weekly sync")
         XCTAssertEqual(llmCalls, 0)
     }
@@ -306,7 +306,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording(status: .running, text: "")
 
-        coordinator.present(rec)
+        coordinator.recordingFinished(rec)
         try await Task.sleep(nanoseconds: 100_000_000)
         coordinator.cancelAndDiscard()
         try await settle()
@@ -314,6 +314,82 @@ final class CalendarMatchWiringTests: XCTestCase {
         XCTAssertNil(stored(rec))
         XCTAssertTrue(provider.eventQueries.isEmpty)
         XCTAssertEqual(llmCalls, 0)
+    }
+
+    // MARK: - Recordings that never get the rename sheet
+
+    /// A stop caused by the Mac going to sleep shows no sheet. The recording
+    /// still happened during a meeting, and must not lose its event for it.
+    func test_recording_finished_without_a_sheet_is_still_matched_and_titled() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let rec = addRecording()
+
+        coordinator.recordingFinished(rec, showsRenameSheet: false)
+        XCTAssertNil(coordinator.pending, "no sheet was asked for")
+        try await waitFor(self.stored(rec)?.title == "Weekly sync")
+        XCTAssertEqual(stored(rec)?.calendarEvent?.attendees.map(\.name), ["Me", "Dana"])
+        XCTAssertEqual(llmCalls, 0)
+    }
+
+    func test_sheetless_recording_the_user_named_keeps_its_title() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        var rec = addRecording()
+        rec.title = "Budget review with Dana"
+        store.update(rec)
+
+        coordinator.recordingFinished(rec, titleWasUserProvided: true, showsRenameSheet: false)
+        try await waitFor(self.stored(rec)?.calendarEvent != nil)
+        XCTAssertEqual(stored(rec)?.title, "Budget review with Dana")
+    }
+
+    /// The sheet is still up for the first recording when the second one
+    /// finishes. `present` drops the second; its calendar match must not go
+    /// with it.
+    func test_recording_finished_behind_an_open_sheet_is_still_matched() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let first = addRecording()
+        coordinator.recordingFinished(first)
+        XCTAssertEqual(coordinator.pending?.id, first.id)
+
+        let second = addRecording()
+        coordinator.recordingFinished(second)
+        XCTAssertEqual(coordinator.pending?.id, first.id, "the sheet stays on the first recording")
+
+        try await waitFor(self.stored(second)?.calendarEvent != nil)
+        XCTAssertEqual(stored(second)?.title, "Weekly sync")
+        try await waitFor(self.stored(first)?.title == "Weekly sync")
+        XCTAssertEqual(provider.eventQueries.count, 2, "one match per recording")
+    }
+
+    func test_reporting_the_same_recording_twice_matches_it_once() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let rec = addRecording(status: .running, text: "")
+        coordinator.recordingFinished(rec)
+        coordinator.recordingFinished(rec, showsRenameSheet: false)
+
+        var current = try XCTUnwrap(stored(rec))
+        current.fullText = "the transcript text"
+        current.status = .completed
+        store.update(current)
+        try await waitFor(self.stored(rec)?.calendarEvent != nil)
+        try await settle()
+        XCTAssertEqual(provider.eventQueries.count, 1)
+    }
+
+    /// `present` on its own — the sheet without a finished recording behind
+    /// it — arms no match. The match belongs to `recordingFinished`.
+    func test_present_alone_arms_no_calendar_match() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let rec = addRecording()
+        coordinator.present(rec)
+        try await waitFor(self.stored(rec)?.title == "An LLM Title")
+        XCTAssertNil(stored(rec)?.calendarEvent)
+        XCTAssertTrue(provider.eventQueries.isEmpty)
     }
 
     // MARK: - Persistence

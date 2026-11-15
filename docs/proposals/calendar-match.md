@@ -12,12 +12,14 @@ Mila has no calendar code at all. #384 asks for a calendar connection to join me
 
 An opt-in setting, Settings ▸ Meetings ▸ "Match recordings to calendar events". Off by default.
 
-When a recording finishes and its transcript is final, Mila looks at the calendars the user ticked, finds the event the recording overlapped, and:
+When a recording made in Mila finishes and its transcript is final, Mila looks at the calendars the user ticked, finds the event the recording overlapped, and:
 
 1. stores it on the recording as `calendarEvent` (title, start, end, calendar name, attendees);
 2. uses the event's title as the recording's title, if the title is still the machine default.
 
 The LLM title job stays as the fallback. It runs when there is no match, when the event has no title, or when the feature is off. When the calendar titles a recording the LLM call is skipped.
+
+Every recording Mila finishes is matched, including one stopped because the Mac went to sleep and one that finishes while the rename sheet is still open for the previous recording. Neither of those gets a rename sheet, and neither gets an LLM title today. That is existing behaviour and this change leaves it alone.
 
 A title the user typed is never replaced. That covers a name typed before recording, one typed in the rename sheet while transcription runs, and a rename in the list.
 
@@ -30,7 +32,7 @@ The recording window is `createdAt - duration` to `createdAt`. `Recording.create
 - The event with the largest absolute overlap wins.
 - A match needs an overlap of at least `min(5 minutes, 20% of the recording)`.
 - No qualifying event means no match. Mila never picks the nearest event as a guess.
-- Ties go to the event that starts nearer the recording's start, then to the earlier title, so the answer does not depend on the order EventKit returns events in.
+- Ties go to the event that starts nearer the recording's start, then to the earlier title, start, end and calendar id, so the answer does not depend on the order EventKit returns events in.
 
 Attendees are the people on the invitation. Rooms, equipment and distribution lists are dropped, and so are addresses that are plainly automated (`noreply@`, `*-bot@`, `*.calendar.google.com`). The calendar's owner is listed first.
 
@@ -41,7 +43,7 @@ Attendees are the people on the invitation. Rooms, equipment and distribution li
 - Mila queries only the recording's own time window, once per recording.
 - The match is stored in `recordings.json` on the user's Mac. It is exposed over the MCP helper as `calendar_event` on `list_recordings` and `get_transcript`, behind the existing MCP consent.
 - It does not travel in a `.milashare`. The attendee list is other people's names and email addresses from the sender's calendar, and sharing a recording is not consent to pass those on. The title the event gave the recording travels as the title.
-- Logs record counts only, never an event title or an attendee.
+- Logs record counts only, never an event title or an attendee. The diagnostic report carries no calendar data.
 
 ### Structure
 
@@ -73,7 +75,6 @@ Three pieces, separate so #384 can build on them:
 
 ## Open questions
 
-- Recordings stopped because the Mac went to sleep, and a recording that finishes while the rename sheet is still open for the previous one, do not go through `PostRecordingCoordinator.present`, so they get neither an LLM title nor a calendar match. Should the match move to a hook that every finished recording reaches?
 - The window uses the duration of the audio on disk. If capture died early the window starts later than the recording really did. The overlap threshold absorbs small errors. Is that enough?
 - Should the checklist start with the user's default calendar ticked, to save a click, or stay empty?
 - Is `calendar_event` the right thing to expose over MCP by default, given it carries attendee email addresses, or should it sit behind its own toggle?
