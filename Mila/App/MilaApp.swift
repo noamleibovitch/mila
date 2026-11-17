@@ -1073,6 +1073,20 @@ struct MilaApp: App {
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
 
+        // Seed the local-model retention BEFORE any `.task` can call
+        // `prewarm`. Live transcription needs the weights warm; a batch-only
+        // session must not load them at launch. A remote-backend user has no
+        // local model to keep either way. Later changes go through
+        // `syncLocalModelRetention()` (the `.onChange` modifiers in `body`),
+        // which releases a warm model when live transcription is switched
+        // off and re-warms when it is switched back on.
+        svc.retainsLocalModel = Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAI.runsLivePipeline,
+            recordingRunsLivePipeline: false,
+            recordingActive: false,
+            stoppingOrFinalizing: false,
+            remoteActive: remoteSettings.isActive)
+
         #if DEBUG
         // Hand every App-level object to the churn probe by property name,
         // so `AppSceneChurnTests` can say WHICH object re-evaluated this App
@@ -1157,6 +1171,32 @@ struct MilaApp: App {
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .task { prewarmDefaultModel() }
+                // Keep the local model's retention in step with the inputs
+                // that decide it. `runsLivePipeline` folds in the hardware
+                // gate and the live-transcription toggle; the per-recording
+                // decision covers a recording that snapshotted the live
+                // pipeline ON and is still capturing after the user switched
+                // the toggle OFF — it must finish with its model warm, and
+                // the Stop/finalize flags keep the model through the drain so
+                // its recovery pass and any batch job start warm.
+                .onChange(of: liveAISettings.runsLivePipeline) { _, _ in
+                    syncLocalModelRetention()
+                }
+                .onChange(of: remoteTranscriptionSettings.isActive) { _, _ in
+                    syncLocalModelRetention()
+                }
+                .onChange(of: actions.recordingRunsLivePipeline) { _, _ in
+                    syncLocalModelRetention()
+                }
+                .onChange(of: actions.isStoppingRecording) { _, _ in
+                    syncLocalModelRetention()
+                }
+                .onChange(of: actions.isFinalizingRecording) { _, _ in
+                    syncLocalModelRetention()
+                }
+                .onChange(of: session.state == .idle) { _, _ in
+                    syncLocalModelRetention()
+                }
                 .task { await diarizationSettings.runHealthCheck() }
                 .task { await diarizationSettings.runStartupCheckDepsIfNeeded() }
                 .task { await diarizationSettings.startAutoBootstrapIfNeeded() }
@@ -2441,7 +2481,52 @@ struct MilaApp: App {
         guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
+        // Batch-only mode (live transcription OFF) must not preload the
+        // model at launch. The first real transcription after Stop loads it.
+        guard liveAISettings.runsLivePipeline else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
+    }
+
+    /// Pure decision behind `syncLocalModelRetention`. Factored out so the
+    /// settings/session transition matrix is unit-testable without a running
+    /// app: the case that matters most is live transcription ON at record
+    /// start and switched OFF mid-recording — the recording must keep its warm
+    /// model until it stops and its drain finishes, then release it.
+    static func localModelRetentionRequired(
+        livePipelineEnabled: Bool,
+        recordingRunsLivePipeline: Bool,
+        recordingActive: Bool,
+        stoppingOrFinalizing: Bool,
+        remoteActive: Bool
+    ) -> Bool {
+        guard !remoteActive else { return false }
+        return livePipelineEnabled
+            || stoppingOrFinalizing
+            || (recordingRunsLivePipeline && recordingActive)
+    }
+
+    /// Recompute whether the local whisper model should stay resident, and
+    /// hand the change to the service. Turning retention back on also warms
+    /// the model, so the first live utterance after switching remote -> local
+    /// or enabling live transcription does not pay a cold CoreML compile.
+    private func syncLocalModelRetention() {
+        let liveRecording = session.state == .recording || session.state == .paused
+        // A stop is still finalizing (closing the WAV, draining the live
+        // pipeline, possibly enqueuing a batch job) after the session reaches
+        // `.idle`. Keep the model through that so switching live OFF mid-
+        // recording does not unload it out from under the drain.
+        let postStop = actions.isStoppingRecording || actions.isFinalizingRecording
+        let retains = Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAISettings.runsLivePipeline,
+            recordingRunsLivePipeline: actions.recordingRunsLivePipeline,
+            recordingActive: liveRecording,
+            stoppingOrFinalizing: postStop,
+            remoteActive: remoteTranscriptionSettings.isActive)
+        Task { @MainActor in
+            let wasRetaining = transcription.retainsLocalModel
+            await transcription.updateLocalModelRetention(retains)
+            if retains, !wasRetaining { prewarmDefaultModel() }
+        }
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest
