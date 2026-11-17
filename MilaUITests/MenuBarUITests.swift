@@ -339,6 +339,13 @@ final class MenuBarUITests: XCTestCase {
         let open = menuItem(application, identifier: "menuBar.open", title: "Open Mila")
         XCTAssertTrue(open.waitForExistence(timeout: 5),
                       "Clicking the status item must open its native menu")
+        // Capture only this app's menu/status item, never the whole desktop.
+        let menu = application.menus.firstMatch
+        let image = menu.exists ? menu.screenshot() : item.screenshot()
+        let attachment = XCTAttachment(screenshot: image)
+        attachment.name = "Mila menu bar"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     private func statusItem(_ application: XCUIApplication) -> XCUIElement {

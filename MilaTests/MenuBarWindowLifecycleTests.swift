@@ -226,8 +226,9 @@ final class MenuBarWindowLifecycleTests: XCTestCase {
         }
         XCTAssertFalse((window.delegate as AnyObject?) === original)
 
-        proxy.windowDidBecomeKey?(Notification(name: NSWindow.didBecomeKeyNotification,
-                                               object: window))
+        let delegate: NSWindowDelegate = proxy
+        delegate.windowDidBecomeKey?(Notification(name: NSWindow.didBecomeKeyNotification,
+                                                  object: window))
         XCTAssertEqual(original.becameKey, 1,
                        "SwiftUI's optional delegate behaviour must be forwarded, not replaced")
 
