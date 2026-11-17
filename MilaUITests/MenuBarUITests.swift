@@ -368,7 +368,7 @@ final class MenuBarUITests: XCTestCase {
     }
 
     private func accessibilityText(_ element: XCUIElement) -> String {
-        [element.label, element.value as? String ?? "", element.identifier].joined(separator: " ")
+        [element.label, element.title, element.value as? String ?? "", element.identifier].joined(separator: " ")
     }
 
     private func statusText(_ application: XCUIApplication, _ element: XCUIElement) -> String {
