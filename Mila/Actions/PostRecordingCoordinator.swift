@@ -395,6 +395,11 @@ final class PostRecordingCoordinator: ObservableObject {
                 if !Task.isCancelled { self?.clearLLM(for: id) }
             }
             guard let self else { return }
+            // A calendar title needs no transcript. Resolve it before the
+            // transcript wait so a deferred recording does not keep the
+            // title spinner active after its event has already named it.
+            if let calendarMatch, await calendarMatch.value { return }
+            if Task.isCancelled { return }
             // Same wait as the Send path, and for the same reason (issue
             // #211): a title generated from the live diarizer's
             // over-segmented speakers is less wrong than a summary built on
@@ -405,10 +410,6 @@ final class PostRecordingCoordinator: ObservableObject {
                 for: id, timeout: waitTimeout, announceSpeakerWait: false) else {
                 return  // discarded, timed out, or empty transcript
             }
-            if Task.isCancelled { return }
-            // The calendar already named it: no CLI call to pay for, and
-            // nothing for a slower suggestion to overwrite.
-            if let calendarMatch, await calendarMatch.value { return }
             if Task.isCancelled { return }
             do {
                 let suggestion = try await runLLM(
