@@ -12,7 +12,8 @@ env:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    # Swift 5.10 installer does not support the rolling Ubuntu 26.04 image.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     steps:
