@@ -290,6 +290,10 @@ final class CalendarMatchWiringTests: XCTestCase {
 
         XCTAssertEqual(stored(rec)?.title, "Weekly sync")
         XCTAssertEqual(coordinator.pending?.title, "Weekly sync")
+        // Await the title task's completion too: storing a match and the
+        // task resuming are separate actor turns. Transcription deliberately
+        // stays running, so this cannot pass by waiting for a transcript.
+        try await waitFor(!coordinator.autoSuggestingIDs.contains(rec.id))
         XCTAssertFalse(coordinator.autoSuggestingIDs.contains(rec.id))
         XCTAssertEqual(llmCalls, 0)
     }
