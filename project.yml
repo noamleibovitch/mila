@@ -196,7 +196,7 @@ targets:
         # Asked for only when the user turns on Settings ▸ Meetings ▸ "Match
         # recordings to calendar events". macOS 14+ needs the FullAccess key
         # to read events (EKEventStore.requestFullAccessToEvents).
-        NSCalendarsFullAccessUsageDescription: "Mila reads the calendars you choose to name a recording after the meeting it was made in. Calendar data stays on your Mac."
+        NSCalendarsFullAccessUsageDescription: "Mila reads the calendars you choose to name recordings after their meetings. Matched event details are stored with recordings and are available to connected clients when you enable MCP access."
         NSPrincipalClass: NSApplication
         LSUIElement: false
         # Custom UTI used by the in-app drag-and-drop payload that moves a
