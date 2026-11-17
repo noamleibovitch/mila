@@ -33,6 +33,32 @@ final class PostRecordingCommandSettingsTests: XCTestCase {
         return url
     }
 
+    func test_forced_values_are_identified_and_refuse_edits_before_publishing() throws {
+        let script = try makeScript()
+        defaults.set(true, forKey: PostRecordingCommandSettings.enabledKey)
+        defaults.set(script.path, forKey: PostRecordingCommandSettings.commandKey)
+        defaults.set(45, forKey: PostRecordingCommandSettings.timeoutKey)
+        let settings = PostRecordingCommandSettings(defaults: defaults, isForced: { _ in true })
+        var publishes = 0
+        let observation = settings.objectWillChange.sink { publishes += 1 }
+        settings.enabled = false
+        settings.command = "/other"
+        settings.timeoutSeconds = 100
+        XCTAssertTrue(settings.hasManagedValues)
+        XCTAssertTrue(settings.enabled)
+        XCTAssertEqual(settings.command, script.path)
+        XCTAssertEqual(settings.timeoutSeconds, 45)
+        XCTAssertEqual(defaults.string(forKey: PostRecordingCommandSettings.commandKey), script.path)
+        XCTAssertEqual(publishes, 0)
+        observation.cancel()
+    }
+
+    func test_unterminated_quotes_and_escape_are_rejected() {
+        XCTAssertEqual(PostRecordingCommandSettings.resolve("/bin/echo 'unfinished"), .malformed)
+        XCTAssertEqual(PostRecordingCommandSettings.resolve("/bin/echo \"unfinished"), .malformed)
+        XCTAssertEqual(PostRecordingCommandSettings.resolve("/bin/echo trailing\\"), .malformed)
+    }
+
     func test_defaults_are_off_empty_and_ten_minutes() {
         let settings = PostRecordingCommandSettings(defaults: defaults)
         XCTAssertFalse(settings.enabled)

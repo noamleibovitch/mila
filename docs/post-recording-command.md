@@ -235,3 +235,18 @@ resume queued runs after Mila quits.
 
 The hook is a per-user setting. It cannot be set from a `.milaconfig` file
 or an MDM profile.
+
+## Completion and quitting
+
+A manual run waits for any active transcript finalization and summary attempt
+before writing its handoff. If that recording also has an automatic run pending,
+the manual request serves that completion; it does not launch a duplicate.
+Re-transcribing the same capture does not repeat its automatic command, including
+when summaries are disabled. Turning the feature on later does not retroactively
+run it for earlier captures.
+
+Quitting Mila closes the command queue, cancels running and queued work, and
+waits for running child-process cancellation before graceful shutdown completes.
+Incomplete commands are not automatically retried on the next launch. Settings
+forced by an organization are labelled as managed and cannot be edited in Mila.
+Unterminated quotes and trailing escapes are rejected before a command is run.

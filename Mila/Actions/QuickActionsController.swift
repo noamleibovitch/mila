@@ -2112,9 +2112,8 @@ final class QuickActionsController: ObservableObject {
                 }
                 // The post-recording command waits on the same hook, so it is
                 // marked at the same point and for the same reason.
-                if self.postCommandSettings?.isReady == true {
-                    self.postCommandRunner?.markPending(updated.id)
-                }
+                self.postCommandRunner?.markPendingIfCaptured(
+                    updated.id, enabled: self.postCommandSettings?.isReady == true)
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {
                     if obsidianOn { self.obsidianExporter?.markPending(updated.id) }

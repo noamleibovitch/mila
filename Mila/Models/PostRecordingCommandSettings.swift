@@ -27,53 +27,55 @@ final class PostRecordingCommandSettings: ObservableObject {
     /// the runs queued behind it for more than an hour.
     static let timeoutRange: ClosedRange<TimeInterval> = 5...3600
 
-    /// Master switch. Off by default — nothing is ever launched unless the
-    /// user turns this on and enters a command.
-    @Published var enabled: Bool {
-        didSet {
-            guard enabled != oldValue else { return }
-            defaults.set(enabled, forKey: Self.enabledKey)
-        }
-    }
-
-    /// The command line: a full path to an executable or script, then any
-    /// fixed arguments. Split with `LLMRunner.tokenizeArguments` (quotes and
-    /// backslash escapes, no other shell grammar) and launched directly —
-    /// never through a shell, so nothing in it is expanded or interpolated,
-    /// and nothing from a recording is ever spliced into it.
-    @Published var command: String {
-        didSet {
-            guard command != oldValue else { return }
-            defaults.set(command, forKey: Self.commandKey)
-        }
-    }
-
-    /// How long one run may take before Mila terminates it, in seconds.
-    /// Clamped to `timeoutRange`.
-    @Published var timeoutSeconds: TimeInterval {
-        didSet {
-            let clamped = Self.clampedTimeout(timeoutSeconds)
-            guard clamped == timeoutSeconds else {
-                timeoutSeconds = clamped
-                return
-            }
-            guard timeoutSeconds != oldValue else { return }
-            defaults.set(timeoutSeconds, forKey: Self.timeoutKey)
-        }
-    }
-
+    @Published private var storedEnabled: Bool
+    @Published private var storedCommand: String
+    @Published private var storedTimeout: TimeInterval
     private let defaults: UserDefaults
     private let fileManager: FileManager
+    private let managedKeys: Set<String>
 
-    init(defaults: UserDefaults = .standard, fileManager: FileManager = .default) {
+    var enabled: Bool {
+        get { storedEnabled }
+        set {
+            guard !isManaged(Self.enabledKey), storedEnabled != newValue else { return }
+            storedEnabled = newValue
+            defaults.set(newValue, forKey: Self.enabledKey)
+        }
+    }
+
+    var command: String {
+        get { storedCommand }
+        set {
+            guard !isManaged(Self.commandKey), storedCommand != newValue else { return }
+            storedCommand = newValue
+            defaults.set(newValue, forKey: Self.commandKey)
+        }
+    }
+
+    var timeoutSeconds: TimeInterval {
+        get { storedTimeout }
+        set {
+            guard !isManaged(Self.timeoutKey) else { return }
+            let clamped = Self.clampedTimeout(newValue)
+            guard storedTimeout != clamped else { return }
+            storedTimeout = clamped
+            defaults.set(clamped, forKey: Self.timeoutKey)
+        }
+    }
+
+    func isManaged(_ key: String) -> Bool { managedKeys.contains(key) }
+    var hasManagedValues: Bool { !managedKeys.isEmpty }
+
+    init(defaults: UserDefaults = .standard, fileManager: FileManager = .default,
+         isForced: ((String) -> Bool)? = nil) {
         self.defaults = defaults
         self.fileManager = fileManager
-        self.enabled = defaults.bool(forKey: Self.enabledKey)
-        self.command = defaults.string(forKey: Self.commandKey) ?? ""
-        // `object(forKey:)` so an unset key reads as the default rather than
-        // as 0, which the clamp would turn into the 5 s floor.
+        let forced = isForced ?? { defaults.objectIsForced(forKey: $0) }
+        self.managedKeys = Set([Self.enabledKey, Self.commandKey, Self.timeoutKey].filter(forced))
+        self.storedEnabled = defaults.bool(forKey: Self.enabledKey)
+        self.storedCommand = defaults.string(forKey: Self.commandKey) ?? ""
         let stored = (defaults.object(forKey: Self.timeoutKey) as? NSNumber)?.doubleValue
-        self.timeoutSeconds = Self.clampedTimeout(stored ?? Self.defaultTimeout)
+        self.storedTimeout = Self.clampedTimeout(stored ?? Self.defaultTimeout)
     }
 
     static func clampedTimeout(_ seconds: TimeInterval) -> TimeInterval {
@@ -93,6 +95,7 @@ final class PostRecordingCommandSettings: ObservableObject {
     /// Why the command can or cannot be launched. Drives the Settings note.
     enum Status: Equatable {
         case empty
+        case malformed
         /// The first token is not a full path. Mila does not search `PATH`:
         /// the app's `PATH` is not the user's shell's, so a bare name would
         /// resolve differently (or not at all) from what they tested in a
@@ -110,6 +113,8 @@ final class PostRecordingCommandSettings: ObservableObject {
         /// One line for Settings; nil when there is nothing to say.
         var problem: String? {
             switch self {
+            case .malformed:
+                return "Close all quotes and complete any trailing escape before running the command."
             case .empty:
                 return "Enter the full path of a script or executable."
             case .notAbsolute(let token):
@@ -128,6 +133,7 @@ final class PostRecordingCommandSettings: ObservableObject {
     /// `fileManager` checks, so the tests drive it with a temp directory.
     static func resolve(_ command: String,
                         fileManager: FileManager = .default) -> Status {
+        guard hasBalancedQuoting(command) else { return .malformed }
         let tokens = LLMRunner.tokenizeArguments(command)
         guard let first = tokens.first, !first.isEmpty else { return .empty }
         let expanded = (first as NSString).expandingTildeInPath
@@ -141,6 +147,32 @@ final class PostRecordingCommandSettings: ObservableObject {
         }
         return .ready(Invocation(executable: URL(fileURLWithPath: expanded),
                                  arguments: Array(tokens.dropFirst())))
+    }
+
+    /// Validate exactly the quote/escape grammar accepted by the existing
+    /// argv tokenizer, without changing any LLM caller's parsing behavior.
+    private static func hasBalancedQuoting(_ input: String) -> Bool {
+        let chars = Array(input)
+        var single = false
+        var double = false
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if single {
+                if c == "'" { single = false }
+            } else if double {
+                if c == "\"" { double = false }
+                else if c == "\\", i + 1 < chars.count,
+                        chars[i + 1] == "\"" || chars[i + 1] == "\\" { i += 1 }
+            } else if c == "'" { single = true }
+            else if c == "\"" { double = true }
+            else if c == "\\" {
+                guard i + 1 < chars.count else { return false }
+                i += 1
+            }
+            i += 1
+        }
+        return !single && !double
     }
 
     /// `command` as it resolves right now. Re-checked on every read: the

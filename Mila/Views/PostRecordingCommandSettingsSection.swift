@@ -29,7 +29,13 @@ struct PostRecordingCommandSettingsSection: View {
                     .foregroundStyle(.tint)
                 Toggle("Run a command after each recording", isOn: $settings.enabled)
                     .accessibilityIdentifier("postCommand.enabled.toggle")
+                    .disabled(settings.isManaged(PostRecordingCommandSettings.enabledKey))
                 Spacer()
+            }
+            if settings.hasManagedValues {
+                Text("Some command settings are managed by your organization.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if settings.enabled {
                 Text("When a new recording's transcript and summary are final, Mila runs the command below once, as you. It gets the path of a JSON file describing the recording as its last argument, and MILA_SRT, MILA_TXT, MILA_AUDIO, MILA_HANDOFF and MILA_RECORDING_ID in its environment. Use it to copy the subtitles somewhere, call a webhook, or start an agent.")
@@ -55,6 +61,7 @@ struct PostRecordingCommandSettingsSection: View {
                     .font(.callout.monospaced())
                     .autocorrectionDisabled()
                     .accessibilityIdentifier("postCommand.command.field")
+                    .disabled(settings.isManaged(PostRecordingCommandSettings.commandKey))
                 Text("A full path, then any fixed arguments. Mila launches it directly, not through a shell, so pipes, variables and globs are not expanded. Put those in the script.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -75,6 +82,7 @@ struct PostRecordingCommandSettingsSection: View {
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 70)
                     .accessibilityIdentifier("postCommand.timeout.field")
+                    .disabled(settings.isManaged(PostRecordingCommandSettings.timeoutKey))
                 Text("seconds")
                     .font(.callout)
                 Spacer()

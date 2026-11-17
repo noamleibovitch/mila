@@ -91,6 +91,7 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// is stored a moment after the transcript settles, and with no summary
     /// to wait for the command could otherwise be handed a row without it.
     var awaitRowSettled: ((_ recordingID: UUID) async -> Void)?
+    var awaitSummarySettled: ((_ recordingID: UUID) async -> Void)?
 
     private let store: RecordingStore
     private let settings: PostRecordingCommandSettings
@@ -111,6 +112,7 @@ final class PostRecordingCommandRunner: ObservableObject {
     let workingDirectory: URL
 
     private var pending: Set<UUID> = []
+    private var isShuttingDown = false
 
     /// Recordings permanently deleted during this session — a tombstone, not
     /// a cleared flag, for the reason `ObsidianExporter.discarded` documents:
@@ -174,19 +176,22 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// apart.
     private var captured: Set<UUID> = []
 
-    func noteCaptured(_ id: UUID) { captured.insert(id) }
+    func noteCaptured(_ id: UUID) { if !isShuttingDown { captured.insert(id) } }
 
     /// `markPending`, for a recording `noteCaptured` reported. Anything else
     /// is left unmarked and so never runs the command on its own; the manual
     /// run from the context menu still works for it.
-    func markPendingIfCaptured(_ id: UUID) {
-        guard captured.contains(id) else { return }
+    func markPendingIfCaptured(_ id: UUID, enabled: Bool = true) {
+        // Consume capture eligibility even when the feature is off. Later
+        // re-transcription is not a new capture, with or without a summary.
+        guard captured.remove(id) != nil, enabled else { return }
         markPending(id)
     }
 
     /// Ignores an id the user has already thrown away — see `discarded`.
     func markPending(_ id: UUID) {
-        guard !discarded.contains(id) else { return }
+        guard !isShuttingDown, !discarded.contains(id) else { return }
+        captured.remove(id)
         pending.insert(id)
     }
     func isPending(_ id: UUID) -> Bool { pending.contains(id) }
@@ -213,7 +218,7 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// recording may have been trashed, or the hook turned off.
     @discardableResult
     func run(recordingID id: UUID, trigger: Trigger) -> Bool {
-        guard !discarded.contains(id) else { return false }
+        guard !isShuttingDown, !discarded.contains(id) else { return false }
         guard tasks[id] == nil else {
             if trigger == .manual {
                 postStatus?("The post-recording command is already running for this recording.", false)
@@ -249,6 +254,7 @@ final class PostRecordingCommandRunner: ObservableObject {
     func discard(_ id: UUID) {
         discarded.insert(id)
         pending.remove(id)
+        captured.remove(id)
         cancelRun(for: id)
         try? fileManager.removeItem(at: handoffURL(for: id))
     }
@@ -260,11 +266,14 @@ final class PostRecordingCommandRunner: ObservableObject {
     private func perform(_ id: UUID, trigger: Trigger) async {
         await awaitRowSettled?(id)
         if Task.isCancelled { return }
+        await awaitSummarySettled?(id)
+        if Task.isCancelled { return }
         // Deleted stays deleted, and the LIVE row is the one described: the
         // caller's copy can predate the summary, a rename, or a trash.
         guard !discarded.contains(id),
               let recording = store.recordings.first(where: { $0.id == id }),
-              !recording.isTrashed else {
+              !recording.isTrashed,
+              recording.status != .pending, recording.status != .running else {
             postCommandLog.log("skipped \(id.uuidString, privacy: .public): recording is gone or trashed")
             return
         }
@@ -374,6 +383,22 @@ final class PostRecordingCommandRunner: ObservableObject {
             .first(where: { !$0.isEmpty }) ?? ""
         let detail = firstLine.isEmpty ? "" : ": \(firstLine.prefix(160))"
         return ("Post-recording command failed (exit \(result.exitCode))\(detail)", true)
+    }
+
+    /// Close admission synchronously, then let shutdown await cancellation
+    /// and the bounded child-process reap before the application exits.
+    func cancelAll() {
+        isShuttingDown = true
+        pending.removeAll()
+        captured.removeAll()
+        for task in tasks.values { task.cancel() }
+    }
+
+    func shutdown() async {
+        cancelAll()
+        await awaitIdle()
+        tasks.removeAll()
+        tail = nil
     }
 
     // MARK: - Handoff files

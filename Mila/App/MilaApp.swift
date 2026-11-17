@@ -660,7 +660,13 @@ struct MilaApp: App {
         let postCommandSettings = PostRecordingCommandSettings()
         let postCommand = PostRecordingCommandRunner(store: store, settings: postCommandSettings)
         postCommand.awaitRowSettled = { [weak coordinator] id in
-            await coordinator?.calendarMatchSettled(for: id)
+            await coordinator?.postCommandRowSettled(for: id)
+        }
+        postCommand.awaitSummarySettled = { [weak summarizer] id in
+            while summarizer?.isSummarizing(id) == true {
+                do { try await Task.sleep(nanoseconds: 20_000_000) }
+                catch { return }
+            }
         }
         postCommand.postStatus = { [weak coordinator] message, isError in
             coordinator?.postStatus(message, isError: isError)
@@ -730,6 +736,7 @@ struct MilaApp: App {
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
             let obsidianOn = (obsidianSettings?.enabled == true) && (obsidianSettings?.vaultURL != nil)
+            postCommand?.markPendingIfCaptured(rec.id, enabled: postCommandSettings?.isReady == true)
             if wasRetranscription {
                 // `regenerate` bypasses the "already has a summary" gate by
                 // design (it's also the manual on-demand path), so it does
@@ -743,6 +750,7 @@ struct MilaApp: App {
                     // No summarizer hook here either, so settle the pending
                     // speaker-name suggestions now.
                     nameSuggester?.suggestIfPending(rec)
+                    postCommand?.runIfPending(rec)
                     return
                 }
                 if obsidianOn { obsidian?.markPending(rec.id) }
@@ -755,7 +763,6 @@ struct MilaApp: App {
                 // Mila's to repeat, so a re-transcription does not re-run it.
                 // Captured recordings only: this hook also completes imported
                 // files, Voice Memos and recovered orphans.
-                if postCommandSettings?.isReady == true { postCommand?.markPendingIfCaptured(rec.id) }
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
@@ -1406,6 +1413,7 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
+        appDelegate.postCommand = postRecordingCommandRunner
         // Route `.milaconfig` / `.milashare` opens through their importers,
         // and drain any that arrived during a cold launch (before this
         // wiring ran).
@@ -2578,6 +2586,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var actions: QuickActionsController?
     weak var configImporter: MilaConfigImporter?
     weak var shareImporter: RecordingShareImporter?
+    weak var postCommand: PostRecordingCommandRunner?
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
@@ -2650,6 +2659,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        postCommand?.cancelAll()
         // Backstop: if `applicationShouldTerminate` was bypassed (e.g. a force
         // quit through the dock), we still get a chance to free the metal
         // context here. A second call is a no-op via `didShutDown`.
@@ -2943,6 +2953,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func gracefulShutdown() async {
+        await postCommand?.shutdown()
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()

@@ -122,6 +122,12 @@ final class PostRecordingCommandRunnerTests: XCTestCase {
 
     /// The hook exactly as `MilaApp` wires it.
     private func wireHook() {
+        runner?.awaitSummarySettled = { [weak summarizer] id in
+            while summarizer?.isSummarizing(id) == true {
+                do { try await Task.sleep(nanoseconds: 20_000_000) }
+                catch { return }
+            }
+        }
         summarizer?.onSummaryFinished = { [weak runner] rec in
             runner?.runIfPending(rec)
         }
@@ -241,6 +247,72 @@ final class PostRecordingCommandRunnerTests: XCTestCase {
         XCTAssertTrue(launches.all.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: runner.handoffURL(for: rec.id).path),
                        "no handoff is written for a run that does not happen")
+    }
+
+    func test_captured_recording_without_summary_is_automatically_run_only_once() async throws {
+        llm.summaryEnabled = false
+        let rec = addRecording()
+        runner.noteCaptured(rec.id)
+        runner.markPendingIfCaptured(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        await runner.awaitIdle()
+        XCTAssertEqual(launches.all.count, 1)
+        // The same callback shape is used by a re-transcription with no
+        // stored summary. It must not gain fresh-capture eligibility.
+        runner.markPendingIfCaptured(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        await runner.awaitIdle()
+        XCTAssertEqual(launches.all.count, 1)
+    }
+
+    func test_disabled_capture_is_not_rearmed_by_later_retranscription() {
+        let rec = addRecording()
+        runner.noteCaptured(rec.id)
+        runner.markPendingIfCaptured(rec.id, enabled: false)
+        runner.markPendingIfCaptured(rec.id, enabled: true)
+        XCTAssertFalse(runner.isPending(rec.id))
+    }
+
+    func test_manual_run_waits_for_summary_and_coalesces_the_pending_automatic_run() async throws {
+        let gate = TestGate()
+        summarizer = RecordingSummarizer(store: store, llmSettings: llm, liveAISettings: liveAI,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _ in
+                await gate.wait()
+                return "The final summary"
+            })
+        wireHook()
+        let rec = addRecording()
+        runner.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        runner.run(recordingID: rec.id, trigger: .manual)
+        await Task.yield()
+        XCTAssertTrue(launches.all.isEmpty)
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await runner.awaitIdle()
+        XCTAssertEqual(launches.all.count, 1)
+        XCTAssertEqual(try handoff(for: rec).summary, "The final summary")
+    }
+
+    func test_shutdown_cancels_a_summary_wait_and_closes_admission() async throws {
+        let gate = TestGate()
+        summarizer = RecordingSummarizer(store: store, llmSettings: llm, liveAISettings: liveAI,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _ in
+                await gate.wait()
+                return "summary"
+            })
+        wireHook()
+        let rec = addRecording()
+        summarizer.summarizeIfNeeded(rec)
+        runner.run(recordingID: rec.id, trigger: .manual)
+        await Task.yield()
+        await runner.shutdown()
+        XCTAssertTrue(launches.all.isEmpty)
+        XCTAssertFalse(runner.run(recordingID: rec.id, trigger: .manual))
+        runner.markPending(rec.id)
+        XCTAssertFalse(runner.isPending(rec.id))
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
     }
 
     // MARK: - Deleted stays deleted
@@ -559,6 +631,34 @@ final class PostRecordingCommandRunnerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: survived.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: runner.handoffURL(for: rec.id).path))
         XCTAssertTrue(banners.isEmpty, "a deliberate cancel posts nothing: \(banners)")
+    }
+
+    func test_shutdown_kills_running_child_and_never_starts_queued_commands() async throws {
+        let started = tempRoot.appendingPathComponent("started")
+        let survived = tempRoot.appendingPathComponent("survived")
+        script = try writeScript("shutdown.sh", body: """
+            echo "$MILA_RECORDING_ID" >> '\(started.path)'
+            sleep 30
+            touch '\(survived.path)'
+            """)
+        settings.command = script.path
+        useRealLaunch()
+        let first = addRecording(title: "First")
+        let second = addRecording(title: "Second")
+        runner.run(recordingID: first.id, trigger: .automatic)
+        runner.run(recordingID: second.id, trigger: .automatic)
+        let deadline = Date().addingTimeInterval(20)
+        while !FileManager.default.fileExists(atPath: started.path), Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: started.path))
+        let stoppedAt = Date()
+        await runner.shutdown()
+        XCTAssertLessThan(Date().timeIntervalSince(stoppedAt), 20)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: survived.path))
+        let ids = try String(contentsOf: started, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(ids, [first.id.uuidString])
     }
 
     func test_trashing_the_recording_mid_run_kills_the_command() async throws {
