@@ -1171,30 +1171,9 @@ struct MilaApp: App {
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .task { prewarmDefaultModel() }
-                // Keep the local model's retention in step with the inputs
-                // that decide it. `runsLivePipeline` folds in the hardware
-                // gate and the live-transcription toggle; the per-recording
-                // decision covers a recording that snapshotted the live
-                // pipeline ON and is still capturing after the user switched
-                // the toggle OFF — it must finish with its model warm, and
-                // the Stop/finalize flags keep the model through the drain so
-                // its immediate drain can finish with the warm model.
-                .onChange(of: liveAISettings.runsLivePipeline) { _, _ in
-                    syncLocalModelRetention()
-                }
-                .onChange(of: remoteTranscriptionSettings.isActive) { _, _ in
-                    syncLocalModelRetention()
-                }
-                .onChange(of: actions.recordingRunsLivePipeline) { _, _ in
-                    syncLocalModelRetention()
-                }
-                .onChange(of: actions.isStoppingRecording) { _, _ in
-                    syncLocalModelRetention()
-                }
-                .onChange(of: actions.isFinalizingRecording) { _, _ in
-                    syncLocalModelRetention()
-                }
-                .onChange(of: session.state == .idle) { _, _ in
+                // Observe the combined decision once: six separate modifiers
+                // push this large window expression past Swift's type-check limit.
+                .onChange(of: needsWarmLocalModel) { _, _ in
                     syncLocalModelRetention()
                 }
                 .task { await diarizationSettings.runHealthCheck() }
@@ -2505,23 +2484,25 @@ struct MilaApp: App {
             || (recordingRunsLivePipeline && recordingActive)
     }
 
-    /// Recompute whether the local whisper model should stay resident, and
-    /// hand the change to the service. Turning retention back on also warms
-    /// the model, so the first live utterance after switching remote -> local
-    /// or enabling live transcription does not pay a cold CoreML compile.
-    private func syncLocalModelRetention() {
+    /// All inputs to residency participate in one observed decision. A live
+    /// recording keeps its snapshotted pipeline through Stop even when the
+    /// user changes the setting to OFF partway through the recording.
+    private var needsWarmLocalModel: Bool {
         let liveRecording = session.state == .recording || session.state == .paused
-        // A stop is still finalizing (closing the WAV, draining the live
-        // pipeline, possibly enqueuing a batch job) after the session reaches
-        // `.idle`. Keep the model through that so switching live OFF mid-
-        // recording does not unload it out from under the drain.
         let postStop = actions.isStoppingRecording || actions.isFinalizingRecording
-        let retains = Self.localModelRetentionRequired(
+        return Self.localModelRetentionRequired(
             livePipelineEnabled: liveAISettings.runsLivePipeline,
             recordingRunsLivePipeline: actions.recordingRunsLivePipeline,
             recordingActive: liveRecording,
             stoppingOrFinalizing: postStop,
             remoteActive: remoteTranscriptionSettings.isActive)
+    }
+
+    /// Apply preference changes synchronously. Turning retention back on also
+    /// warms the model for live transcription; cleanup rechecks the latest
+    /// decision so a queued OFF cleanup cannot undo a subsequent ON change.
+    private func syncLocalModelRetention() {
+        let retains = needsWarmLocalModel
         let wasRetaining = transcription.retainsLocalModel
         transcription.updateLocalModelRetention(retains)
         if retains, !wasRetaining { prewarmDefaultModel() }
