@@ -2721,6 +2721,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
                               shareImporter.objectWillChange.eraseToAnyPublisher(),
                               configImporter.objectWillChange.eraseToAnyPublisher(),
                               store.objectWillChange.eraseToAnyPublisher(),
+                              updater.objectWillChange.eraseToAnyPublisher(),
                               Self.menuBarTranscriptionChanges(transcription)
                           ])
     }

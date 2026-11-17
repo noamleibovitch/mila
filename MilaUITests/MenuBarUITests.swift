@@ -50,6 +50,9 @@ final class MenuBarUITests: XCTestCase {
             XCTAssertTrue(mainWindow(application).waitForExistence(timeout: 10))
         }
 
+        closeMainWindow(application)
+        waitUntilGone(mainWindow(application))
+
         // Settings opens natively from the menu and closes normally, without
         // hiding the app or showing the background notice.
         openMenu(application)
