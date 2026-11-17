@@ -87,9 +87,9 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// banner the Send action already reports through.
     var postStatus: ((_ message: String, _ isError: Bool) -> Void)?
     /// Awaited before a run reads the row. Late-bound by `MilaApp` to
-    /// `PostRecordingCoordinator.calendarMatchSettled`: the calendar event
-    /// is stored a moment after the transcript settles, and with no summary
-    /// to wait for the command could otherwise be handed a row without it.
+    /// `PostRecordingCoordinator.postCommandRowSettled`, which waits for
+    /// calendar lookup and transcript/speaker finalization. Summary settlement
+    /// is a separate cancellation-aware wait through `awaitSummarySettled`.
     var awaitRowSettled: ((_ recordingID: UUID) async -> Void)?
     var awaitSummarySettled: ((_ recordingID: UUID) async -> Void)?
 

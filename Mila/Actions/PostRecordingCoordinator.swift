@@ -255,10 +255,6 @@ final class PostRecordingCoordinator: ObservableObject {
 
     // MARK: - Calendar match
 
-    /// Returns once the calendar match for `id` has stored its event, or at
-    /// once when none is in flight. For a reader of the row that must not
-    /// miss `calendarEvent` (the post-recording command's handoff).
-
     /// The event a recording that starts now is most likely for, for the
     /// recording screen to show. nil when the calendar match is off, not
     /// ready, or nothing is on. Never stored: `recordingFinished` matches
@@ -267,6 +263,9 @@ final class PostRecordingCoordinator: ObservableObject {
         await calendar?.currentEvent()
     }
 
+    /// Returns once the calendar match for `id` has stored its event, or at
+    /// once when none is in flight. For a reader of the row that must not
+    /// miss `calendarEvent` (the post-recording command's handoff).
     func calendarMatchSettled(for id: UUID) async {
         while calendarTasks[id] != nil {
             do { try await Task.sleep(nanoseconds: 20_000_000) }
