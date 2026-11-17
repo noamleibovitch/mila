@@ -91,7 +91,9 @@ public struct MilaMCPToolHandlers: Sendable {
             List Mila recordings (meetings, voice memos, app-audio captures), newest first by \
             default. Filter by speaker display name to find conversations with a specific \
             person — e.g. the last meeting with John Doe is list_recordings(speaker: "john \
-            doe", limit: 1). Trashed recordings are excluded.
+            doe", limit: 1). Trashed recordings are excluded. A recording the user's calendar \
+            match tied to an event carries "calendar_event" (title, start, end, calendar, \
+            attendees) — the people INVITED, who are not necessarily the "speakers" heard.
             """,
             inputSchema: [
                 "type": "object",
@@ -122,6 +124,8 @@ public struct MilaMCPToolHandlers: Sendable {
             Fetch one recording's full transcript with speaker names resolved (e.g. "John \
             Doe: …"), plus its summary and action items when available. Pass the id from \
             list_recordings/search_transcripts; omit it for the latest completed recording.
+            "calendar_event", when present, is the calendar event the recording overlapped; \
+            its attendees were invited, which does not mean each of them spoke.
             Each action item carries "source": "voice_command" when the speaker dictated it \
             out loud, "inferred" when the model derived it from the conversation — do not \
             present an inferred item as something the speaker said.
@@ -753,6 +757,25 @@ public struct MilaMCPToolHandlers: Sendable {
         // Lets a client tell "the user chose to transcribe this later" from a
         // genuine `failed` without fetching the transcript.
         if recording.isTranscriptionDeferred { obj["transcription_stopped"] = true }
+        // Present only when the app matched the recording to a calendar
+        // event (an opt-in feature). The invitation, not the room: an
+        // attendee listed here was invited, which is not the same as spoke.
+        if let event = recording.calendarEvent { obj["calendar_event"] = calendarEventObject(for: event) }
+        return obj
+    }
+
+    private func calendarEventObject(for event: StoredRecording.CalendarEvent) -> [String: Any] {
+        var obj: [String: Any] = [
+            "title": event.title,
+            "start": iso(event.start),
+            "end": iso(event.end),
+            "attendees": event.attendees.map { attendee -> [String: Any] in
+                var entry: [String: Any] = ["name": attendee.name]
+                if let email = attendee.email { entry["email"] = email }
+                return entry
+            },
+        ]
+        if !event.calendarName.isEmpty { obj["calendar"] = event.calendarName }
         return obj
     }
 

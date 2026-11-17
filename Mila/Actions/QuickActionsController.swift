@@ -121,6 +121,12 @@ final class QuickActionsController: ObservableObject {
         return store.recordings.contains(where: { $0.id == id && !$0.isTrashed }) ? id : nil
     }
 
+    /// Title of the calendar event the recording in progress most likely
+    /// belongs to, looked up when it started. The meeting-name field shows
+    /// it as its placeholder. Display only: the title is decided by the
+    /// calendar match on the finished recording, and a typed name beats both.
+    @Published private(set) var recordingCalendarTitle: String?
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -872,6 +878,7 @@ final class QuickActionsController: ObservableObject {
             // the moment the drain releases it (issue #356).
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recording(withSystemAudio: withSystemAudio)
+            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
@@ -1130,6 +1137,7 @@ final class QuickActionsController: ObservableObject {
             // call in startRecording() for the full rationale.
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recordingApp(processID: app?.processID, includeMic: includeMic)
+            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
@@ -1255,6 +1263,9 @@ final class QuickActionsController: ObservableObject {
         // live text into a final transcript and skip the batch pass.
         let runsLivePipeline = ownsLivePipeline && recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
+        // For the calendar match: the audio's duration leaves paused time
+        // out, so only the wall clock says when the recording really began.
+        let wallClockStart = session.startedAt
         pendingSleepStopReason = nil
         // Always cancel the silence-watch BEFORE the engine teardown so a
         // late-arriving "no sound" warning doesn't fire on a recording the
@@ -1295,6 +1306,7 @@ final class QuickActionsController: ObservableObject {
             // must not leave title/folder selected for the next recording.
             nextRecordingTitle = ""
             nextRecordingFolder = nil
+            recordingCalendarTitle = nil
             guard ownsLivePipeline else {
                 // Nothing of the live pipeline is ours to tear down.
                 activeJob = .none
@@ -1375,6 +1387,7 @@ final class QuickActionsController: ObservableObject {
         let chosenFolder = nextRecordingFolder
         nextRecordingTitle = ""
         nextRecordingFolder = nil
+        recordingCalendarTitle = nil
 
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why
@@ -1512,19 +1525,29 @@ final class QuickActionsController: ObservableObject {
                 wasOnBattery: !SleepGuard.isOnACPower()
             )
         }
-        if sleepReason == nil {
-            if autoSaveRecordings {
-                // Preferred "save and open" flow: keep the recording and put
-                // the user on it instead of blocking on a name. The rename
-                // sheet is skipped; the (optional) AI title still runs in the
-                // background, and ContentView reveals the row via the one-shot
-                // reveal id. `autoSuggestOnly` never touches `pending`.
-                postRecording.autoSuggestOnly(recording,
-                                              titleWasUserProvided: titleWasUserProvided)
-                autoSaveRevealID = recording.id
-            } else {
-                postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
-            }
+        // Always called; only the rename sheet is withheld after a sleep
+        // stop (the wake-up alert above stands in for it) and on the
+        // auto-save path. The calendar match it arms belongs to every
+        // finished recording.
+        if autoSaveRecordings && sleepReason == nil {
+            // Preferred "save and open" flow: keep the recording and put
+            // the user on it instead of blocking on a name. The rename
+            // sheet is skipped; the (optional) AI title still runs in the
+            // background, after the calendar match, and ContentView reveals
+            // the row via the one-shot reveal id. `autoSuggestOnly` never
+            // touches `pending`.
+            postRecording.recordingFinished(recording,
+                                            startedAt: wallClockStart,
+                                            titleWasUserProvided: titleWasUserProvided,
+                                            showsRenameSheet: false)
+            postRecording.autoSuggestOnly(recording,
+                                          titleWasUserProvided: titleWasUserProvided)
+            autoSaveRevealID = recording.id
+        } else {
+            postRecording.recordingFinished(recording,
+                                            startedAt: wallClockStart,
+                                            titleWasUserProvided: titleWasUserProvided,
+                                            showsRenameSheet: sleepReason == nil)
         }
 
         // A recording that never had the live pipeline has nothing to drain,

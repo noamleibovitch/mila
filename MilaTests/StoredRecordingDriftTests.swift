@@ -76,7 +76,12 @@ final class StoredRecordingDriftTests: XCTestCase {
                                       evidence: "hi there, John here", origin: .transcript),
             ],
             untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
-                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)],
+            calendarEvent: CalendarEventMatch(
+                title: "Weekly sync", start: created.addingTimeInterval(-120), end: created,
+                calendarName: "Work",
+                attendees: [.init(name: "Daniel", email: "daniel@example.com"),
+                            .init(name: "John Doe")])
         )
     }
 
@@ -158,6 +163,13 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(span.end, 15.5, accuracy: 0.001)
         XCTAssertNil(span.unreadable)
         XCTAssertEqual(s.untranscribedSpans?.last?.unreadable, true)
+        let event = try XCTUnwrap(s.calendarEvent)
+        XCTAssertEqual(event.title, "Weekly sync")
+        XCTAssertEqual(event.start, created.addingTimeInterval(-120))
+        XCTAssertEqual(event.end, created)
+        XCTAssertEqual(event.calendarName, "Work")
+        XCTAssertEqual(event.attendees, [.init(name: "Daniel", email: "daniel@example.com"),
+                                         .init(name: "John Doe")])
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -235,6 +247,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             "retranscriptionPriorState": [],
             // Nothing. `UntranscribedSpan` is mirrored in full.
             "untranscribedSpans": [],
+            // Nothing. `CalendarEventMatch` is mirrored in full.
+            "calendarEvent": [],
         ]
         // Object-valued keys whose KEYS are data, not schema: the mirror
         // decodes them as a dictionary, so there is no element type to drift.
@@ -284,8 +298,8 @@ final class StoredRecordingDriftTests: XCTestCase {
                   let elements = elements(of: value), !elements.isEmpty else { return nil }
             return key
         }.sorted()
-        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments",
-                                    "untranscribedSpans"],
+        XCTAssertEqual(containers, ["actionItems", "calendarEvent", "retranscriptionPriorState",
+                                    "segments", "untranscribedSpans"],
                        "Recording gained (or lost) a nested container. Populate it in "
                        + "fullyPopulatedRecording(), mirror its element type in "
                        + "StoredRecording, and pin its shape in "
@@ -351,6 +365,18 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(spanKeys, ["start", "end", "unreadable"],
                        "UntranscribedSpan's persisted shape changed — update the fixture and "
                        + "decide whether the new key belongs in StoredRecording.UntranscribedSpan")
+
+        let event = try XCTUnwrap(appJSON["calendarEvent"] as? [String: Any])
+        XCTAssertEqual(Set(event.keys), ["title", "start", "end", "calendarName", "attendees"],
+                       "CalendarEventMatch's persisted shape changed — update the fixture and "
+                       + "decide whether the new key belongs in StoredRecording.CalendarEvent")
+        // One level further than the container check reaches: the attendees
+        // are objects inside an object.
+        let attendees = try XCTUnwrap(event["attendees"] as? [[String: Any]])
+        let attendeeKeys = attendees.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        XCTAssertEqual(attendeeKeys, ["name", "email"],
+                       "CalendarEventMatch.Attendee's persisted shape changed — update the "
+                       + "fixture and StoredRecording.CalendarEvent.Attendee")
     }
 
     /// The recovered fields must actually arrive, not merely have a key.
@@ -379,6 +405,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertNil(s.summaryLanguage)
         XCTAssertNil(s.retranscriptionPriorState, "omitted when nil, so a never re-transcribed row has no key")
         XCTAssertNil(s.untranscribedSpans, "omitted when nil, so a complete transcript has no key")
+        XCTAssertNil(s.calendarEvent, "omitted when nil, so an unmatched recording has no key")
     }
 
     func test_legacy_inline_fulltext_decodes() throws {
