@@ -53,9 +53,14 @@ final class BatchOnlyRecordingUITests: XCTestCase {
 
         let stop = element(application, "home.record.hero")
         XCTAssertTrue(stop.waitForExistence(timeout: 30))
+        // The Home-only Pause control exists only during an active capture.
+        // Do not infer recording state from a SwiftUI button's combined AX
+        // caption, which macOS can expose on a child rather than the button.
+        XCTAssertTrue(element(application, "recording.pause").waitForExistence(timeout: 30))
+        XCTAssertFalse(element(application, "liveAI.stop").exists,
+                       "The fixture must use batch Home capture, not the live pane")
         let recording = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            let caption = stop.label + (stop.value as? String ?? "")
-            return caption.contains("Recording") && stop.isHittable && stop.isEnabled
+            stop.isHittable && stop.isEnabled
         }, object: stop)
         XCTAssertEqual(XCTWaiter.wait(for: [recording], timeout: 30), .completed,
                        "Batch-only capture must offer an enabled Stop without a live transcript")
