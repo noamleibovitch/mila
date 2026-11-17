@@ -20,6 +20,7 @@ struct MenuBarMenuView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        let stopRequested = controller.canStop
         Text(controller.status.accessibilityLabel)
             .accessibilityIdentifier("menuBar.status")
 
@@ -30,8 +31,8 @@ struct MenuBarMenuView: View {
 
         Divider()
 
-        Button(controller.recordTitle) {
-            controller.performRecord()
+        Button(stopRequested ? "Stop Recording" : "Start Recording") {
+            controller.performRecord(stopRequested: stopRequested)
         }
         .disabled(!controller.canStop && !controller.canStart)
         .accessibilityIdentifier("menuBar.record")

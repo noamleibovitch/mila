@@ -116,27 +116,34 @@ final class MenuBarController: ObservableObject {
         return MenuBarPolicy.status(for: currentInput(runtime))
     }
 
-    /// The single Record/Stop menu item. The decision is made from the same
-    /// snapshot the menu rendered, so a Stop always routes to
-    /// `stopRecording` for every capture source (including paused), and Start
-    /// always routes through `toggleRecord(microphone:appAudio:)`.
-    func performRecord() {
+    /// Preserve the intent captured with the displayed menu title. Revalidate
+    /// against live state before execution; a stale Start or Stop must never
+    /// turn into its opposite when another surface changes capture state.
+    func performRecord(stopRequested: Bool) {
         guard let runtime, !actionInFlight else { return }
         let input = currentInput(runtime)
 
-        if MenuBarPolicy.canStop(input) {
+        if stopRequested {
+            guard MenuBarPolicy.canStop(input) else { refresh(); return }
             actionInFlight = true
             Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.finishAction() }
+                guard MenuBarPolicy.canStop(self.currentInput(runtime)) else { return }
                 await runtime.stop()
-                self?.finishAction()
             }
             return
         }
 
-        guard MenuBarPolicy.canStart(input) else { return }
+        guard MenuBarPolicy.canStart(input) else { refresh(); return }
         let sources = MenuBarSourceSettings.read(from: settingsDefaults)
         actionInFlight = true
         Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.finishAction() }
+            // The Task can start a runloop turn after the menu click. Check
+            // again before entering the shared toggle, which can also Stop.
+            guard MenuBarPolicy.canStart(self.currentInput(runtime)) else { return }
             await runtime.start(sources.microphone, sources.appAudio)
             // A refused start with no error state must not leave the user
             // staring at a menu that silently did nothing. A permission/error
@@ -145,7 +152,6 @@ final class MenuBarController: ObservableObject {
             if !runtime.startBegan() && !runtime.blockingState() {
                 runtime.revealIfHidden()
             }
-            self?.finishAction()
         }
     }
 

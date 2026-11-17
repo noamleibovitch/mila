@@ -25,7 +25,7 @@ final class MenuBarControllerTests: XCTestCase {
     func test_start_reads_exactly_the_home_source_defaults() async {
         let first = expectation(description: "start 1")
         state.onStart = { first.fulfill() }
-        controller.performRecord()
+        controller.performRecord(stopRequested: controller.canStop)
         await fulfillment(of: [first], timeout: 2)
         await waitForActionToFinish()
         XCTAssertEqual(state.startCalls.count, 1)
@@ -38,7 +38,7 @@ final class MenuBarControllerTests: XCTestCase {
 
         let second = expectation(description: "start 2")
         state.onStart = { second.fulfill() }
-        controller.performRecord()
+        controller.performRecord(stopRequested: controller.canStop)
         await fulfillment(of: [second], timeout: 2)
         await waitForActionToFinish()
         XCTAssertEqual(state.startCalls.count, 2)
@@ -50,7 +50,7 @@ final class MenuBarControllerTests: XCTestCase {
         state.startBegan = false
         let started = expectation(description: "start finished")
         state.onStart = { started.fulfill() }
-        controller.performRecord()
+        controller.performRecord(stopRequested: controller.canStop)
         await fulfillment(of: [started], timeout: 2)
         await waitForActionToFinish()
         XCTAssertEqual(state.revealCalls, 1,
@@ -63,7 +63,7 @@ final class MenuBarControllerTests: XCTestCase {
             self.state.blocking = true
             started.fulfill()
         }
-        controller.performRecord()
+        controller.performRecord(stopRequested: controller.canStop)
         await fulfillment(of: [started], timeout: 2)
         await waitForActionToFinish()
         XCTAssertEqual(state.revealCalls, 1)
@@ -86,13 +86,59 @@ final class MenuBarControllerTests: XCTestCase {
 
             let stopped = expectation(description: "stop \(job)")
             state.onStop = { stopped.fulfill() }
-            controller.performRecord()
+            controller.performRecord(stopRequested: controller.canStop)
             await fulfillment(of: [stopped], timeout: 2)
             await waitForActionToFinish()
             XCTAssertEqual(state.stopCalls, index + 1)
             XCTAssertTrue(state.startCalls.isEmpty,
                           "A capture state must never route to Start")
         }
+    }
+
+    func test_stale_stop_does_not_start_after_external_stop() async {
+        state.input.activeJob = .recording(withSystemAudio: true)
+        state.input.sessionState = .recording
+        controller.refresh()
+        let displayedStop = controller.canStop
+        state.input.activeJob = .none
+        state.input.sessionState = .idle
+        controller.refresh()
+        controller.performRecord(stopRequested: displayedStop)
+        await Task.yield()
+        XCTAssertTrue(state.startCalls.isEmpty)
+        XCTAssertEqual(state.stopCalls, 0)
+    }
+
+    func test_stale_start_does_not_stop_after_external_start() async {
+        let displayedStop = controller.canStop
+        state.input.activeJob = .recordingApp(processID: nil, includeMic: false)
+        state.input.sessionState = .recording
+        controller.refresh()
+        controller.performRecord(stopRequested: displayedStop)
+        await Task.yield()
+        XCTAssertTrue(state.startCalls.isEmpty)
+        XCTAssertEqual(state.stopCalls, 0)
+    }
+
+    func test_queued_start_revalidates_before_shared_toggle() async {
+        controller.performRecord(stopRequested: false)
+        state.input.activeJob = .recording(withSystemAudio: true)
+        state.input.sessionState = .recording
+        await waitForActionToFinish()
+        XCTAssertTrue(state.startCalls.isEmpty)
+        XCTAssertEqual(state.stopCalls, 0)
+    }
+
+    func test_queued_stop_revalidates_after_external_stop() async {
+        state.input.activeJob = .recording(withSystemAudio: true)
+        state.input.sessionState = .recording
+        controller.refresh()
+        controller.performRecord(stopRequested: true)
+        state.input.activeJob = .none
+        state.input.sessionState = .idle
+        await waitForActionToFinish()
+        XCTAssertTrue(state.startCalls.isEmpty)
+        XCTAssertEqual(state.stopCalls, 0)
     }
 
     func test_repeated_stop_while_stopping_is_disabled() {
