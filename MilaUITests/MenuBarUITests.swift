@@ -38,9 +38,9 @@ final class MenuBarUITests: XCTestCase {
         waitForStatusLabel(application, containing: "Ready")
         let main = mainWindow(application)
         XCTAssertTrue(main.waitForExistence(timeout: 20))
-        XCTAssertTrue(statusItem(application).label.contains("Mila"),
+        XCTAssertTrue(accessibilityText(statusItem(application)).contains("Mila"),
                       "The menu-bar item must expose its Mila accessibility name")
-        XCTAssertTrue(statusItem(application).label.contains("Ready"))
+        XCTAssertTrue(accessibilityText(statusItem(application)).contains("Ready"))
 
         // Repeated X → Open cycles, with no first-close explanation.
         for _ in 0..<2 {
@@ -341,7 +341,7 @@ final class MenuBarUITests: XCTestCase {
                       "Clicking the status item must open its native menu")
         // Capture only this app's menu/status item, never the whole desktop.
         let menu = application.menus.firstMatch
-        let image = menu.exists ? menu.screenshot() : item.screenshot()
+        let image = menu.exists && !menu.frame.isEmpty ? menu.screenshot() : item.screenshot()
         let attachment = XCTAttachment(screenshot: image)
         attachment.name = "Mila menu bar"
         attachment.lifetime = .keepAlways
@@ -367,9 +367,12 @@ final class MenuBarUITests: XCTestCase {
         return application.descendants(matching: .any)[expected]
     }
 
+    private func accessibilityText(_ element: XCUIElement) -> String {
+        [element.label, element.value as? String ?? "", element.identifier].joined(separator: " ")
+    }
+
     private func statusText(_ application: XCUIApplication, _ element: XCUIElement) -> String {
-        let value = (element.value as? String) ?? ""
-        return element.label + " " + value
+        accessibilityText(element)
     }
 
     private func backgroundNotice(_ application: XCUIApplication) -> XCUIElement {
@@ -379,12 +382,12 @@ final class MenuBarUITests: XCTestCase {
     }
 
     private func noticeMessage(_ application: XCUIApplication, title: String) -> String {
-        let texts = application.staticTexts
+        let texts = backgroundNotice(application).staticTexts
         var message = ""
         for index in 0..<texts.count {
             let text = texts.element(boundBy: index)
             if text.exists, text.label != title {
-                message += text.label + " "
+                message += accessibilityText(text) + " "
             }
         }
         return message
@@ -415,13 +418,12 @@ final class MenuBarUITests: XCTestCase {
         XCTAssertTrue(item.waitForExistence(timeout: 20))
         let matches = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in
-                let value = (item.value as? String) ?? ""
-                return (item.label + " " + value).localizedCaseInsensitiveContains(state)
+                self.accessibilityText(item).localizedCaseInsensitiveContains(state)
             },
             object: item
         )
         XCTAssertEqual(XCTWaiter.wait(for: [matches], timeout: timeout), .completed,
-                       "Status item must expose \(state)")
+                       "Status item must expose \(state): \(item.debugDescription)")
     }
 
     private func waitForDefaultsAcknowledgement() {
