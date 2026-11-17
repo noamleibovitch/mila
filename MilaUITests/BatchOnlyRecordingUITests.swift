@@ -30,26 +30,25 @@ final class BatchOnlyRecordingUITests: XCTestCase {
                           "Requires an unlocked Mac and local synthetic WAV/tiny model fixtures.")
         let wav = try fixturePath("MILA_FIXTURE_WAV_PATH")
         let tiny = try fixturePath("MILA_TINY_MODEL_PATH")
-        // Only this test-owned suite is written. The same existing seam also
-        // copies the synthetic WAV into the isolated recording store for Stop.
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "Mila.AutoSaveUITests.\(suiteID.uuidString)"))
-        defaults.set(true, forKey: "recordings.autoSave")
-        defaults.set(false, forKey: "liveAI.transcribeWhileRecording")
-        defaults.set(false, forKey: "liveAI.enabled")
-        defaults.set(false, forKey: "liveAI.backgroundMode")
-        let application = XCUIApplication()
-        application.launchArguments = [
-            "--uitests", "--ui-test-clean-store", "--ui-test-recording-lang-en",
-            "--ui-test-auto-save-suite=\(suiteID.uuidString)",
-            "--ui-test-inject-fixture-wav=\(wav)", "--ui-test-tiny-model-path=\(tiny)",
-            "-diarization.enabled", "NO", "-speakers.voiceRecognition.enabled", "NO",
-            "-llm.tool", "none", "-llm.name.enabled", "NO",
-            "-llm.summary.enabled", "NO", "-llm.action.enabled", "NO",
-            "-transcription.backend", "local",
-        ]
-        application.launchEnvironment["TMPDIR"] = tempRoot.path + "/"
-        app = application
-        application.launch()
+        // Configure the target through its real controls. The XCTest runner
+        // and target can have different preference homes, so seeding defaults
+        // from this process is not proof of what the target will actually read.
+        let initial = launch(tiny: tiny)
+        initial.typeKey(",", modifierFlags: .command)
+        let audio = element(initial, "settings.section.audio")
+        XCTAssertTrue(audio.waitForExistence(timeout: 10))
+        audio.click()
+        setToggle(initial, "liveAI.transcribeWhileRecording.toggle", isOn: false)
+        setToggle(initial, "recordings.autoSave.toggle", isOn: true)
+        let settings = initial.windows["com_apple_SwiftUI_Settings_window"]
+        let close = settings.buttons["_XCUI:CloseWindow"]
+        XCTAssertTrue(close.isHittable)
+        close.click()
+        initial.terminate()
+
+        // Relaunch the SAME test-owned suite with synthetic capture armed.
+        // The explicit live-pane absence check below verifies the setting stuck.
+        let application = launch(wav: wav, tiny: tiny)
 
         let stop = element(application, "home.record.hero")
         XCTAssertTrue(stop.waitForExistence(timeout: 30))
@@ -91,6 +90,45 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         XCTAssertTrue(title.waitForExistence(timeout: 10))
         XCTAssertTrue(transcript.waitForExistence(timeout: 10),
                       "Reopening must retain the batch transcript")
+    }
+
+    private func launch(wav: String? = nil, tiny: String) -> XCUIApplication {
+        let application = XCUIApplication()
+        application.launchArguments = [
+            "--uitests", "--ui-test-clean-store", "--ui-test-recording-lang-en",
+            "--ui-test-auto-save-suite=\(suiteID.uuidString)",
+            "--ui-test-tiny-model-path=\(tiny)",
+            "-diarization.enabled", "NO", "-speakers.voiceRecognition.enabled", "NO",
+            "-llm.tool", "none", "-llm.name.enabled", "NO",
+            "-llm.summary.enabled", "NO", "-llm.action.enabled", "NO",
+            "-transcription.backend", "local",
+        ]
+        if let wav { application.launchArguments.append("--ui-test-inject-fixture-wav=\(wav)") }
+        application.launchEnvironment["TMPDIR"] = tempRoot.path + "/"
+        app = application
+        application.launch()
+        return application
+    }
+
+    private func setToggle(_ application: XCUIApplication, _ identifier: String, isOn: Bool) {
+        let toggle = element(application, identifier)
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        let settings = application.windows.containing(.any, identifier: "settings.section.audio").firstMatch
+        for _ in 0..<8 {
+            if toggle.isHittable { break }
+            settings.scrollViews.firstMatch.scroll(byDeltaX: 0, deltaY: -160)
+        }
+        XCTAssertTrue(toggle.isHittable)
+        XCTAssertTrue(toggle.isEnabled)
+        let expected = isOn ? "1" : "0"
+        let matches = NSPredicate { _, _ in
+            if let value = toggle.value as? NSNumber { return value.boolValue == isOn }
+            return (toggle.value as? String) == expected
+        }
+        if !matches.evaluate(with: toggle) { toggle.click() }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: matches, object: toggle)],
+                                     timeout: 5), .completed,
+                       "The target must persist the requested Audio setting")
     }
 
     private func element(_ application: XCUIApplication, _ identifier: String) -> XCUIElement {
