@@ -273,6 +273,30 @@ final class CalendarMatchWiringTests: XCTestCase {
         XCTAssertEqual(llmCalls, 0)
     }
 
+    /// Ten minutes in the first meeting, a half-hour pause, one minute in
+    /// the second. The audio is 11 minutes long, so `createdAt - duration`
+    /// would start the window inside the pause and miss the first meeting.
+    func test_paused_recording_is_matched_on_its_wall_clock_start() async throws {
+        let start = stoppedAt.addingTimeInterval(-41 * 60)
+        provider.allEvents = [
+            CalendarEventCandidate(title: "First", start: start, end: start.addingTimeInterval(30 * 60),
+                                   calendarID: work.id, calendarName: "Work", attendees: []),
+            CalendarEventCandidate(title: "Second", start: start.addingTimeInterval(30 * 60), end: stoppedAt,
+                                   calendarID: work.id, calendarName: "Work", attendees: [])]
+        let coordinator = makeCoordinator()
+        let audioURL = store.freshAudioURL(suggestedName: "Paused")
+        try? Data("not-audio".utf8).write(to: audioURL)
+        var rec = Recording(title: defaultTitle, createdAt: stoppedAt, duration: 11 * 60,
+                            source: .meeting, audioFileName: audioURL.lastPathComponent,
+                            fullText: "the transcript text")
+        rec.status = .completed
+        store.add(rec)
+
+        coordinator.recordingFinished(rec, startedAt: start)
+
+        XCTAssertEqual(stored(rec)?.title, "First")
+    }
+
     // MARK: - Timing
 
     func test_match_waits_for_the_offline_speaker_pass() async throws {

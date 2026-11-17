@@ -1135,6 +1135,9 @@ final class QuickActionsController: ObservableObject {
         // live text into a final transcript and skip the batch pass.
         let runsLivePipeline = ownsLivePipeline && recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
+        // For the calendar match: the audio's duration leaves paused time
+        // out, so only the wall clock says when the recording really began.
+        let wallClockStart = session.startedAt
         let sleepReason = pendingSleepStopReason
         pendingSleepStopReason = nil
         // Always cancel the silence-watch BEFORE the engine teardown so a
@@ -1399,6 +1402,7 @@ final class QuickActionsController: ObservableObject {
         // stop (the wake-up alert above stands in for it). The calendar
         // match it arms belongs to every finished recording.
         postRecording.recordingFinished(recording,
+                                        startedAt: wallClockStart,
                                         titleWasUserProvided: titleWasUserProvided,
                                         showsRenameSheet: sleepReason == nil)
 

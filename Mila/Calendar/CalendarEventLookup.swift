@@ -28,10 +28,20 @@ final class CalendarEventLookup {
 
     /// The event `recording` overlapped, or nil — the feature is off or not
     /// ready, or no event qualifies (`CalendarEventMatcher.bestMatch`).
-    func match(for recording: Recording) -> CalendarEventMatch? {
+    ///
+    /// `startedAt` is the wall-clock instant the recording began, when the
+    /// caller knows it. A paused recording's `duration` leaves the pause
+    /// out, so `createdAt - duration` puts its start too late and can hand
+    /// the match to the next meeting.
+    func match(for recording: Recording, startedAt: Date? = nil) -> CalendarEventMatch? {
         guard settings.isReady else { return nil }
-        let window = CalendarEventMatcher.recordingWindow(createdAt: recording.createdAt,
+        let window: DateInterval
+        if let startedAt, startedAt < recording.createdAt {
+            window = DateInterval(start: startedAt, end: recording.createdAt)
+        } else {
+            window = CalendarEventMatcher.recordingWindow(createdAt: recording.createdAt,
                                                           duration: recording.duration)
+        }
         guard window.duration > 0 else { return nil }
         let allowed = settings.allowedCalendarIDs
         let events = settings.provider.events(in: window, calendarIDs: allowed)

@@ -236,9 +236,10 @@ final class PostRecordingCoordinator: ObservableObject {
     /// come here: their `createdAt` is not the moment a recording stopped,
     /// which is what the match window is built on.
     func recordingFinished(_ recording: Recording,
+                           startedAt: Date? = nil,
                            titleWasUserProvided: Bool = false,
                            showsRenameSheet: Bool = true) {
-        armCalendarMatch(for: recording, mayTitle: !titleWasUserProvided)
+        armCalendarMatch(for: recording, startedAt: startedAt, mayTitle: !titleWasUserProvided)
         if showsRenameSheet {
             // The row, not the caller's copy: the match may just have
             // titled it, and the sheet seeds its field from what it is given.
@@ -274,6 +275,7 @@ final class PostRecordingCoordinator: ObservableObject {
     /// writing the row, and a field added in between could be written over.
     @discardableResult
     private func armCalendarMatch(for recording: Recording,
+                                  startedAt: Date? = nil,
                                   mayTitle: Bool) -> Task<Bool, Never>? {
         guard let calendar, calendar.isReady else { return nil }
         let id = recording.id
@@ -285,7 +287,7 @@ final class PostRecordingCoordinator: ObservableObject {
         // The lookup needs only the recording's times, which are final at
         // stop, so it runs here, once. No event means nothing to wait for
         // and the LLM title job proceeds as if the feature were off.
-        guard let match = calendar.match(for: recording) else { return nil }
+        guard let match = calendar.match(for: recording, startedAt: startedAt) else { return nil }
         // The title does not wait for the row to settle either: a title-only
         // write to a row that is still transcribing is what the rename
         // sheet's Save already does (`dismiss(savingTitle:)`). Naming it now
