@@ -157,7 +157,9 @@ final class MenuBarUITests: XCTestCase {
         let quit = menuItem(application, identifier: "menuBar.quit", title: "Quit Mila")
         XCTAssertTrue(quit.waitForExistence(timeout: 5))
         quit.click()
-        XCTAssertNotEqual(application.state, .runningForeground)
+        // Quit uses AppKit's terminateLater while capture and child processes
+        // shut down. Require actual termination within the existing bound;
+        // the foreground state immediately after the click is not a result.
         waitUntilNotRunning(application)
         XCTAssertFalse(backgroundNotice(application).exists,
                        "Quit must not present the background-running notice")
