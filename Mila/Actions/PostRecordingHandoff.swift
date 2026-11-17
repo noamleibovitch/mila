@@ -60,6 +60,9 @@ struct PostRecordingHandoff: Codable, Equatable {
     var files: Files
     var summary: String?
     var actionItems: [Item]
+    /// The calendar event the recording was matched to, when the calendar
+    /// match is on and found one. Carries the invite's title and attendees.
+    var calendarEvent: CalendarEventMatch?
 
     /// Build the handoff for `recording`. `audio`/`srt`/`txt`/`summary` are
     /// where the store keeps the files; each is listed only if it exists.
@@ -98,11 +101,7 @@ struct PostRecordingHandoff: Codable, Equatable {
         actionItems = (recording.actionItems ?? []).map {
             Item(id: $0.id, text: $0.text, speaker: $0.speaker, source: $0.source.rawValue)
         }
-        // EXTENSION POINT: per-recording context that arrives with later
-        // fields on `Recording` (the calendar event a meeting belonged to,
-        // for one) is added here as a new optional key, with `schemaVersion`
-        // unchanged. Nothing is reserved for it now: a placeholder key would
-        // be a promise about a shape that does not exist yet.
+        calendarEvent = recording.calendarEvent
     }
 
     /// The bytes written to `<id>.json`. Sorted keys and ISO-8601 dates so

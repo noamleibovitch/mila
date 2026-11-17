@@ -86,6 +86,11 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// Late-bound by `MilaApp` to `PostRecordingCoordinator.postStatus`, the
     /// banner the Send action already reports through.
     var postStatus: ((_ message: String, _ isError: Bool) -> Void)?
+    /// Awaited before a run reads the row. Late-bound by `MilaApp` to
+    /// `PostRecordingCoordinator.calendarMatchSettled`: the calendar event
+    /// is stored a moment after the transcript settles, and with no summary
+    /// to wait for the command could otherwise be handed a row without it.
+    var awaitRowSettled: ((_ recordingID: UUID) async -> Void)?
 
     private let store: RecordingStore
     private let settings: PostRecordingCommandSettings
@@ -253,6 +258,8 @@ final class PostRecordingCommandRunner: ObservableObject {
     }
 
     private func perform(_ id: UUID, trigger: Trigger) async {
+        await awaitRowSettled?(id)
+        if Task.isCancelled { return }
         // Deleted stays deleted, and the LIVE row is the one described: the
         // caller's copy can predate the summary, a rename, or a trash.
         guard !discarded.contains(id),

@@ -137,6 +137,7 @@ Before each run Mila writes
 | `folder` | string | The Mila folder. Omitted when the recording is unfiled. |
 | `appName` | string | The captured app, for app-audio and meeting recordings. Omitted otherwise. |
 | `speakers` | object | Raw speaker id to the label used in the `.srt` and `.txt`: the name you assigned, or the raw id for an unnamed speaker. Empty when speakers were not identified. |
+| `calendarEvent` | object | Only when the calendar match is on and the recording overlapped an event: `title`, `start`, `end`, `calendarName`, and `attendees` as a list of `name` and optional `email`. Missing otherwise. |
 | `files` | object | Absolute paths under `audio`, `srt`, `txt` and `summary`. A key is present only if the file exists. |
 | `summary` | string | The AI summary. Omitted when there is none. |
 | `actionItems` | array | Each item has `id`, `text`, `source` (`inferred` or `voice_command`) and, when known, `speaker`. Empty when there are none. |

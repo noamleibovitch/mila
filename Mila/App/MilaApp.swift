@@ -659,6 +659,9 @@ struct MilaApp: App {
         // Obsidian export (`markPending` below and in `finalizeTail`).
         let postCommandSettings = PostRecordingCommandSettings()
         let postCommand = PostRecordingCommandRunner(store: store, settings: postCommandSettings)
+        postCommand.awaitRowSettled = { [weak coordinator] id in
+            await coordinator?.calendarMatchSettled(for: id)
+        }
         postCommand.postStatus = { [weak coordinator] message, isError in
             coordinator?.postStatus(message, isError: isError)
         }
