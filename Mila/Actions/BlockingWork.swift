@@ -67,6 +67,7 @@ import Foundation
 /// | `RenameRecordingSheet` "Suggest" | one modal sheet, guarded by `isFetchingName` | 1 |
 /// | `LLMSettings.diagnose` (Settings → Test) | one Settings panel, user-driven | 1 |
 /// | `ProcessGitCommandRunner` via `ObsidianGitSyncer` | an `actor`, and `sync` issues its commands sequentially | 1 |
+/// | `PostRecordingCommandRunner` | each run awaits the one queued before it | 1 |
 ///
 /// Even with every one of those in flight at once — a batch summary sweep
 /// during a live meeting while an Obsidian sync runs — that is ~7 children and

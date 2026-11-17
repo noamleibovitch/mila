@@ -98,6 +98,13 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - `Recording.calendarEvent` is mirrored in MilaKit (`StoredRecording.CalendarEvent`, `calendar_event` over MCP) and deliberately NOT carried in a `.milashare`: the attendee list is other people's names and addresses from the sender's calendar. Log counts only, never an event title or attendee, and the diagnostic report carries none of it (`DiagnosticReporterTests`).
 - `project.yml` carries both `NSCalendarsFullAccessUsageDescription` and the `com.apple.security.personal-information.calendars` entitlement. Hardened runtime denies calendar access without the entitlement.
 
+### Post-recording command
+
+- `PostRecordingCommandRunner` runs the user's own command (`PostRecordingCommandSettings`, keys `postCommand.*`, off by default) once per fresh recording. **Its sequencing is `ObsidianExporter`'s**: `markPending` in `onTranscriptionCompleted` and `finalizeTail`, the run from `RecordingSummarizer.onSummaryFinished` (which also fires on every skip path), and a `discarded` tombstone so `finalizeTail` cannot re-arm a deleted recording. The one deliberate difference: a re-transcription is NOT marked, because the command's side effects are not Mila's to repeat. The context-menu item is the rerun path. See `docs/post-recording-command.md`.
+- **Nothing from a recording goes on the command line.** The command is tokenized with `LLMRunner.tokenizeArguments` and launched directly, never through a shell; recording content reaches it only through `handoff/<id>.json` (`PostRecordingHandoff`) and the `MILA_*` paths. `PostRecordingHandoff` is a separate DTO, not `Recording`'s Codable, because user scripts read it: `PostRecordingHandoffTests` pins the key set, additive keys keep `schemaVersion`, and a removed or re-typed key bumps it.
+- The runner cancels on `RecordingStore.permanentlyDeleted` (kill, tombstone, delete the handoff) and when a queued or running recording is trashed (kill only). Runs are serial: that is the caller-side bound `.claude/rules/python-subprocess.md` asks of anything that can spawn children in a batch. It reuses `LLMRunner.executeProcess` rather than a second subprocess implementation.
+- Logs carry the recording UUID, exit code, duration and byte counts. Never the title, a path, or the command's output; `DiagnosticReporter` reports `postCommand.command` as a length.
+
 ### Tests
 
 - `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.

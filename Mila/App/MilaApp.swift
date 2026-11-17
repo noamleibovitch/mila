@@ -365,6 +365,11 @@ struct MilaApp: App {
     /// installed; a second instance would mean two views of one install.
     @StateObject private var claudeSetupSettings: ClaudeSetupSettings
     @StateObject private var obsidianExporter: ObsidianExporter
+    /// The opt-in "run a command after each recording" hook and its runner.
+    /// Like the exporter, the runner is a StateObject so it stays alive — the
+    /// completion hooks capture it weakly.
+    @StateObject private var postRecordingCommandSettings: PostRecordingCommandSettings
+    @StateObject private var postRecordingCommandRunner: PostRecordingCommandRunner
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
     /// Persistent, app-wide list of speaker names — the pick-list behind
@@ -648,15 +653,28 @@ struct MilaApp: App {
             NSWorkspace.shared.open(url)
         })
         let obsidian = ObsidianExporter(settings: obsidianSettings)
+        // The user's own post-recording command: one executable, run once per
+        // fresh recording when its summary state is final, with a JSON handoff
+        // describing the recording. Off by default. Sequenced exactly like the
+        // Obsidian export (`markPending` below and in `finalizeTail`).
+        let postCommandSettings = PostRecordingCommandSettings()
+        let postCommand = PostRecordingCommandRunner(store: store, settings: postCommandSettings)
+        postCommand.postStatus = { [weak coordinator] message, isError in
+            coordinator?.postStatus(message, isError: isError)
+        }
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
-        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester] rec in
+        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester, weak postCommand] rec in
             // First, and independent of Obsidian: a no-op unless a fresh
             // completion marked this recording (never for backfill).
             nameSuggester?.suggestIfPending(rec)
-            guard let obsidian, obsidian.isPending(rec.id) else { return }
-            obsidian.export(rec)
-            obsidian.clearPending(rec.id)
+            if let obsidian, obsidian.isPending(rec.id) {
+                obsidian.export(rec)
+                obsidian.clearPending(rec.id)
+            }
+            // After the export, so a command that works on the vault finds
+            // the note there. Same gate: a no-op unless marked pending.
+            postCommand?.runIfPending(rec)
         }
         // Wire the post-transcription summary hook. Fires for every
         // recording that the queue successfully completes — the
@@ -688,7 +706,7 @@ struct MilaApp: App {
         store.isTranscriptEditBlocked = { [weak svc] id in
             svc?.isAwaitingSpeakerFinalization(id) ?? false
         }
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester, weak postCommandSettings, weak postCommand] rec, wasRetranscription in
             // Speaker-name suggestions for this pass's (re-keyed) speakers,
             // once the summary attempt below settles. With no summarizer
             // there is no settle signal to wait for, so run them now rather
@@ -728,6 +746,13 @@ struct MilaApp: App {
                 summarizer?.regenerate(rec)
             } else {
                 if obsidianOn { obsidian?.markPending(rec.id) }
+                // The post-recording command runs off the same hook. Marked
+                // on this branch only: unlike the note, which a re-export
+                // overwrites in place, the command's side effects are not
+                // Mila's to repeat, so a re-transcription does not re-run it.
+                // Captured recordings only: this hook also completes imported
+                // files, Voice Memos and recovered orphans.
+                if postCommandSettings?.isReady == true { postCommand?.markPendingIfCaptured(rec.id) }
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
@@ -970,6 +995,10 @@ struct MilaApp: App {
         // Discard un-exports: the note can already be in the vault by the time
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
+        actions.postCommandSettings = postCommandSettings
+        actions.postCommandRunner = postCommand
+        // Discard stops the command too, even when the row is already gone.
+        coordinator.postCommandRunner = postCommand
         actions.liveSidecarWriter = sidecarWriter
         var meetingDefaults = UserDefaults.standard
         var meetingManagedSettings = managedSettings
@@ -1057,6 +1086,8 @@ struct MilaApp: App {
         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
+        _postRecordingCommandSettings = StateObject(wrappedValue: postCommandSettings)
+        _postRecordingCommandRunner = StateObject(wrappedValue: postCommand)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
@@ -1119,6 +1150,8 @@ struct MilaApp: App {
                 .of("mcpAccessSettings", mcpAccess),
                 .of("claudeSetupSettings", claudeSetup),
                 .of("obsidianExporter", obsidian),
+                .of("postRecordingCommandSettings", postCommandSettings),
+                .of("postRecordingCommandRunner", postCommand),
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
                 .of("speakerIdentitySettings", speakerIdentity),
@@ -1237,6 +1270,8 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(postRecordingCommandSettings)
+                .environmentObject(postRecordingCommandRunner)
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -1321,6 +1356,8 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(postRecordingCommandSettings)
+                .environmentObject(postRecordingCommandRunner)
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
         // `SettingsView`; since #177 it is a resizable sidebar window whose
