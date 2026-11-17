@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let summarizerLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                    category: "RecordingSummarizer")
@@ -61,6 +62,11 @@ final class RecordingSummarizer: ObservableObject {
 
     private let runLLM: RunLLM
 
+    /// The user's own name ("Your name", Settings → Speakers), for the
+    /// summary prompt's `{{MY_NAME}}`. A closure so the summarizer does not
+    /// hold a settings object it has no other use for.
+    private let myName: @MainActor () -> String?
+
     /// Background work tracked per-recording so a second `summarizeIfNeeded`
     /// call for the same id (e.g. a re-transcribe trigger) doesn't spawn
     /// two overlapping CLI invocations.
@@ -78,7 +84,8 @@ final class RecordingSummarizer: ObservableObject {
     /// transcript, a summary-language pick, a `.milashare` re-import — any of
     /// them can change the row while the call is out, and requests that
     /// arrive meanwhile hit the dedup guard. So the completion compares the
-    /// LIVE row's `fullText` and summary-language override against the
+    /// LIVE row's prompt transcript (`promptTranscript(for:)`) and
+    /// summary-language override against the
     /// snapshot (`completion(of:token:produced:)`): if either moved, the
     /// output is discarded and one follow-up runs from the live row. That
     /// replaces #313's language-only `replayIfSummaryLanguageChanged` rather
@@ -90,6 +97,8 @@ final class RecordingSummarizer: ObservableObject {
         let token: UUID
         let task: Task<Void, Never>
         let inputs: SummaryInputs
+        let metadataTemplate: String
+        let metadataFacts: String
         /// The global output language the run resolved against. The
         /// completion re-resolves the LIVE row's prompt language against
         /// this same global value: what matters is the language the prompt
@@ -127,6 +136,7 @@ final class RecordingSummarizer: ObservableObject {
         let prompt: String
         let transcript: String
         let openAIBaseURL: String
+        let contextFilePath: String
     }
 
     /// How a completed call is handled — see `completion(of:token:produced:)`.
@@ -207,6 +217,7 @@ final class RecordingSummarizer: ObservableObject {
     init(store: RecordingStore,
          llmSettings: LLMSettings,
          liveAISettings: LiveAISettings,
+         myName: @escaping @MainActor () -> String? = { nil },
          runLLM: @escaping RunLLM = { tool, prompt, transcript, executableOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport in
              try await LLMRunner.run(
                  tool: tool,
@@ -228,6 +239,7 @@ final class RecordingSummarizer: ObservableObject {
         self.store = store
         self.llmSettings = llmSettings
         self.liveAISettings = liveAISettings
+        self.myName = myName
         self.runLLM = runLLM
 
         // Backfill on off→on transitions of LLM configured-ness. The
@@ -546,7 +558,7 @@ final class RecordingSummarizer: ObservableObject {
         // the running call (same inputs) or gets a follow-up (new inputs).
         if var run = inFlight[id] {
             if force {
-                if run.inputs == summaryInputs(for: recording) {
+                if run.inputs.contextFilePath.isEmpty, run.inputs == summaryInputs(for: recording) {
                     run.regenerateFolded = true
                     summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — regenerate folded into it")
                 } else {
@@ -562,6 +574,9 @@ final class RecordingSummarizer: ObservableObject {
         }
         let globalLanguage = liveAISettings.outputLanguage
         let inputs = summaryInputs(for: recording)
+        let metadataTemplate = liveAISettings.summaryPrompt
+        let metadataFacts = SummaryPromptContext.resolveVariables(
+            in: metadataTemplate, recording: recording, myName: myName())
         let hasLanguageOverride = recording.summaryLanguage != nil
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
@@ -633,9 +648,18 @@ final class RecordingSummarizer: ObservableObject {
                 // Routed through the injected `runLLM` seam (defaults to
                 // `LLMRunner.run`) so tests can return canned output without
                 // spawning a real CLI subprocess.
+                // A file on a disconnected/slow volume must not freeze the
+                // recording controls. Never read it in summaryInputs, which
+                // is also used synchronously by the dedup guard.
+                let path = inputs.contextFilePath
+                let context = await Task.detached(priority: .utility) {
+                    SummaryPromptContext.loadContextFile(at: path)
+                }.value
+                try Task.checkCancellation()
+                let prompt = SummaryPromptContext.prompt(inputs.prompt, withContext: context.text)
                 let raw = try await runLLM(
                     inputs.tool,
-                    inputs.prompt,
+                    prompt,
                     inputs.transcript,
                     inputs.executableOverride,
                     inputs.model.isEmpty ? nil : inputs.model,
@@ -756,6 +780,8 @@ final class RecordingSummarizer: ObservableObject {
         inFlight[id] = InFlightRun(token: token,
                                    task: task,
                                    inputs: inputs,
+                                   metadataTemplate: metadataTemplate,
+                                   metadataFacts: metadataFacts,
                                    globalLanguage: globalLanguage,
                                    force: force)
     }
@@ -782,8 +808,16 @@ final class RecordingSummarizer: ObservableObject {
         // pick while the call is out is caught by the completion.
         let promptLanguageName = Self.promptLanguageName(for: recording,
                                                          global: liveAISettings.outputLanguage)
-        let basePrompt = liveAISettings.summaryPrompt
-            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // The user's prompt with this recording's facts filled in, behind
+        // the optional context file. Both are resolved per run: the file is
+        // re-read each time, so an edit to it reaches the next summary, and
+        // either one changing makes a `regenerate` a different call.
+        let facts = SummaryPromptContext.resolveVariables(
+            in: liveAISettings.summaryPrompt
+                .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
+            recording: recording,
+            myName: myName())
+        let basePrompt = facts
         // Wrap the user's plain-text summary prompt so the one-shot call
         // also returns action items. Restores the summary + action-items
         // pair the pre-#87 inline final Live-AI tick used to produce. See
@@ -797,8 +831,34 @@ final class RecordingSummarizer: ObservableObject {
                              extraArgs: llmSettings.extraArgsTokens,
                              promptLanguageName: promptLanguageName,
                              prompt: prompt,
-                             transcript: recording.fullText,
-                             openAIBaseURL: llmSettings.openAIBaseURL)
+                             transcript: Self.promptTranscript(for: recording),
+                             openAIBaseURL: llmSettings.openAIBaseURL,
+                             contextFilePath: llmSettings.summaryContextFile)
+    }
+
+    /// The transcript a summary call is built from: one line per speaker
+    /// turn, prefixed with the speaker's display name when the recording was
+    /// diarized. Same rendering the Send action and the MCP server use
+    /// (`TranscriptFormatter.plainText`), so the summary can attribute a
+    /// decision or a task to the person who said it. `fullText` alone is the
+    /// plain join with no labels, which left the model writing "the main
+    /// speaker" for a recording whose speakers were all named.
+    ///
+    /// Falls back to `fullText` for a recording with no speaker labels, and
+    /// when the labelled rendering comes out empty (segments that carry a
+    /// speaker but no text), so the "is there anything to summarize" gates,
+    /// which read `fullText`, never disagree with what is sent.
+    ///
+    /// The staleness check in `completion(of:token:produced:)` compares this
+    /// same rendering, so renaming a speaker while a call is out counts as
+    /// the row having moved on: the follow-up carries the new name.
+    static func promptTranscript(for recording: Recording) -> String {
+        let labelled = TranscriptFormatter.plainText(segments: recording.segments,
+                                                     fallback: recording.fullText,
+                                                     names: recording.speakerNames)
+        return labelled.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? recording.fullText
+            : labelled
     }
 
     /// Decide what a completed call (`token`) does with its output. Called
@@ -827,8 +887,11 @@ final class RecordingSummarizer: ObservableObject {
         guard let live = liveRecording(id) else { return .proceed(run) }
         let reason: String
         let liveLanguage = Self.promptLanguageName(for: live, global: run.globalLanguage)
-        if live.fullText != run.inputs.transcript || liveLanguage != run.inputs.promptLanguageName {
-            reason = "transcript or summary language changed mid-flight"
+        if Self.promptTranscript(for: live) != run.inputs.transcript
+            || liveLanguage != run.inputs.promptLanguageName
+            || SummaryPromptContext.resolveVariables(in: run.metadataTemplate,
+                                                       recording: live, myName: myName()) != run.metadataFacts {
+            reason = "transcript, metadata or summary language changed mid-flight"
         } else if run.regenerateWithNewInputs {
             reason = "regenerate with new inputs requested mid-flight"
         } else if run.regenerateFolded, !produced {

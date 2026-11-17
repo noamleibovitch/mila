@@ -318,6 +318,19 @@ final class LLMSettings: ObservableObject {
         didSet { defaults.set(summaryEnabled, forKey: Keys.summaryEnabled) }
     }
 
+    /// Optional path to a text or Markdown file sent ahead of the summary
+    /// prompt on every automatic summary: who the people are, product and
+    /// project names, house style. Empty means off. The file is read at send
+    /// time, so editing it needs no trip to Settings. See
+    /// `SummaryPromptContext.loadContextFile` for what happens when the file
+    /// is missing or too large (the summary still runs, without it).
+    @Published var summaryContextFile: String {
+        didSet {
+            guard summaryContextFile != oldValue else { return }
+            defaults.set(summaryContextFile, forKey: Keys.summaryContextFile)
+        }
+    }
+
     /// Whether Mila asks the LLM, after a recording finishes, which unnamed
     /// speakers state their own name in the transcript ("Hi, I'm Dana") and
     /// offers those as one-click suggestions (`SpeakerNameSuggester`,
@@ -623,6 +636,7 @@ final class LLMSettings: ObservableObject {
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
         self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
+        self.summaryContextFile = defaults.string(forKey: Keys.summaryContextFile) ?? ""
         // Absent → nil → the switch follows auto-summary, live (see
         // `speakerNameSuggestionsEnabled`).
         self.speakerNameSuggestionsChoice =
@@ -690,6 +704,7 @@ final class LLMSettings: ObservableObject {
         static let actionPrompt = "llm.action.prompt"
         static let actionTranscriptByPath = "llm.action.transcriptByPath"
         static let summaryEnabled = "llm.summary.enabled"
+        static let summaryContextFile = "llm.summary.contextFile"
         static let speakerNameSuggestionsEnabled = "llm.speakerNames.enabled"
         static let cliTimeout = "llm.cli.timeout"
         static let extraArgs = "llm.extraArgs"

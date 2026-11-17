@@ -60,6 +60,9 @@ final class RecordingSession: ObservableObject {
     private(set) var fileURL: URL?
     private var audioFile: AVAudioFile?
     private var startTime: Date?
+    /// Wall-clock instant the current recording began, pauses included. nil
+    /// when nothing is being recorded; read it before `stop()`.
+    var startedAt: Date? { startTime }
     /// Wall-clock instant the current pause began. `nil` unless
     /// `state == .paused`. Used to accumulate `totalPaused` on resume so
     /// `elapsed` never counts paused time.

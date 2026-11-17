@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 @testable import Mila
 
 /// Coverage for `RecordingSummarizer.backfillIfNeeded()` — the scan that
@@ -266,6 +267,36 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     /// Rebuild `summarizer` with a deterministic `runLLM` stub. Call after
     /// configuring `llm` / `liveAI` (and before `maxConcurrent` tweaks,
     /// which are applied on the rebuilt instance).
+    /// The launch-time sweep builds its calls the same way a fresh
+    /// completion does, so a diarized recording it fills in is summarized
+    /// from the speaker-named transcript too.
+    func test_backfill_sends_speaker_names_for_a_diarized_recording() async throws {
+        var sent: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            sent.append(transcript)
+            return "FILLED"
+        }
+        llm.tool = .claude
+
+        let audioURL = store.freshAudioURL(suggestedName: "Diarized")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Diarized", source: .meeting, audioFileName: audioURL.lastPathComponent,
+            status: .completed,
+            segments: [
+                TranscriptSegment(start: 0, end: 2, text: "I will send it", speaker: "SPEAKER_00"),
+                TranscriptSegment(start: 2, end: 4, text: "thanks", speaker: "SPEAKER_01")
+            ],
+            fullText: "I will send it thanks",
+            speakerNames: ["SPEAKER_00": "Dana"])
+        store.add(rec)
+
+        summarizer.backfillIfNeeded()
+        try await waitForSummary(recordingID: rec.id)
+
+        XCTAssertEqual(sent, ["Dana: I will send it\nSPEAKER_01: thanks"])
+    }
+
     private func useStubRunner(_ run: @escaping RecordingSummarizer.RunLLM) {
         summarizer = RecordingSummarizer(store: store,
                                          llmSettings: llm,

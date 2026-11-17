@@ -241,7 +241,12 @@ final class ShareManifestTests: XCTestCase {
                                       evidence: "hi there, John here", origin: .transcript),
             ],
             // Local repair bookkeeping; set so the key-set test sees the key.
-            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)])
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)],
+            // The sender's calendar match; set so the key-set test sees the key.
+            calendarEvent: CalendarEventMatch(
+                title: "Weekly sync", start: created.addingTimeInterval(-120), end: created,
+                calendarName: "Work",
+                attendees: [.init(name: "Daniel", email: "daniel@example.com")]))
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -345,6 +350,12 @@ final class ShareManifestTests: XCTestCase {
             // The receiver imports the transcript as sent; a full
             // re-transcription on their side covers the whole audio anyway.
             "untranscribedSpans",
+            // The event from the SENDER's calendar the recording overlapped.
+            // Its attendee list is other people's names and email addresses,
+            // which the sender's calendar holds and the transcript does not;
+            // sharing a recording is not consent to pass those on. The title
+            // it gave the recording travels as `title`.
+            "calendarEvent",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601
