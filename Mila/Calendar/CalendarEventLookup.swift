@@ -14,6 +14,18 @@ final class CalendarEventLookup {
     /// Whether a lookup can return anything right now.
     var isReady: Bool { settings.isReady }
 
+    /// The event a recording starting at `now` is most likely for, or nil —
+    /// the feature is off or not ready, or nothing is on or about to start
+    /// (`CalendarEventMatcher.currentEvent`). A guess for display only.
+    func currentEvent(at now: Date = Date()) -> CalendarEventMatch? {
+        guard settings.isReady else { return nil }
+        let allowed = settings.allowedCalendarIDs
+        let window = DateInterval(start: now, duration: CalendarEventMatcher.startLead)
+        let events = settings.provider.events(in: window, calendarIDs: allowed)
+        return CalendarEventMatcher.currentEvent(at: now, candidates: events,
+                                                 allowedCalendarIDs: allowed)
+    }
+
     /// The event `recording` overlapped, or nil — the feature is off or not
     /// ready, or no event qualifies (`CalendarEventMatcher.bestMatch`).
     func match(for recording: Recording) -> CalendarEventMatch? {

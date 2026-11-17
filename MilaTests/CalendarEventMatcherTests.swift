@@ -34,6 +34,43 @@ final class CalendarEventMatcherTests: XCTestCase {
                                        allowedCalendarIDs: allowed ?? [work])
     }
 
+    // MARK: - At recording start
+
+    private func current(_ minute: Double, _ events: [CalendarEventCandidate]) -> String? {
+        CalendarEventMatcher.currentEvent(at: at(minute), candidates: events,
+                                          allowedCalendarIDs: [work])?.title
+    }
+
+    func test_start_inside_an_event_takes_it() {
+        XCTAssertEqual(current(10, [event("Sync", 0, 30)]), "Sync")
+    }
+
+    func test_start_a_few_minutes_early_takes_the_event_about_to_begin() {
+        XCTAssertEqual(current(-4, [event("Sync", 0, 30)]), "Sync")
+        XCTAssertNil(current(-11, [event("Sync", 0, 30)]))
+    }
+
+    func test_start_after_an_event_ended_is_nil() {
+        XCTAssertNil(current(30, [event("Sync", 0, 30)]))
+    }
+
+    func test_start_in_the_last_minutes_of_one_event_takes_the_next() {
+        let events = [event("First", 0, 30), event("Second", 30, 60)]
+        XCTAssertEqual(current(27, events), "Second")
+        XCTAssertEqual(current(20, events), "First")
+    }
+
+    func test_start_inside_two_events_takes_the_one_that_began_last() {
+        XCTAssertEqual(current(40, [event("Block", 0, 120), event("1:1", 30, 60)]), "1:1")
+    }
+
+    func test_start_ignores_events_the_overlap_match_ignores() {
+        XCTAssertNil(current(10, [event("Off list", 0, 30, calendar: "cal-home"),
+                                  event("All day", 0, 30, allDay: true),
+                                  event("Declined", 0, 30, declined: true),
+                                  event("Canceled", 0, 30, canceled: true)]))
+    }
+
     // MARK: - Recording window
 
     /// `createdAt` is the STOP time, so the window runs backwards from it.

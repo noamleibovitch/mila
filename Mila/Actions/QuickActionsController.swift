@@ -105,6 +105,12 @@ final class QuickActionsController: ObservableObject {
     /// silently carries into the next one.
     @Published var nextRecordingTitle: String = ""
 
+    /// Title of the calendar event the recording in progress most likely
+    /// belongs to, looked up when it started. The meeting-name field shows
+    /// it as its placeholder. Display only: the title is decided by the
+    /// calendar match on the finished recording, and a typed name beats both.
+    @Published private(set) var recordingCalendarTitle: String?
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -803,6 +809,7 @@ final class QuickActionsController: ObservableObject {
             // the moment the drain releases it (issue #356).
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recording(withSystemAudio: withSystemAudio)
+            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
@@ -1018,6 +1025,7 @@ final class QuickActionsController: ObservableObject {
             // call in startRecording() for the full rationale.
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recordingApp(processID: app?.processID, includeMic: includeMic)
+            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
@@ -1168,6 +1176,7 @@ final class QuickActionsController: ObservableObject {
             // must not leave title/folder selected for the next recording.
             nextRecordingTitle = ""
             nextRecordingFolder = nil
+            recordingCalendarTitle = nil
             guard ownsLivePipeline else {
                 // Nothing of the live pipeline is ours to tear down.
                 activeJob = .none
@@ -1248,6 +1257,7 @@ final class QuickActionsController: ObservableObject {
         let chosenFolder = nextRecordingFolder
         nextRecordingTitle = ""
         nextRecordingFolder = nil
+        recordingCalendarTitle = nil
 
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why

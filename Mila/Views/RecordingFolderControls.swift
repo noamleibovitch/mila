@@ -58,7 +58,9 @@ struct NextRecordingMeetingNameField: View {
     let accessibilityID: String
 
     var body: some View {
-        TextField(placeholder, text: $actions.nextRecordingTitle)
+        // While recording, the calendar event the recording will most likely
+        // be named after stands in for the placeholder.
+        TextField(actions.recordingCalendarTitle ?? placeholder, text: $actions.nextRecordingTitle)
             .accessibilityIdentifier(accessibilityID)
     }
 }

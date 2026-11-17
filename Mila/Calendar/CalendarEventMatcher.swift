@@ -93,6 +93,57 @@ enum CalendarEventMatcher {
                                   attendees: humanAttendees(event.attendees))
     }
 
+    // MARK: - At recording start
+
+    /// How far ahead of an event's start a recording may begin and still be
+    /// taken for it: joining a call a few minutes early.
+    static let startLead: TimeInterval = 10 * 60
+    /// An event with less than this left to run loses to one about to start:
+    /// pressing Record in the last minutes of a meeting is the next meeting.
+    static let endingSoon: TimeInterval = 5 * 60
+
+    /// The event a recording that starts at `now` is most likely for, or nil.
+    ///
+    /// A guess, unlike `bestMatch`: nothing has been recorded yet, so there
+    /// is no overlap to measure. It is shown while recording and never
+    /// stored; `bestMatch` on the finished recording decides the title.
+    ///
+    /// Same events considered as `bestMatch`. One in progress wins, the most
+    /// recently started first, unless it is `endingSoon` and another starts
+    /// within `startLead`. With none in progress, the next to start within
+    /// `startLead`.
+    static func currentEvent(at now: Date,
+                             candidates: [CalendarEventCandidate],
+                             allowedCalendarIDs: Set<String>) -> CalendarEventMatch? {
+        let usable = candidates.filter {
+            allowedCalendarIDs.contains($0.calendarID)
+                && !$0.isAllDay && !$0.isDeclined && !$0.isCanceled && $0.end > $0.start
+        }
+        // Ties go to the earlier title, then end and calendar id, so the
+        // answer never depends on the order the calendar returned them in.
+        func tieBreak(_ a: CalendarEventCandidate, _ b: CalendarEventCandidate) -> Bool {
+            if a.title != b.title { return a.title < b.title }
+            if a.end != b.end { return a.end < b.end }
+            return a.calendarID < b.calendarID
+        }
+        let inProgress = usable.filter { $0.start <= now && now < $0.end }
+            .min { a, b in a.start != b.start ? a.start > b.start : tieBreak(a, b) }
+        let upcoming = usable.filter { $0.start > now && $0.start.timeIntervalSince(now) <= startLead }
+            .min { a, b in a.start != b.start ? a.start < b.start : tieBreak(a, b) }
+        let chosen: CalendarEventCandidate?
+        if let inProgress, let upcoming, inProgress.end.timeIntervalSince(now) < endingSoon {
+            chosen = upcoming
+        } else {
+            chosen = inProgress ?? upcoming
+        }
+        guard let event = chosen else { return nil }
+        return CalendarEventMatch(title: event.title,
+                                  start: event.start,
+                                  end: event.end,
+                                  calendarName: event.calendarName,
+                                  attendees: humanAttendees(event.attendees))
+    }
+
     private static func isBetter(_ event: CalendarEventCandidate,
                                  _ overlap: TimeInterval,
                                  than current: (event: CalendarEventCandidate, overlap: TimeInterval),

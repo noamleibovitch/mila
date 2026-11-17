@@ -249,6 +249,14 @@ final class PostRecordingCoordinator: ObservableObject {
 
     // MARK: - Calendar match
 
+    /// The event a recording that starts now is most likely for, for the
+    /// recording screen to show. nil when the calendar match is off, not
+    /// ready, or nothing is on. Never stored: `recordingFinished` matches
+    /// the finished recording and that match is the one that titles it.
+    func calendarEventAtRecordingStart() -> CalendarEventMatch? {
+        calendar?.currentEvent()
+    }
+
     /// Look up the calendar event `recording` overlapped, once, and store it
     /// on the row. When `mayTitle` is set and the recording still carries
     /// its machine-default title, the event's title replaces it.
