@@ -133,6 +133,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         try await settle()
 
@@ -153,6 +154,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         XCTAssertEqual(stored(rec)?.title, "Weekly sync")
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         XCTAssertEqual(llmCalls, 0)
@@ -165,6 +167,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent, "no match is nil, never a guess")
         XCTAssertEqual(llmCalls, 1)
@@ -178,6 +181,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertTrue(provider.eventQueries.isEmpty)
@@ -190,6 +194,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.llmCalls == 1)
         XCTAssertNil(stored(rec)?.calendarEvent)
         XCTAssertTrue(provider.eventQueries.isEmpty)
@@ -201,6 +206,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNil(stored(rec)?.calendarEvent)
     }
@@ -211,6 +217,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.title == "An LLM Title")
         XCTAssertNotNil(stored(rec)?.calendarEvent, "the event is still the recording's event")
         XCTAssertEqual(llmCalls, 1)
@@ -226,6 +233,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         store.update(rec)
 
         coordinator.recordingFinished(rec, titleWasUserProvided: true)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         try await settle()
 
@@ -238,24 +246,36 @@ final class CalendarMatchWiringTests: XCTestCase {
     /// the match lands afterwards and must leave the name alone.
     func test_rename_before_the_match_lands_wins() async throws {
         scheduleEvent()
+        let gate = TestGate()
+        provider.beforeEvents = { await gate.wait() }
         let coordinator = makeCoordinator()
         let rec = addRecording(status: .running, text: "")
-
         coordinator.recordingFinished(rec)
-        try await settle()
         var current = try XCTUnwrap(stored(rec))
-        XCTAssertNil(current.calendarEvent, "the event field waits for the row to settle")
-        XCTAssertEqual(current.title, "Weekly sync", "the title does not wait")
-        XCTAssertEqual(provider.eventQueries.count, 1)
-
         current.title = "My own name"
         current.fullText = "the transcript text"
         current.status = .completed
         store.update(current)
-
-        try await waitFor(self.stored(rec)?.calendarEvent != nil)
-        try await settle()
+        gate.open()
+        await coordinator.calendarMatchSettled(for: rec.id)
         XCTAssertEqual(stored(rec)?.title, "My own name")
+        XCTAssertNotNil(stored(rec)?.calendarEvent)
+    }
+
+    func test_late_transcription_snapshot_preserves_a_persisted_event() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let rec = addRecording(status: .pending, text: "")
+        coordinator.recordingFinished(rec, showsRenameSheet: false)
+        await coordinator.calendarMatchSettled(for: rec.id)
+        let match = try XCTUnwrap(stored(rec)?.calendarEvent)
+        var stale = rec
+        stale.status = .completed
+        stale.fullText = "a deferred transcript"
+        store.update(stale)
+        XCTAssertEqual(stored(rec)?.calendarEvent, match)
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first { $0.id == rec.id }?.calendarEvent, match)
     }
 
     /// The event names the recording at stop, before transcription ends, so
@@ -266,6 +286,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording(status: .running, text: "")
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
 
         XCTAssertEqual(stored(rec)?.title, "Weekly sync")
         XCTAssertEqual(coordinator.pending?.title, "Weekly sync")
@@ -293,21 +314,23 @@ final class CalendarMatchWiringTests: XCTestCase {
         store.add(rec)
 
         coordinator.recordingFinished(rec, startedAt: start)
+        await coordinator.calendarMatchSettled(for: rec.id)
 
         XCTAssertEqual(stored(rec)?.title, "First")
     }
 
     // MARK: - Timing
 
-    func test_match_waits_for_the_offline_speaker_pass() async throws {
+    func test_match_is_persisted_before_the_offline_speaker_pass_finishes() async throws {
         scheduleEvent()
         let coordinator = makeCoordinator()
         let rec = addRecording()
         service.beginSpeakerFinalization(rec.id)
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await settle()
-        XCTAssertNil(stored(rec)?.calendarEvent)
+        XCTAssertNotNil(stored(rec)?.calendarEvent)
         XCTAssertEqual(stored(rec)?.title, "Weekly sync", "the title does not wait")
 
         service.endSpeakerFinalization(rec.id)
@@ -315,18 +338,18 @@ final class CalendarMatchWiringTests: XCTestCase {
         XCTAssertEqual(llmCalls, 0)
     }
 
-    /// The wait gave up with transcription still running. Adding the event
-    /// field then is what the wait exists to prevent, so only the title,
-    /// written at stop, is there.
-    func test_wait_timing_out_on_a_row_still_in_flight_stores_no_event() async throws {
+    /// Transcription may be deferred indefinitely; the event must survive
+    /// independently of whether that work finishes within any wait budget.
+    func test_deferred_transcription_keeps_the_calendar_event() async throws {
         scheduleEvent()
         let coordinator = makeCoordinator()
         coordinator.transcriptWaitTimeout = 0.3
         let rec = addRecording(status: .running, text: "")
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await Task.sleep(nanoseconds: 1_000_000_000)
-        XCTAssertNil(stored(rec)?.calendarEvent)
+        XCTAssertNotNil(stored(rec)?.calendarEvent)
         XCTAssertEqual(stored(rec)?.title, "Weekly sync")
         XCTAssertEqual(llmCalls, 0)
     }
@@ -338,6 +361,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording(status: .failed, text: "")
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.title == "Weekly sync")
         XCTAssertEqual(llmCalls, 0)
     }
@@ -348,6 +372,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording(status: .running, text: "")
 
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await Task.sleep(nanoseconds: 100_000_000)
         coordinator.cancelAndDiscard()
         try await settle()
@@ -367,6 +392,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec, showsRenameSheet: false)
+        await coordinator.calendarMatchSettled(for: rec.id)
         XCTAssertNil(coordinator.pending, "no sheet was asked for")
         XCTAssertEqual(stored(rec)?.title, "Weekly sync")
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
@@ -382,6 +408,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         store.update(rec)
 
         coordinator.recordingFinished(rec, titleWasUserProvided: true, showsRenameSheet: false)
+        await coordinator.calendarMatchSettled(for: rec.id)
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         XCTAssertEqual(stored(rec)?.title, "Budget review with Dana")
     }
@@ -394,10 +421,12 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let first = addRecording()
         coordinator.recordingFinished(first)
+        await coordinator.calendarMatchSettled(for: first.id)
         XCTAssertEqual(coordinator.pending?.id, first.id)
 
         let second = addRecording()
         coordinator.recordingFinished(second)
+        await coordinator.calendarMatchSettled(for: second.id)
         XCTAssertEqual(coordinator.pending?.id, first.id, "the sheet stays on the first recording")
 
         try await waitFor(self.stored(second)?.calendarEvent != nil)
@@ -411,7 +440,9 @@ final class CalendarMatchWiringTests: XCTestCase {
         let coordinator = makeCoordinator()
         let rec = addRecording(status: .running, text: "")
         coordinator.recordingFinished(rec)
+        await coordinator.calendarMatchSettled(for: rec.id)
         coordinator.recordingFinished(rec, showsRenameSheet: false)
+        await coordinator.calendarMatchSettled(for: rec.id)
 
         var current = try XCTUnwrap(stored(rec))
         current.fullText = "the transcript text"

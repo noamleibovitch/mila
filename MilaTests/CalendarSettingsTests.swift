@@ -13,6 +13,7 @@ final class FakeCalendarProvider: CalendarEventProviding {
     var grantOnRequest = true
     var allCalendars: [CalendarInfo]
     var allEvents: [CalendarEventCandidate]
+    var beforeEvents: (() async -> Void)?
 
     private(set) var accessRequests = 0
     private(set) var calendarListReads = 0
@@ -39,8 +40,9 @@ final class FakeCalendarProvider: CalendarEventProviding {
         return authorization == .fullAccess ? allCalendars : []
     }
 
-    func events(in interval: DateInterval, calendarIDs: Set<String>) -> [CalendarEventCandidate] {
+    func events(in interval: DateInterval, calendarIDs: Set<String>) async -> [CalendarEventCandidate] {
         eventQueries.append((interval, calendarIDs))
+        await beforeEvents?()
         guard authorization == .fullAccess else { return [] }
         // Deliberately NOT filtered by `calendarIDs`: the matcher has to
         // enforce the allow-list itself, whatever a provider hands back.
@@ -205,12 +207,13 @@ final class CalendarSettingsTests: XCTestCase {
         let lookup = CalendarEventLookup(settings: settings)
 
         XCTAssertFalse(lookup.isReady)
-        XCTAssertNil(lookup.match(for: recording(endingAt: end, minutes: 30)))
+        let disabledMatch = await lookup.match(for: recording(endingAt: end, minutes: 30))
+        XCTAssertNil(disabledMatch)
         XCTAssertTrue(provider.eventQueries.isEmpty, "not ready: the calendar is not read at all")
 
         await settings.setEnabled(true)
         settings.setCalendar(work.id, allowed: true)
-        let found = lookup.match(for: recording(endingAt: end, minutes: 30))
+        let found = await lookup.match(for: recording(endingAt: end, minutes: 30))
         XCTAssertEqual(found?.title, "Weekly sync",
                        "the unticked calendar's event is ignored even though the provider returned it")
         XCTAssertEqual(provider.eventQueries.count, 1)
@@ -223,7 +226,8 @@ final class CalendarSettingsTests: XCTestCase {
         await settings.setEnabled(true)
         settings.setCalendar(work.id, allowed: true)
         let lookup = CalendarEventLookup(settings: settings)
-        XCTAssertNil(lookup.match(for: recording(endingAt: Date(), minutes: 0)))
+        let emptyMatch = await lookup.match(for: recording(endingAt: Date(), minutes: 0))
+        XCTAssertNil(emptyMatch)
         XCTAssertTrue(provider.eventQueries.isEmpty)
     }
 }

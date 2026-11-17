@@ -97,6 +97,8 @@ final class RecordingSummarizer: ObservableObject {
         let token: UUID
         let task: Task<Void, Never>
         let inputs: SummaryInputs
+        let metadataTemplate: String
+        let metadataFacts: String
         /// The global output language the run resolved against. The
         /// completion re-resolves the LIVE row's prompt language against
         /// this same global value: what matters is the language the prompt
@@ -134,6 +136,7 @@ final class RecordingSummarizer: ObservableObject {
         let prompt: String
         let transcript: String
         let openAIBaseURL: String
+        let contextFilePath: String
     }
 
     /// How a completed call is handled — see `completion(of:token:produced:)`.
@@ -555,7 +558,7 @@ final class RecordingSummarizer: ObservableObject {
         // the running call (same inputs) or gets a follow-up (new inputs).
         if var run = inFlight[id] {
             if force {
-                if run.inputs == summaryInputs(for: recording) {
+                if run.inputs.contextFilePath.isEmpty, run.inputs == summaryInputs(for: recording) {
                     run.regenerateFolded = true
                     summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — regenerate folded into it")
                 } else {
@@ -571,6 +574,9 @@ final class RecordingSummarizer: ObservableObject {
         }
         let globalLanguage = liveAISettings.outputLanguage
         let inputs = summaryInputs(for: recording)
+        let metadataTemplate = liveAISettings.summaryPrompt
+        let metadataFacts = SummaryPromptContext.resolveVariables(
+            in: metadataTemplate, recording: recording, myName: myName())
         let hasLanguageOverride = recording.summaryLanguage != nil
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
@@ -642,9 +648,18 @@ final class RecordingSummarizer: ObservableObject {
                 // Routed through the injected `runLLM` seam (defaults to
                 // `LLMRunner.run`) so tests can return canned output without
                 // spawning a real CLI subprocess.
+                // A file on a disconnected/slow volume must not freeze the
+                // recording controls. Never read it in summaryInputs, which
+                // is also used synchronously by the dedup guard.
+                let path = inputs.contextFilePath
+                let context = await Task.detached(priority: .utility) {
+                    SummaryPromptContext.loadContextFile(at: path)
+                }.value
+                try Task.checkCancellation()
+                let prompt = SummaryPromptContext.prompt(inputs.prompt, withContext: context.text)
                 let raw = try await runLLM(
                     inputs.tool,
-                    inputs.prompt,
+                    prompt,
                     inputs.transcript,
                     inputs.executableOverride,
                     inputs.model.isEmpty ? nil : inputs.model,
@@ -765,6 +780,8 @@ final class RecordingSummarizer: ObservableObject {
         inFlight[id] = InFlightRun(token: token,
                                    task: task,
                                    inputs: inputs,
+                                   metadataTemplate: metadataTemplate,
+                                   metadataFacts: metadataFacts,
                                    globalLanguage: globalLanguage,
                                    force: force)
     }
@@ -800,13 +817,7 @@ final class RecordingSummarizer: ObservableObject {
                 .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
             recording: recording,
             myName: myName())
-        let context = SummaryPromptContext.loadContextFile(at: llmSettings.summaryContextFile)
-        if context != .notSet, context.text == nil {
-            // The state names the failure and nothing else: the path is the
-            // user's and stays out of the log.
-            summarizerLog.log("context file not sent for \(self.shortID(recording.id), privacy: .public): \(String(describing: context), privacy: .public)")
-        }
-        let basePrompt = SummaryPromptContext.prompt(facts, withContext: context.text)
+        let basePrompt = facts
         // Wrap the user's plain-text summary prompt so the one-shot call
         // also returns action items. Restores the summary + action-items
         // pair the pre-#87 inline final Live-AI tick used to produce. See
@@ -821,7 +832,8 @@ final class RecordingSummarizer: ObservableObject {
                              promptLanguageName: promptLanguageName,
                              prompt: prompt,
                              transcript: Self.promptTranscript(for: recording),
-                             openAIBaseURL: llmSettings.openAIBaseURL)
+                             openAIBaseURL: llmSettings.openAIBaseURL,
+                             contextFilePath: llmSettings.summaryContextFile)
     }
 
     /// The transcript a summary call is built from: one line per speaker
@@ -876,8 +888,10 @@ final class RecordingSummarizer: ObservableObject {
         let reason: String
         let liveLanguage = Self.promptLanguageName(for: live, global: run.globalLanguage)
         if Self.promptTranscript(for: live) != run.inputs.transcript
-            || liveLanguage != run.inputs.promptLanguageName {
-            reason = "transcript or summary language changed mid-flight"
+            || liveLanguage != run.inputs.promptLanguageName
+            || SummaryPromptContext.resolveVariables(in: run.metadataTemplate,
+                                                       recording: live, myName: myName()) != run.metadataFacts {
+            reason = "transcript, metadata or summary language changed mid-flight"
         } else if run.regenerateWithNewInputs {
             reason = "regenerate with new inputs requested mid-flight"
         } else if run.regenerateFolded, !produced {

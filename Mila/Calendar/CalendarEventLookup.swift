@@ -17,11 +17,12 @@ final class CalendarEventLookup {
     /// The event a recording starting at `now` is most likely for, or nil —
     /// the feature is off or not ready, or nothing is on or about to start
     /// (`CalendarEventMatcher.currentEvent`). A guess for display only.
-    func currentEvent(at now: Date = Date()) -> CalendarEventMatch? {
+    func currentEvent(at now: Date = Date()) async -> CalendarEventMatch? {
         guard settings.isReady else { return nil }
         let allowed = settings.allowedCalendarIDs
         let window = DateInterval(start: now, duration: CalendarEventMatcher.startLead)
-        let events = settings.provider.events(in: window, calendarIDs: allowed)
+        let events = await settings.provider.events(in: window, calendarIDs: allowed)
+        guard !Task.isCancelled, settings.isReady, settings.allowedCalendarIDs == allowed else { return nil }
         return CalendarEventMatcher.currentEvent(at: now, candidates: events,
                                                  allowedCalendarIDs: allowed)
     }
@@ -33,7 +34,7 @@ final class CalendarEventLookup {
     /// caller knows it. A paused recording's `duration` leaves the pause
     /// out, so `createdAt - duration` puts its start too late and can hand
     /// the match to the next meeting.
-    func match(for recording: Recording, startedAt: Date? = nil) -> CalendarEventMatch? {
+    func match(for recording: Recording, startedAt: Date? = nil) async -> CalendarEventMatch? {
         guard settings.isReady else { return nil }
         let window: DateInterval
         if let startedAt, startedAt < recording.createdAt {
@@ -44,7 +45,8 @@ final class CalendarEventLookup {
         }
         guard window.duration > 0 else { return nil }
         let allowed = settings.allowedCalendarIDs
-        let events = settings.provider.events(in: window, calendarIDs: allowed)
+        let events = await settings.provider.events(in: window, calendarIDs: allowed)
+        guard !Task.isCancelled, settings.isReady, settings.allowedCalendarIDs == allowed else { return nil }
         return CalendarEventMatcher.bestMatch(window: window,
                                               candidates: events,
                                               allowedCalendarIDs: allowed)
