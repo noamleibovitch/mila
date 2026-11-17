@@ -127,6 +127,18 @@ final class QuickActionsController: ObservableObject {
     /// calendar match on the finished recording, and a typed name beats both.
     @Published private(set) var recordingCalendarTitle: String?
 
+    private func refreshRecordingCalendarTitle() {
+        recordingCalendarTitle = nil
+        let file = session.fileURL
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let event = await self.postRecording.calendarEventAtRecordingStart()
+            guard let file, self.session.fileURL == file, self.session.state != .idle else { return }
+            self.recordingCalendarTitle = event?.resolvedTitle
+        }
+    }
+
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -878,7 +890,7 @@ final class QuickActionsController: ObservableObject {
             // the moment the drain releases it (issue #356).
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recording(withSystemAudio: withSystemAudio)
-            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
+            refreshRecordingCalendarTitle()
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
@@ -1137,7 +1149,7 @@ final class QuickActionsController: ObservableObject {
             // call in startRecording() for the full rationale.
             claimLivePipeline(startingLiveAISession: true)
             activeJob = .recordingApp(processID: app?.processID, includeMic: includeMic)
-            recordingCalendarTitle = postRecording.calendarEventAtRecordingStart()?.resolvedTitle
+            refreshRecordingCalendarTitle()
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()

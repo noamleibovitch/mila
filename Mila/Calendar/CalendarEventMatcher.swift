@@ -3,14 +3,14 @@ import Foundation
 /// One calendar event as the matcher sees it: everything `CalendarEventMatcher`
 /// needs and nothing from EventKit, so the matching rules are tested with
 /// hand-built values and any other source of events can feed them.
-struct CalendarEventCandidate: Hashable {
+struct CalendarEventCandidate: Hashable, Sendable {
     /// What kind of thing an invitee is. Rooms and equipment are invited like
     /// people, and a distribution list is one invitee standing for many.
-    enum AttendeeKind: Hashable {
+    enum AttendeeKind: Hashable, Sendable {
         case person, room, resource, group, unknown
     }
 
-    struct Attendee: Hashable {
+    struct Attendee: Hashable, Sendable {
         var name: String
         var email: String?
         var kind: AttendeeKind = .person

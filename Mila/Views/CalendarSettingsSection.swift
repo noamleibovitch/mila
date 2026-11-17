@@ -19,7 +19,7 @@ struct CalendarSettingsSection: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Match recordings to calendar events")
                         .font(.body)
-                    Text("When a recording ends, Mila looks for the calendar event it overlapped and names the recording after it. Mila reads only the calendars you tick below, and what it reads stays on this Mac.")
+                    Text("When a recording ends, Mila looks for the calendar event it overlapped and names the recording after it. Mila reads only the calendars you tick below, and stores the matched event with the recording. If you enable MCP access, connected clients can also read the event and invited attendees, including their email addresses.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

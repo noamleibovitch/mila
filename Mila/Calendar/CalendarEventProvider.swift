@@ -41,7 +41,7 @@ protocol CalendarEventProviding: AnyObject {
     func calendars() -> [CalendarInfo]
     /// Events that intersect `interval` in the calendars named by
     /// `calendarIDs`, or none without access.
-    func events(in interval: DateInterval, calendarIDs: Set<String>) -> [CalendarEventCandidate]
+    func events(in interval: DateInterval, calendarIDs: Set<String>) async -> [CalendarEventCandidate]
 }
 
 /// `CalendarEventProviding` over the system calendar database (the one
@@ -52,6 +52,7 @@ final class EventKitCalendarProvider: CalendarEventProviding {
     /// Created on first use, not at launch: nothing should reach for the
     /// calendar database in an install that never turns the feature on.
     private lazy var store = EKEventStore()
+    private let eventQueue = DispatchQueue(label: "io.island.mila.calendar.events", qos: .utility)
 
     var authorization: CalendarAuthorization {
         switch EKEventStore.authorizationStatus(for: .event) {
@@ -84,21 +85,30 @@ final class EventKitCalendarProvider: CalendarEventProviding {
             }
     }
 
-    func events(in interval: DateInterval, calendarIDs: Set<String>) -> [CalendarEventCandidate] {
+    func events(in interval: DateInterval, calendarIDs: Set<String>) async -> [CalendarEventCandidate] {
         guard authorization == .fullAccess, !calendarIDs.isEmpty else { return [] }
-        let calendars = store.calendars(for: .event)
-            .filter { calendarIDs.contains($0.calendarIdentifier) }
-        // An empty list must not reach the predicate: EventKit reads
-        // `calendars: []` as "every calendar", which would search exactly the
-        // ones the user left unticked.
-        guard !calendars.isEmpty else { return [] }
-        let predicate = store.predicateForEvents(withStart: interval.start,
-                                                 end: interval.end,
-                                                 calendars: calendars)
-        return store.events(matching: predicate).map(Self.candidate(from:))
+        // Create, query and consume this store on one serial queue. No
+        // EventKit object crosses back to the main actor, only value types.
+        let queue = eventQueue
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                let queryStore = EKEventStore()
+                let calendars = queryStore.calendars(for: .event)
+                    .filter { calendarIDs.contains($0.calendarIdentifier) }
+                guard !calendars.isEmpty else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                let predicate = queryStore.predicateForEvents(withStart: interval.start,
+                                                              end: interval.end,
+                                                              calendars: calendars)
+                let events = queryStore.events(matching: predicate).map(Self.candidate(from:))
+                continuation.resume(returning: events)
+            }
+        }
     }
 
-    private static func candidate(from event: EKEvent) -> CalendarEventCandidate {
+    nonisolated private static func candidate(from event: EKEvent) -> CalendarEventCandidate {
         let attendees = (event.attendees ?? []).map(attendee(from:))
         let declined = (event.attendees ?? []).contains {
             $0.isCurrentUser && $0.participantStatus == .declined
@@ -114,7 +124,7 @@ final class EventKitCalendarProvider: CalendarEventProviding {
                                       isCanceled: event.status == .canceled)
     }
 
-    private static func attendee(from participant: EKParticipant) -> CalendarEventCandidate.Attendee {
+    nonisolated private static func attendee(from participant: EKParticipant) -> CalendarEventCandidate.Attendee {
         let kind: CalendarEventCandidate.AttendeeKind
         switch participant.participantType {
         case .person: kind = .person
