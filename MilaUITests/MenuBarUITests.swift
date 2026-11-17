@@ -270,10 +270,19 @@ final class MenuBarUITests: XCTestCase {
 
         // Genuine status-item menu keyboard navigation must dismiss cleanly
         // without starting a recording.
+        XCTAssertTrue(menuItem(application, identifier: "menuBar.open", title: "Open Mila").isHittable)
         application.typeKey(.downArrow, modifierFlags: [])
         application.typeKey(.upArrow, modifierFlags: [])
         application.typeKey(.escape, modifierFlags: [])
-        waitUntilGone(menuItem(application, identifier: "menuBar.open", title: "Open Mila"))
+        // Native menus may retain AX entries after dismissal. Verify the
+        // action is no longer interactable, using a fresh query each poll.
+        let closed = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                let open = self.menuItem(application, identifier: "menuBar.open", title: "Open Mila")
+                return !open.exists || !open.isHittable
+            }, object: application)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed,
+                       "Escape must dismiss the interactive status menu")
         XCTAssertEqual(application.state, .runningForeground)
         waitForStatusLabel(application, containing: "Choose Audio Source")
 
