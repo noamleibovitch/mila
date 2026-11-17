@@ -31,9 +31,14 @@ final class MenuBarUITests: XCTestCase {
     // MARK: - Idle window lifecycle
 
     func test_idle_close_and_reopen_keeps_one_resident_window_and_settings_close_is_normal() {
-        acknowledgeNotice()
         let application = launch()
         defer { application.terminate() }
+        closeMainWindow(application, expectNotice: true)
+        let initialNotice = backgroundNotice(application)
+        XCTAssertTrue(initialNotice.waitForExistence(timeout: 10))
+        acknowledge(initialNotice, application)
+        waitUntilGone(mainWindow(application))
+        openMila(application)
 
         waitForStatusLabel(application, containing: "Ready")
         let main = mainWindow(application)
@@ -97,15 +102,19 @@ final class MenuBarUITests: XCTestCase {
         acknowledge(notice, application)
         waitUntilGone(notice)
         waitUntilGone(mainWindow(application))
-        waitForDefaultsAcknowledgement()
-        XCTAssertTrue(UserDefaults(suiteName: suiteName)!
-            .bool(forKey: "menuBar.didExplainBackgroundRunning"))
+        // Prove persistence through the app's own UI across a relaunch.
+        // UI runner and host can have different preference containers.
+        application.terminate()
+        let relaunched = launch()
+        XCTAssertTrue(mainWindow(relaunched).waitForExistence(timeout: 20))
+        closeMainWindow(relaunched)
+        assertNoBackgroundNotice(relaunched)
 
-        openMila(application)
-        XCTAssertTrue(mainWindow(application).waitForExistence(timeout: 10))
-        closeMainWindow(application)
-        assertNoBackgroundNotice(application)
-        waitUntilGone(mainWindow(application))
+        openMila(relaunched)
+        XCTAssertTrue(mainWindow(relaunched).waitForExistence(timeout: 10))
+        closeMainWindow(relaunched)
+        assertNoBackgroundNotice(relaunched)
+        waitUntilGone(mainWindow(relaunched))
     }
 
     // MARK: - Active / paused capture
@@ -154,6 +163,25 @@ final class MenuBarUITests: XCTestCase {
                        "Quit must not present the background-running notice")
     }
 
+    func test_menu_stop_ends_hidden_synthetic_recording() {
+        let application = launch(fakeRecording: true)
+        defer { application.terminate() }
+        startFromMenu(application)
+        waitForStatusLabel(application, containing: "Recording")
+        closeMainWindow(application, expectNotice: true)
+        let notice = backgroundNotice(application)
+        XCTAssertTrue(notice.waitForExistence(timeout: 10))
+        acknowledge(notice, application)
+        waitUntilGone(mainWindow(application))
+
+        openMenu(application)
+        let stop = menuItem(application, identifier: "menuBar.record", title: "Stop Recording")
+        XCTAssertTrue(stop.isEnabled)
+        stop.click()
+        // No audio is pumped: this verifies stopping capture, not saved audio.
+        waitForStatusLabel(application, containing: "Ready")
+    }
+
     func test_quit_from_menu_without_closing_terminates_without_notice() {
         let application = launch(fakeRecording: true)
         XCTAssertTrue(mainWindow(application).waitForExistence(timeout: 20))
@@ -166,9 +194,13 @@ final class MenuBarUITests: XCTestCase {
         quit.click()
         waitUntilNotRunning(application)
         XCTAssertFalse(backgroundNotice(application).exists)
-        XCTAssertFalse(UserDefaults(suiteName: suiteName)!
-            .bool(forKey: "menuBar.didExplainBackgroundRunning"),
-                       "Quit is not an acknowledgement of the first-close notice")
+        let relaunched = launch()
+        closeMainWindow(relaunched, expectNotice: true)
+        let notice = backgroundNotice(relaunched)
+        XCTAssertTrue(notice.waitForExistence(timeout: 10),
+                      "Quit must not acknowledge the first-close notice")
+        acknowledge(notice, relaunched)
+        relaunched.terminate()
     }
 
     func test_paused_recording_survives_close_and_stays_stoppable() {
@@ -218,7 +250,6 @@ final class MenuBarUITests: XCTestCase {
     // MARK: - Blocked state, accessibility, keyboard
 
     func test_both_sources_off_shows_explanatory_status_and_disabled_start() {
-        acknowledgeNotice()
         let application = launch(microphone: false, appAudio: false)
         defer { application.terminate() }
         XCTAssertTrue(mainWindow(application).waitForExistence(timeout: 20))
@@ -259,12 +290,6 @@ final class MenuBarUITests: XCTestCase {
     // MARK: - Helpers
 
     private var suiteName: String { menuBarSuitePrefix + suiteID.uuidString }
-
-    private func acknowledgeNotice() {
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.set(true, forKey: "menuBar.didExplainBackgroundRunning")
-        defaults.synchronize()
-    }
 
     private func launch(microphone: Bool = true,
                         appAudio: Bool = true,
@@ -364,7 +389,7 @@ final class MenuBarUITests: XCTestCase {
         let byIdentifier = application.descendants(matching: .any)
             .matching(identifier: "menuBar.status").firstMatch
         if byIdentifier.exists { return byIdentifier }
-        return application.descendants(matching: .any)[expected]
+        return application.menuItems[expected]
     }
 
     private func accessibilityText(_ element: XCUIElement) -> String {
@@ -424,17 +449,6 @@ final class MenuBarUITests: XCTestCase {
         )
         XCTAssertEqual(XCTWaiter.wait(for: [matches], timeout: timeout), .completed,
                        "Status item must expose \(state): \(item.debugDescription)")
-    }
-
-    private func waitForDefaultsAcknowledgement() {
-        let defaults = UserDefaults(suiteName: suiteName)!
-        let acknowledged = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in
-                defaults.bool(forKey: "menuBar.didExplainBackgroundRunning")
-            },
-            object: defaults
-        )
-        XCTAssertEqual(XCTWaiter.wait(for: [acknowledged], timeout: 5), .completed)
     }
 
     private func waitUntilGone(_ element: XCUIElement, timeout: TimeInterval = 5) {
