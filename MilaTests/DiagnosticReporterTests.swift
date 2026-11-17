@@ -151,6 +151,16 @@ final class DiagnosticReporterTests: XCTestCase {
     /// by key name; prompts are reported as a length — people paste meeting
     /// agendas into them; the Obsidian written-index is a count, because its
     /// vault paths are derived from recording titles.
+    /// The summary context file is a path the user chose. A path names
+    /// folders and projects, so the report says only whether one is set.
+    func test_scopedSettings_reports_the_summary_context_file_as_set_or_not() {
+        let set = DiagnosticReporter.scopedSettings(
+            from: ["llm.summary.contextFile": "/Users/dana/Clients/Acme layoffs/context.md"])
+        XCTAssertEqual(set["llm.summary.contextFile"] as? String, "<set>")
+        let unset = DiagnosticReporter.scopedSettings(from: ["llm.summary.contextFile": ""])
+        XCTAssertEqual(unset["llm.summary.contextFile"] as? String, "<not set>")
+    }
+
     func test_scopedSettings_redacts_credentials_and_reports_prompts_as_lengths() throws {
         let agenda = "Q3 planning: budget cuts in the Berlin office, layoffs to be discussed Thursday"
         let defaults: [String: Any] = [

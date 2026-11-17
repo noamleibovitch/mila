@@ -236,6 +236,8 @@ enum DiagnosticReporter {
     ///     (that is how "the summary mentions last week's call" reports
     ///     usually resolve). The length still shows whether one is set and
     ///     whether it is the default's size;
+    ///   - `llm.summary.contextFile` is a path the user chose, and a path
+    ///     names folders and projects: reported as set / not set;
     ///   - `obsidian.writtenIndex` maps recording ids to vault paths derived
     ///     from recording titles — reported as an entry count;
     ///   - everything else goes through `sanitizedValue` (Data, i.e.
@@ -250,6 +252,8 @@ enum DiagnosticReporter {
                 scoped[key] = "<redacted>"
             } else if lower.contains("prompt"), let text = value as? String {
                 scoped[key] = "<\(text.count) chars>"
+            } else if key == "llm.summary.contextFile", let path = value as? String {
+                scoped[key] = path.isEmpty ? "<not set>" : "<set>"
             } else if key == "obsidian.writtenIndex" {
                 let count = (value as? [String: Any])?.count ?? (value as? [Any])?.count ?? 0
                 scoped[key] = "<\(count) entries>"
