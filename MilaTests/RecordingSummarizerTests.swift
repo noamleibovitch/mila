@@ -421,6 +421,29 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Summarize Roadmap."))
     }
 
+    func test_title_token_change_discards_stale_summary_and_reruns() async throws {
+        llm.tool = .claude
+        liveAI.summaryPrompt = "Summarize {{TITLE}}."
+        let gate = TestGate()
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            if prompts.count == 1 { await gate.wait() }
+            return prompts.count == 1 ? "OLD" : "CURRENT"
+        }
+        let rec = try addRecording(named: "Before", text: "the transcript")
+        summarizer.summarizeIfNeeded(rec)
+        var live = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        live.title = "After"
+        store.update(live)
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertTrue(prompts.first?.contains("Summarize Before.") == true)
+        XCTAssertTrue(prompts.last?.contains("Summarize After.") == true)
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "CURRENT")
+    }
+
     func test_summary_context_file_persists() {
         llm.summaryContextFile = "~/notes/context.md"
         XCTAssertEqual(LLMSettings(defaults: llmDefaults).summaryContextFile, "~/notes/context.md")

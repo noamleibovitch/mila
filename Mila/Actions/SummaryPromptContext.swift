@@ -37,7 +37,7 @@ enum SummaryPromptContext {
         guard prompt.contains("{{") else { return prompt }
         let values: [String: String] = [
             "TITLE": singleLine(recording.title),
-            "DATE": startDateString(for: recording, timeZone: timeZone),
+            "DATE": recordingDateString(for: recording, timeZone: timeZone),
             "DURATION": durationString(recording.duration),
             "SPEAKERS": speakerList(for: recording),
             "MY_NAME": singleLine(myName ?? "")
@@ -67,23 +67,15 @@ enum SummaryPromptContext {
         return resolved
     }
 
-    /// When the recording began, as `yyyy-MM-dd HH:mm` in `timeZone`.
-    ///
-    /// `createdAt` is stamped when Mila saves a recording it made, which is
-    /// when it stops, so the start is `createdAt - duration`. An imported
-    /// Voice Memo keeps the memo's own date, which is already its start.
-    static func startDateString(for recording: Recording, timeZone: TimeZone) -> String {
-        let start: Date
-        if recording.source == .voiceMemo || !recording.duration.isFinite || recording.duration <= 0 {
-            start = recording.createdAt
-        } else {
-            start = recording.createdAt.addingTimeInterval(-recording.duration)
-        }
+    /// The stored recording date, not an inferred capture start. Imported
+    /// audio uses its import date and Voice Memos retain their source date;
+    /// neither can safely be reconstructed by subtracting audio duration.
+    static func recordingDateString(for recording: Recording, timeZone: TimeZone) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = timeZone
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
-        return formatter.string(from: start)
+        return formatter.string(from: recording.createdAt)
     }
 
     /// Whole minutes, rounded, never below one for a recording that has any
@@ -116,7 +108,7 @@ enum SummaryPromptContext {
 
     // MARK: - Context file
 
-    enum ContextFileState: Equatable {
+    enum ContextFileState: Equatable, Sendable {
         /// No path configured. Not an error: the feature is simply off.
         case notSet
         case ready(String)
@@ -143,11 +135,14 @@ enum SummaryPromptContext {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
               !isDirectory.boolValue else { return .missing }
-        if let size = (try? fileManager.attributesOfItem(atPath: url.path))?[.size] as? NSNumber,
-           size.intValue > maxContextFileBytes {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return .unreadable }
+        if let size = attributes[.size] as? NSNumber, size.intValue > maxContextFileBytes {
             return .tooLarge
         }
-        guard let data = try? Data(contentsOf: url) else { return .unreadable }
+        guard let file = try? FileHandle(forReadingFrom: url) else { return .unreadable }
+        defer { try? file.close() }
+        guard let data = try? file.read(upToCount: maxContextFileBytes + 1) else { return .unreadable }
         // Re-checked on the bytes actually read: the size attribute is a
         // separate syscall, and a file can grow between the two.
         guard data.count <= maxContextFileBytes else { return .tooLarge }

@@ -44,8 +44,8 @@ final class SummaryPromptContextTests: XCTestCase {
             in: "{{TITLE}}|{{DATE}}|{{DURATION}}|{{SPEAKERS}}|{{MY_NAME}}",
             recording: rec, myName: "Dana", timeZone: utc)
         // 1_800_000_000 is 2027-01-15 08:00:00 UTC; the recording stopped
-        // then and ran 52 minutes, so it started at 07:08.
-        XCTAssertEqual(out, "Weekly sync|2027-01-15 07:08|52 min|Dana, SPEAKER_01|Dana")
+        // then; DATE is the stored date, not an estimated start.
+        XCTAssertEqual(out, "Weekly sync|2027-01-15 08:00|52 min|Dana, SPEAKER_01|Dana")
     }
 
     func test_prompt_without_tokens_is_returned_unchanged() {
@@ -90,14 +90,20 @@ final class SummaryPromptContextTests: XCTestCase {
     /// A Voice Memo keeps the memo's own date, which is already its start.
     func test_date_is_not_shifted_for_a_voice_memo() {
         let rec = recording(source: .voiceMemo)
-        XCTAssertEqual(SummaryPromptContext.startDateString(for: rec, timeZone: utc),
+        XCTAssertEqual(SummaryPromptContext.recordingDateString(for: rec, timeZone: utc),
+                       "2027-01-15 08:00")
+    }
+
+    func test_import_date_is_not_invented_from_audio_duration() {
+        let rec = recording(source: .microphone, duration: 3600)
+        XCTAssertEqual(SummaryPromptContext.recordingDateString(for: rec, timeZone: utc),
                        "2027-01-15 08:00")
     }
 
     func test_date_is_rendered_in_the_given_time_zone() {
         let jerusalem = TimeZone(identifier: "Asia/Jerusalem")!
-        XCTAssertEqual(SummaryPromptContext.startDateString(for: recording(), timeZone: jerusalem),
-                       "2027-01-15 09:08")
+        XCTAssertEqual(SummaryPromptContext.recordingDateString(for: recording(), timeZone: jerusalem),
+                       "2027-01-15 10:00")
     }
 
     func test_duration_rounds_to_minutes_and_never_reports_zero() {
