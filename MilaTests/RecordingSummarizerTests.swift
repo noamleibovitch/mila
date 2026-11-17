@@ -2012,12 +2012,12 @@ final class RecordingSummarizerTests: XCTestCase {
     /// newer run for the same id produces.
     func test_a_cancelled_run_stores_nothing_when_its_call_returns() async throws {
         llm.tool = .claude
+        let entered = TestGate()
         let gate = TestGate()
         var returned = false
         useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            entered.open()
             await gate.wait()
-            // The summarizer's completion runs in the same main-actor job as
-            // this return, so once the test sees the flag it has finished.
             returned = true
             return "LATE"
         }
@@ -2026,16 +2026,35 @@ final class RecordingSummarizerTests: XCTestCase {
 
         let rec = try addRecording(named: "Cancelled", text: "a transcript")
         summarizer.summarizeIfNeeded(rec)
+        // This test covers a call ALREADY in flight. Context-file loading
+        // now has an earlier cancellation boundary, so cancelling before
+        // entry legitimately avoids the call altogether (covered below).
+        await entered.wait()
         summarizer.cancel(recordingID: rec.id)
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
-
         gate.open()
-        await waitUntil { returned }
-        await Task.yield()
+        await summarizer.awaitInFlight(rec.id)
         XCTAssertTrue(returned)
-
         XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary)
         XCTAssertEqual(finished, 0)
+    }
+
+    func test_cancelling_before_invocation_never_calls_model_or_signals_completion() async throws {
+        llm.tool = .claude
+        var calls = 0
+        var finished = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            return "MUST NOT RUN"
+        }
+        summarizer.onSummaryFinished = { _ in finished += 1 }
+        let rec = try addRecording(named: "Cancelled before call", text: "a transcript")
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.cancel(recordingID: rec.id)
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(finished, 0)
+        XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary)
     }
 
     // MARK: - Deleting a recording mid-summary
