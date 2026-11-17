@@ -30,6 +30,11 @@ final class SummaryPromptContextTests: XCTestCase {
 
     // MARK: - Variables
 
+    func test_absurd_duration_is_empty_and_does_not_trap() {
+        XCTAssertEqual(SummaryPromptContext.durationString(1e300), "")
+        XCTAssertEqual(SummaryPromptContext.durationString(.infinity), "")
+    }
+
     func test_resolves_every_variable() {
         let rec = recording(segments: [
             TranscriptSegment(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00"),

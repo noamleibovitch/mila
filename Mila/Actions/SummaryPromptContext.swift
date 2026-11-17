@@ -89,7 +89,10 @@ enum SummaryPromptContext {
     /// Whole minutes, rounded, never below one for a recording that has any
     /// length at all. Empty for a corrupt or zero duration.
     static func durationString(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds > 0 else { return "" }
+        // The upper bound keeps a corrupt value read back from
+        // `recordings.json` (1e300 is finite) out of the `Int` conversion,
+        // which traps on a value it cannot represent.
+        guard seconds.isFinite, seconds > 0, seconds < 1e9 else { return "" }
         let minutes = max(1, Int((seconds / 60).rounded()))
         return "\(minutes) min"
     }
