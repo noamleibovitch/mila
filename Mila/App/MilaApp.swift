@@ -1214,7 +1214,7 @@ struct MilaApp: App {
         // this body when it publishes, and each evaluation re-diffs every
         // scene below — see `AppSceneChurnProbe` for why that is counted.
         let _ = AppSceneChurnProbe.noteBodyEvaluation()
-        WindowGroup("Mila") {
+        WindowGroup("Mila", id: "main") {
             ContentView()
                 .environmentObject(store)
                 .environmentObject(storageSettings)
@@ -1321,6 +1321,10 @@ struct MilaApp: App {
                 .environmentObject(obsidianExporter)
                 .environmentObject(postRecordingCommandSettings)
                 .environmentObject(postRecordingCommandRunner)
+                // Register ONLY this window with the resident controller:
+                // X hides it (keeping the recording and view state alive)
+                // instead of destroying it. Settings/panels are untouched.
+                .background(MenuBarMainWindowBridge(controller: appDelegate.menuBarWindow))
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -1370,6 +1374,16 @@ struct MilaApp: App {
                 }
             }
         }
+
+        // Resident menu-bar control. A leaf scene: it observes the app
+        // delegate's model, never re-evaluating this App body on each state
+        // change (and never subscribing to progress/meters).
+        MenuBarExtra {
+            MenuBarMenuView(controller: appDelegate.menuBar)
+        } label: {
+            MenuBarStatusLabel(controller: appDelegate.menuBar)
+        }
+        .menuBarExtraStyle(.menu)
 
         Settings {
             SettingsView()
@@ -1458,6 +1472,14 @@ struct MilaApp: App {
         // wiring ran).
         appDelegate.configImporter = configImporter
         appDelegate.shareImporter = shareImporter
+        appDelegate.configureMenuBar(actions: actions,
+                                     transcription: transcription,
+                                     session: session,
+                                     postRecording: postRecording,
+                                     shareImporter: shareImporter,
+                                     configImporter: configImporter,
+                                     store: store,
+                                     updater: updater)
         appDelegate.flushBufferedOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
@@ -2672,6 +2694,18 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var shareImporter: RecordingShareImporter?
     weak var postCommand: PostRecordingCommandRunner?
 
+    /// Resident window + menu-bar leaf. Both live for the app's lifetime with
+    /// the delegate, not with a window/menu that can close. Neither is an
+    /// App-level `@StateObject`, so their publishes never re-evaluate
+    /// `MilaApp.body`.
+    let menuBar = MenuBarController()
+    let menuBarWindow: MenuBarWindowController
+
+    override init() {
+        menuBarWindow = MenuBarWindowController(defaults: MenuBarDefaults.resolve())
+        super.init()
+    }
+
     private var didShutDown = false
     private var screenLockObserversInstalled = false
     /// `.milaconfig` / `.milashare` URLs delivered by a cold launch
@@ -2733,6 +2767,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quit (Cmd+Q or the menu item) must never show the background
+        // explanation or hide a window on the way out.
+        menuBarWindow.beginTermination()
         if didShutDown { return .terminateNow }
         didShutDown = true
         Task { @MainActor [weak self] in
@@ -2742,8 +2779,22 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    /// Closing every window must not end the app: capture and background
+    /// transcription keep running behind the menu-bar icon. Explicit still,
+    /// even though macOS does not generally quit non-document apps.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    /// Dock click / `open` on the running app brings the SAME resident window
+    /// back (deminiaturizing first), rather than creating a second window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        menuBarWindow.restoreMainWindow()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         postCommand?.cancelAll()
+        menuBarWindow.beginTermination()
         // Backstop: if `applicationShouldTerminate` was bypassed (e.g. a force
         // quit through the dock), we still get a chance to free the metal
         // context here. A second call is a no-op via `didShutDown`.
@@ -2751,6 +2802,138 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             didShutDown = true
             Task { @MainActor [weak self] in await self?.gracefulShutdown() }
         }
+    }
+
+    /// Wire the menu-bar leaf to the existing controllers. Idempotent — the
+    /// main window's `.onAppear` can run more than once.
+    func configureMenuBar(actions: QuickActionsController,
+                          transcription: TranscriptionService,
+                          session: RecordingSession,
+                          postRecording: PostRecordingCoordinator,
+                          shareImporter: RecordingShareImporter,
+                          configImporter: MilaConfigImporter,
+                          store: RecordingStore,
+                          updater: UpdaterViewModel) {
+        guard !menuBar.isConfigured else { return }
+        menuBarWindow.statusProvider = { [weak menuBar] in
+            menuBar?.currentStatus() ?? .ready
+        }
+
+        let runtime = MenuBarController.Runtime(
+            input: {
+                MenuBarStatusInput(
+                    activeJob: actions.activeJob,
+                    sessionState: session.state,
+                    isStoppingRecording: actions.isStoppingRecording,
+                    isCaptureStartInFlight: actions.captureStartInFlight,
+                    isPreparingModel: transcription.isPreparingModel,
+                    isImporting: shareImporter.isImporting
+                        || shareImporter.isStaging
+                        || Self.isFileImport(actions.activeJob),
+                    isTranscriptionBusy: Self.hasTranscriptionWork(transcription)
+                )
+            },
+            start: { microphone, appAudio in
+                await actions.toggleRecord(microphone: microphone, appAudio: appAudio)
+            },
+            stop: {
+                await actions.stopRecording()
+            },
+            startBegan: {
+                actions.isRecording || actions.isStartingRecording
+            },
+            blockingState: {
+                Self.hasBlockingUIState(actions: actions,
+                                        transcription: transcription,
+                                        postRecording: postRecording,
+                                        shareImporter: shareImporter,
+                                        configImporter: configImporter,
+                                        store: store,
+                                        updater: updater)
+            },
+            revealIfHidden: { [weak self] in
+                self?.menuBarWindow.revealIfHidden()
+            },
+            restoreMainWindow: { [weak self] in
+                self?.menuBarWindow.restoreMainWindow() ?? false
+            }
+        )
+        menuBar.configure(runtime: runtime,
+                          changes: [
+                              actions.objectWillChange.eraseToAnyPublisher(),
+                              session.objectWillChange.eraseToAnyPublisher(),
+                              postRecording.objectWillChange.eraseToAnyPublisher(),
+                              shareImporter.objectWillChange.eraseToAnyPublisher(),
+                              configImporter.objectWillChange.eraseToAnyPublisher(),
+                              store.objectWillChange.eraseToAnyPublisher(),
+                              updater.objectWillChange.eraseToAnyPublisher(),
+                              Self.menuBarTranscriptionChanges(transcription)
+                          ])
+    }
+
+    /// Menu-relevant transcription changes only. Deliberately excludes
+    /// `$progress`: the menu derives Processing from the deduplicated job
+    /// IDs/state below, and an `objectWillChange` subscription would wake it
+    /// at whisper's progress cadence.
+    static func menuBarTranscriptionChanges(_ service: TranscriptionService) -> AnyPublisher<Void, Never> {
+        let publishers: [AnyPublisher<Void, Never>] = [
+            service.$activeRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$pendingIDs.map { _ in () }.eraseToAnyPublisher(),
+            service.$stoppingRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$diarizingRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$speakerFinalizationPendingIDs.map { _ in () }.eraseToAnyPublisher(),
+            service.$isPreparingModel.map { _ in () }.eraseToAnyPublisher(),
+            service.$lastError.map { _ in () }.eraseToAnyPublisher()
+        ]
+        var merged = publishers[0]
+        for publisher in publishers.dropFirst() {
+            merged = merged.merge(with: publisher).eraseToAnyPublisher()
+        }
+        return merged
+    }
+
+    /// `activeJob` intentionally has no URL-free accessor for its import case,
+    /// so the controller's file-import state is detected from the job itself.
+    static func isFileImport(_ job: QuickActionsController.ActiveJob) -> Bool {
+        if case .importingFile = job { return true }
+        return false
+    }
+
+    /// Deduplicated job IDs/state only. Never `TranscriptionService.progress`;
+    /// adding that here would reintroduce the #280 class of App-level churn
+    /// through a new observer.
+    static func hasTranscriptionWork(_ service: TranscriptionService) -> Bool {
+        service.activeRecordingID != nil
+            || service.stoppingRecordingID != nil
+            || service.diarizingRecordingID != nil
+            || !service.speakerFinalizationPendingIDs.isEmpty
+            || !service.pendingIDs.isEmpty
+    }
+
+    /// Existing blocking UI in ContentView. The leaf observes this set and
+    /// reveals the resident window when one appears while it is hidden,
+    /// leaving the original alerts/sheets/errors untouched.
+    static func hasBlockingUIState(actions: QuickActionsController,
+                                   transcription: TranscriptionService,
+                                   postRecording: PostRecordingCoordinator,
+                                   shareImporter: RecordingShareImporter,
+                                   configImporter: MilaConfigImporter,
+                                   store: RecordingStore,
+                                   updater: UpdaterViewModel) -> Bool {
+        transcription.lastError != nil
+            || actions.microphonePermissionMissing
+            || actions.screenRecordingPermissionMissing
+            || actions.sleepInterruption != nil
+            || actions.noSoundWarningShown
+            || postRecording.pending != nil
+            || (postRecording.activityIsError && postRecording.activityStatus != nil)
+            || configImporter.pending != nil
+            || configImporter.errorMessage != nil
+            || shareImporter.pending != nil
+            || shareImporter.errorMessage != nil
+            || store.trimNotice != nil
+            || actions.isAppPickerShown
+            || updater.availableUpdate != nil
     }
 
     /// Subscribe to the events that affect a live recording:
