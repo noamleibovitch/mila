@@ -34,13 +34,14 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         // copies the synthetic WAV into the isolated recording store for Stop.
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "Mila.AutoSaveUITests.\(suiteID.uuidString)"))
         defaults.set(true, forKey: "recordings.autoSave")
+        defaults.set(false, forKey: "liveAI.transcribeWhileRecording")
+        defaults.set(false, forKey: "liveAI.enabled")
+        defaults.set(false, forKey: "liveAI.backgroundMode")
         let application = XCUIApplication()
         application.launchArguments = [
             "--uitests", "--ui-test-clean-store", "--ui-test-recording-lang-en",
             "--ui-test-auto-save-suite=\(suiteID.uuidString)",
             "--ui-test-inject-fixture-wav=\(wav)", "--ui-test-tiny-model-path=\(tiny)",
-            "-liveAI.transcribeWhileRecording", "NO",
-            "-liveAI.backgroundMode", "NO", "-liveAI.enabled", "NO",
             "-diarization.enabled", "NO", "-speakers.voiceRecognition.enabled", "NO",
             "-llm.tool", "none", "-llm.name.enabled", "NO",
             "-llm.summary.enabled", "NO", "-llm.action.enabled", "NO",
@@ -53,7 +54,8 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         let stop = element(application, "home.record.hero")
         XCTAssertTrue(stop.waitForExistence(timeout: 30))
         let recording = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            stop.label.contains("Recording") && stop.isHittable && stop.isEnabled
+            let caption = stop.label + (stop.value as? String ?? "")
+            return caption.contains("Recording") && stop.isHittable && stop.isEnabled
         }, object: stop)
         XCTAssertEqual(XCTWaiter.wait(for: [recording], timeout: 30), .completed,
                        "Batch-only capture must offer an enabled Stop without a live transcript")

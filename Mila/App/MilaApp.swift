@@ -511,7 +511,11 @@ struct MilaApp: App {
                 performanceCoreCount: SystemCapabilities.live.performanceCoreCount
             )
             : .live
-        let liveAI = LiveAISettings(capabilities: liveAICapabilities, managed: managedSettings)
+        // The validated fixture suite supplies typed preferences. Launch
+        // arguments are strings, so `object(forKey:) as? Bool` would ignore
+        // an argument-domain "NO" and silently default live transcription ON.
+        let liveAI = LiveAISettings(defaults: Self.autoSaveUITestDefaults() ?? .standard,
+                                    capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
