@@ -6,22 +6,10 @@ final class BatchOnlyRecordingUITests: XCTestCase {
     private var app: XCUIApplication?
     private var suiteID: UUID!
     private var tempRoot: URL!
-    private var permissionMonitor: NSObjectProtocol?
 
     override func setUpWithError() throws {
         try super.setUpWithError()
         continueAfterFailure = false
-        // The isolated target may have no TCC decision after signing. This
-        // fixture supplies a WAV and must not need physical microphone access.
-        permissionMonitor = addUIInterruptionMonitor(withDescription: "Synthetic fixture needs no microphone") { alert in
-            guard alert.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "microphone"))
-                .firstMatch.exists else { return false }
-            let deny = alert.buttons.matching(NSPredicate(format: "label IN %@", ["Don't Allow", "Don’t Allow"]))
-                .firstMatch
-            guard deny.exists else { return false }
-            deny.click()
-            return true
-        }
         suiteID = UUID()
         tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Mila.BatchOnlyUITests.\(suiteID.uuidString)", isDirectory: true)
@@ -30,7 +18,6 @@ final class BatchOnlyRecordingUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         app?.terminate()
-        if let permissionMonitor { removeUIInterruptionMonitor(permissionMonitor) }
         if let suiteID {
             UserDefaults().removePersistentDomain(forName: "Mila.AutoSaveUITests.\(suiteID.uuidString)")
         }
@@ -43,34 +30,11 @@ final class BatchOnlyRecordingUITests: XCTestCase {
                           "Requires an unlocked Mac and local synthetic WAV/tiny model fixtures.")
         let wav = try fixturePath("MILA_FIXTURE_WAV_PATH")
         let tiny = try fixturePath("MILA_TINY_MODEL_PATH")
-        // Configure the target through its real controls. The XCTest runner
-        // and target can have different preference homes, so seeding defaults
-        // from this process is not proof of what the target will actually read.
-        let initial = launch(tiny: tiny)
-        initial.typeKey(",", modifierFlags: .command)
-        let audio = element(initial, "settings.section.audio")
-        XCTAssertTrue(audio.waitForExistence(timeout: 10))
-        audio.click()
-        setToggle(initial, "liveAI.transcribeWhileRecording.toggle", isOn: false)
-        setToggle(initial, "recordings.autoSave.toggle", isOn: true)
-        let settings = initial.windows["com_apple_SwiftUI_Settings_window"]
-        let close = settings.buttons["_XCUI:CloseWindow"]
-        XCTAssertTrue(close.isHittable)
-        close.click()
-        initial.terminate()
-
-        // Relaunch the SAME test-owned suite with synthetic capture armed.
-        // The explicit live-pane absence check below verifies the setting stuck.
+        // The target seeds typed preferences in its own UUID-owned suite,
+        // avoiding cross-process defaults and the physical mic settings meter.
         let application = launch(wav: wav, tiny: tiny)
 
         let stop = element(application, "home.record.hero")
-        // TCC may display its dialog after launch has returned. Passive
-        // waits do not invoke interruption monitors, so issue a harmless
-        // event when the main window is still blocked, with a bounded retry.
-        for _ in 0..<5 {
-            if stop.waitForExistence(timeout: 2) { break }
-            application.typeKey(.escape, modifierFlags: [])
-        }
         XCTAssertTrue(stop.waitForExistence(timeout: 30))
         // The Home-only Pause control exists only during an active capture.
         // Do not infer recording state from a SwiftUI button's combined AX
@@ -116,6 +80,7 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         let application = XCUIApplication()
         application.launchArguments = [
             "--uitests", "--ui-test-clean-store", "--ui-test-recording-lang-en",
+            "--ui-test-batch-recording",
             "--ui-test-auto-save-suite=\(suiteID.uuidString)",
             "--ui-test-tiny-model-path=\(tiny)",
             "-diarization.enabled", "NO", "-speakers.voiceRecognition.enabled", "NO",
@@ -127,31 +92,7 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         application.launchEnvironment["TMPDIR"] = tempRoot.path + "/"
         app = application
         application.launch()
-        // Interruption monitors run when an event meets a system dialog, not
-        // during passive existence waits. Escape safely exercises that path.
-        application.typeKey(.escape, modifierFlags: [])
         return application
-    }
-
-    private func setToggle(_ application: XCUIApplication, _ identifier: String, isOn: Bool) {
-        let toggle = element(application, identifier)
-        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
-        let settings = application.windows.containing(.any, identifier: "settings.section.audio").firstMatch
-        for _ in 0..<8 {
-            if toggle.isHittable { break }
-            settings.scrollViews.firstMatch.scroll(byDeltaX: 0, deltaY: -160)
-        }
-        XCTAssertTrue(toggle.isHittable)
-        XCTAssertTrue(toggle.isEnabled)
-        let expected = isOn ? "1" : "0"
-        let matches = NSPredicate { _, _ in
-            if let value = toggle.value as? NSNumber { return value.boolValue == isOn }
-            return (toggle.value as? String) == expected
-        }
-        if !matches.evaluate(with: toggle) { toggle.click() }
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: matches, object: toggle)],
-                                     timeout: 5), .completed,
-                       "The target must persist the requested Audio setting")
     }
 
     private func element(_ application: XCUIApplication, _ identifier: String) -> XCUIElement {

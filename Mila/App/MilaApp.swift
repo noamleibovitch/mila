@@ -408,6 +408,21 @@ struct MilaApp: App {
         return UserDefaults(suiteName: "Mila.AutoSaveUITests.\(id.uuidString)")!
     }
 
+    /// Seed the synthetic batch fixture INSIDE the target's preference home.
+    /// All three test flags plus a UUID-owned suite are required; a normal
+    /// launch never enters this path or changes the user's preferences.
+    static func prepareBatchUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard arguments.contains("--uitests"),
+              arguments.contains("--ui-test-clean-store"),
+              arguments.contains("--ui-test-batch-recording"),
+              let defaults = autoSaveUITestDefaults(arguments: arguments) else { return nil }
+        defaults.set(false, forKey: "liveAI.transcribeWhileRecording")
+        defaults.set(false, forKey: "liveAI.enabled")
+        defaults.set(false, forKey: "liveAI.backgroundMode")
+        defaults.set(true, forKey: "recordings.autoSave")
+        return defaults
+    }
+
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
@@ -420,7 +435,8 @@ struct MilaApp: App {
         // `--ui-test-auto-save-suite=<UUID>` redirects just this object at a
         // test-owned suite; anything malformed — or the flag absent — keeps
         // normal production behaviour (`.standard`).
-        let storage = RecordingStorageSettings(defaults: Self.autoSaveUITestDefaults() ?? .standard)
+        let fixtureDefaults = Self.prepareBatchUITestDefaults() ?? Self.autoSaveUITestDefaults()
+        let storage = RecordingStorageSettings(defaults: fixtureDefaults ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
         }
@@ -514,7 +530,7 @@ struct MilaApp: App {
         // The validated fixture suite supplies typed preferences. Launch
         // arguments are strings, so `object(forKey:) as? Bool` would ignore
         // an argument-domain "NO" and silently default live transcription ON.
-        let liveAI = LiveAISettings(defaults: Self.autoSaveUITestDefaults() ?? .standard,
+        let liveAI = LiveAISettings(defaults: fixtureDefaults ?? .standard,
                                     capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
