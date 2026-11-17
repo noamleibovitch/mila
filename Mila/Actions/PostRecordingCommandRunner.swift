@@ -161,6 +161,24 @@ final class PostRecordingCommandRunner: ObservableObject {
 
     // MARK: - Pending gate
 
+    /// Recordings Mila captured itself during this session, reported by
+    /// `QuickActionsController.stopRecording`. The batch-transcription
+    /// completion hook is shared with imported audio files, a Voice Memos
+    /// sync and orphan WAVs recovered at launch, none of which is a meeting
+    /// that just ended; `markPendingIfCaptured` is how that hook tells them
+    /// apart.
+    private var captured: Set<UUID> = []
+
+    func noteCaptured(_ id: UUID) { captured.insert(id) }
+
+    /// `markPending`, for a recording `noteCaptured` reported. Anything else
+    /// is left unmarked and so never runs the command on its own; the manual
+    /// run from the context menu still works for it.
+    func markPendingIfCaptured(_ id: UUID) {
+        guard captured.contains(id) else { return }
+        markPending(id)
+    }
+
     /// Ignores an id the user has already thrown away — see `discarded`.
     func markPending(_ id: UUID) {
         guard !discarded.contains(id) else { return }

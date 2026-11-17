@@ -720,7 +720,9 @@ struct MilaApp: App {
                 // on this branch only: unlike the note, which a re-export
                 // overwrites in place, the command's side effects are not
                 // Mila's to repeat, so a re-transcription does not re-run it.
-                if postCommandSettings?.isReady == true { postCommand?.markPending(rec.id) }
+                // Captured recordings only: this hook also completes imported
+                // files, Voice Memos and recovered orphans.
+                if postCommandSettings?.isReady == true { postCommand?.markPendingIfCaptured(rec.id) }
                 summarizer?.summarizeIfNeeded(rec)
             }
         }

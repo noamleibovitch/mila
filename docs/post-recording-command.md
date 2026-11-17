@@ -38,14 +38,16 @@ Once per new recording, after transcription has finished and the AI summary
 has either landed, failed, or been skipped. It runs with summaries turned off
 and with no LLM configured; the handoff then has no `summary`.
 
-It runs for recordings you capture and for files Mila transcribes on import,
-including a Voice Memos sync. Runs are queued and happen one at a time, in
-the order the recordings finished.
+It runs for recordings you capture in Mila. Runs are queued and happen one at
+a time.
 
 It does not run:
 
 - for recordings that already existed when you turned the hook on, or for the
   summary catch-up Mila does at launch
+- for audio files you import, a Voice Memos sync, or a recording Mila
+  recovers at launch after a crash. Use "Run Post-Recording Command" in the
+  recording's context menu for those
 - when you re-transcribe a recording. Your command has effects Mila cannot
   see, so Mila does not repeat them on its own
 - for dictation, or for a `.milashare` someone sent you

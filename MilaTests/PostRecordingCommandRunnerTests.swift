@@ -176,6 +176,17 @@ final class PostRecordingCommandRunnerTests: XCTestCase {
     }
 
     /// The launch-time backfill sweep summarizes recordings nobody marked.
+    func test_only_a_captured_recording_is_marked_by_the_batch_hook() async throws {
+        let imported = addRecording()
+        runner.markPendingIfCaptured(imported.id)
+        XCTAssertFalse(runner.isPending(imported.id), "an import or a recovered orphan is not a finished meeting")
+
+        let captured = addRecording()
+        runner.noteCaptured(captured.id)
+        runner.markPendingIfCaptured(captured.id)
+        XCTAssertTrue(runner.isPending(captured.id))
+    }
+
     func test_unmarked_summary_never_runs_the_command() async throws {
         let rec = addRecording()
         summarizer.summarizeIfNeeded(rec)

@@ -1330,6 +1330,7 @@ final class QuickActionsController: ObservableObject {
             actionItems: initialItems.isEmpty ? nil : initialItems
         )
         store.add(recording)
+        postCommandRunner?.noteCaptured(recording.id)
         // The live sidecar is deliberately NOT closed here. `finish()`
         // publishes `completed` + `final_recording_id`, and that pair is a
         // promise to an external poller that the id it just got resolves to
