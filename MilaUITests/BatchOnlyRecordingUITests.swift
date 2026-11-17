@@ -64,6 +64,13 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         let application = launch(wav: wav, tiny: tiny)
 
         let stop = element(application, "home.record.hero")
+        // TCC may display its dialog after launch has returned. Passive
+        // waits do not invoke interruption monitors, so issue a harmless
+        // event when the main window is still blocked, with a bounded retry.
+        for _ in 0..<5 {
+            if stop.waitForExistence(timeout: 2) { break }
+            application.typeKey(.escape, modifierFlags: [])
+        }
         XCTAssertTrue(stop.waitForExistence(timeout: 30))
         // The Home-only Pause control exists only during an active capture.
         // Do not infer recording state from a SwiftUI button's combined AX
