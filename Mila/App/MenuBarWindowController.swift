@@ -140,7 +140,7 @@ final class MenuBarWindowController: NSObject {
     // MARK: - Delegate forwarding
 
     private func installDelegate(on window: NSWindow) {
-        if (window.delegate as AnyObject?) === proxy { return }
+        if let proxy, (window.delegate as AnyObject?) === proxy { return }
         let forwarding = proxy ?? MenuBarWindowDelegateProxy(controller: self)
         forwarding.original = window.delegate
         proxy = forwarding
@@ -151,7 +151,7 @@ final class MenuBarWindowController: NSObject {
     /// (rather than discarding it) when the window becomes key/main again.
     private func reassertDelegate(on window: NSWindow) {
         guard !isTerminating, window === mainWindow else { return }
-        if (window.delegate as AnyObject?) === proxy { return }
+        if let proxy, (window.delegate as AnyObject?) === proxy { return }
         installDelegate(on: window)
     }
 

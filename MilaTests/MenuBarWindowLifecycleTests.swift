@@ -25,12 +25,13 @@ final class MenuBarWindowLifecycleTests: XCTestCase {
     private func makeWindow(_ identifier: String = "Mila") -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
-            styleMask: [.titled, .closable, .resizable],
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.identifier = NSUserInterfaceItemIdentifier(identifier)
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         return window
     }
 
@@ -74,6 +75,21 @@ final class MenuBarWindowLifecycleTests: XCTestCase {
         window.performClose(nil)
         XCTAssertFalse(window.isVisible)
         XCTAssertEqual(presentations.count, 1, "The explanation is once only")
+    }
+
+    func test_window_without_an_original_delegate_is_still_wrapped() {
+        let controller = makeController()
+        let window = makeWindow()
+        XCTAssertNil(window.delegate)
+        controller.attach(window: window)
+        XCTAssertTrue(window.delegate is MenuBarWindowDelegateProxy,
+                      "An absent original delegate must not be mistaken for an installed proxy")
+        window.orderFront(nil)
+        window.performClose(nil)
+        XCTAssertEqual(presentations.count, 1)
+        XCTAssertFalse(window.isVisible)
+        controller.detach(window: window)
+        XCTAssertNil(window.delegate)
     }
 
     func test_notice_is_once_per_injected_defaults_suite() {
@@ -166,15 +182,21 @@ final class MenuBarWindowLifecycleTests: XCTestCase {
         XCTAssertFalse(MenuBarFirstCloseStore(defaults: defaults).hasExplained)
     }
 
-    func test_minimized_window_is_deminiaturized_by_restore() {
+    func test_minimized_window_is_deminiaturized_by_restore() async {
         let controller = makeController()
         let window = makeWindow()
         controller.attach(window: window)
         window.orderFront(nil)
         window.miniaturize(nil)
+        let minimized = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in window.isMiniaturized }, object: window)
+        await fulfillment(of: [minimized], timeout: 3)
         XCTAssertTrue(window.isMiniaturized)
 
         XCTAssertTrue(controller.restoreMainWindow())
+        let restored = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in !window.isMiniaturized && window.isVisible }, object: window)
+        await fulfillment(of: [restored], timeout: 3)
         XCTAssertFalse(window.isMiniaturized)
         XCTAssertTrue(window.isVisible)
     }
