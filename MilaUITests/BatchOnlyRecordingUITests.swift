@@ -6,10 +6,22 @@ final class BatchOnlyRecordingUITests: XCTestCase {
     private var app: XCUIApplication?
     private var suiteID: UUID!
     private var tempRoot: URL!
+    private var permissionMonitor: NSObjectProtocol?
 
     override func setUpWithError() throws {
         try super.setUpWithError()
         continueAfterFailure = false
+        // The isolated target may have no TCC decision after signing. This
+        // fixture supplies a WAV and must not need physical microphone access.
+        permissionMonitor = addUIInterruptionMonitor(withDescription: "Synthetic fixture needs no microphone") { alert in
+            guard alert.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "microphone"))
+                .firstMatch.exists else { return false }
+            let deny = alert.buttons.matching(NSPredicate(format: "label IN %@", ["Don't Allow", "Don’t Allow"]))
+                .firstMatch
+            guard deny.exists else { return false }
+            deny.click()
+            return true
+        }
         suiteID = UUID()
         tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("Mila.BatchOnlyUITests.\(suiteID.uuidString)", isDirectory: true)
@@ -18,6 +30,7 @@ final class BatchOnlyRecordingUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         app?.terminate()
+        if let permissionMonitor { removeUIInterruptionMonitor(permissionMonitor) }
         if let suiteID {
             UserDefaults().removePersistentDomain(forName: "Mila.AutoSaveUITests.\(suiteID.uuidString)")
         }
@@ -107,6 +120,9 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         application.launchEnvironment["TMPDIR"] = tempRoot.path + "/"
         app = application
         application.launch()
+        // Interruption monitors run when an event meets a system dialog, not
+        // during passive existence waits. Escape safely exercises that path.
+        application.typeKey(.escape, modifierFlags: [])
         return application
     }
 
