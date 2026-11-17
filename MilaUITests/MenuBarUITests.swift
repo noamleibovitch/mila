@@ -365,7 +365,7 @@ final class MenuBarUITests: XCTestCase {
         XCTAssertTrue(open.waitForExistence(timeout: 5),
                       "Clicking the status item must open its native menu")
         // Capture only this app's menu/status item, never the whole desktop.
-        let menu = application.menus.firstMatch
+        let menu = item.menus.firstMatch
         let image = menu.exists && !menu.frame.isEmpty ? menu.screenshot() : item.screenshot()
         let attachment = XCTAttachment(screenshot: image)
         attachment.name = "Mila menu bar"
@@ -380,16 +380,17 @@ final class MenuBarUITests: XCTestCase {
     private func menuItem(_ application: XCUIApplication,
                           identifier: String,
                           title: String) -> XCUIElement {
-        let byIdentifier = application.menuItems.matching(identifier: identifier).firstMatch
+        let items = statusItem(application).menuItems
+        let byIdentifier = items.matching(identifier: identifier).firstMatch
         if byIdentifier.exists { return byIdentifier }
-        return application.menuItems[title]
+        return items[title]
     }
 
     private func statusMenuText(_ application: XCUIApplication, expected: String) -> XCUIElement {
-        let byIdentifier = application.descendants(matching: .any)
-            .matching(identifier: "menuBar.status").firstMatch
+        let items = statusItem(application).menuItems
+        let byIdentifier = items.matching(identifier: "menuBar.status").firstMatch
         if byIdentifier.exists { return byIdentifier }
-        return application.menuItems[expected]
+        return items[expected]
     }
 
     private func accessibilityText(_ element: XCUIElement) -> String {
