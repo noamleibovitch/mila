@@ -153,8 +153,8 @@ final class CalendarMatchWiringTests: XCTestCase {
         let rec = addRecording()
 
         coordinator.recordingFinished(rec)
-        try await waitFor(self.stored(rec)?.title == "Weekly sync")
-        XCTAssertNotNil(stored(rec)?.calendarEvent)
+        XCTAssertEqual(stored(rec)?.title, "Weekly sync")
+        try await waitFor(self.stored(rec)?.calendarEvent != nil)
         XCTAssertEqual(llmCalls, 0)
     }
 
@@ -244,8 +244,9 @@ final class CalendarMatchWiringTests: XCTestCase {
         coordinator.recordingFinished(rec)
         try await settle()
         var current = try XCTUnwrap(stored(rec))
-        XCTAssertNil(current.calendarEvent, "nothing is written while the row is still in flight")
-        XCTAssertTrue(provider.eventQueries.isEmpty)
+        XCTAssertNil(current.calendarEvent, "the event field waits for the row to settle")
+        XCTAssertEqual(current.title, "Weekly sync", "the title does not wait")
+        XCTAssertEqual(provider.eventQueries.count, 1)
 
         current.title = "My own name"
         current.fullText = "the transcript text"
@@ -255,6 +256,21 @@ final class CalendarMatchWiringTests: XCTestCase {
         try await waitFor(self.stored(rec)?.calendarEvent != nil)
         try await settle()
         XCTAssertEqual(stored(rec)?.title, "My own name")
+    }
+
+    /// The event names the recording at stop, before transcription ends, so
+    /// the rename sheet opens on the event title and no title job starts.
+    func test_event_titles_at_stop_and_the_sheet_opens_on_it() async throws {
+        scheduleEvent()
+        let coordinator = makeCoordinator()
+        let rec = addRecording(status: .running, text: "")
+
+        coordinator.recordingFinished(rec)
+
+        XCTAssertEqual(stored(rec)?.title, "Weekly sync")
+        XCTAssertEqual(coordinator.pending?.title, "Weekly sync")
+        XCTAssertFalse(coordinator.autoSuggestingIDs.contains(rec.id))
+        XCTAssertEqual(llmCalls, 0)
     }
 
     // MARK: - Timing
@@ -268,16 +284,17 @@ final class CalendarMatchWiringTests: XCTestCase {
         coordinator.recordingFinished(rec)
         try await settle()
         XCTAssertNil(stored(rec)?.calendarEvent)
-        XCTAssertEqual(stored(rec)?.title, defaultTitle)
+        XCTAssertEqual(stored(rec)?.title, "Weekly sync", "the title does not wait")
 
         service.endSpeakerFinalization(rec.id)
-        try await waitFor(self.stored(rec)?.title == "Weekly sync")
+        try await waitFor(self.stored(rec)?.calendarEvent != nil)
         XCTAssertEqual(llmCalls, 0)
     }
 
-    /// The wait gave up with transcription still running. Writing the row
-    /// then is what the wait exists to prevent, so nothing is matched.
-    func test_wait_timing_out_on_a_row_still_in_flight_writes_nothing() async throws {
+    /// The wait gave up with transcription still running. Adding the event
+    /// field then is what the wait exists to prevent, so only the title,
+    /// written at stop, is there.
+    func test_wait_timing_out_on_a_row_still_in_flight_stores_no_event() async throws {
         scheduleEvent()
         let coordinator = makeCoordinator()
         coordinator.transcriptWaitTimeout = 0.3
@@ -286,8 +303,8 @@ final class CalendarMatchWiringTests: XCTestCase {
         coordinator.recordingFinished(rec)
         try await Task.sleep(nanoseconds: 1_000_000_000)
         XCTAssertNil(stored(rec)?.calendarEvent)
-        XCTAssertEqual(stored(rec)?.title, defaultTitle)
-        XCTAssertTrue(provider.eventQueries.isEmpty)
+        XCTAssertEqual(stored(rec)?.title, "Weekly sync")
+        XCTAssertEqual(llmCalls, 0)
     }
 
     /// A recording with no speech in it still happened during the meeting.
@@ -312,7 +329,7 @@ final class CalendarMatchWiringTests: XCTestCase {
         try await settle()
 
         XCTAssertNil(stored(rec))
-        XCTAssertTrue(provider.eventQueries.isEmpty)
+        XCTAssertEqual(provider.eventQueries.count, 1, "the one lookup, at stop")
         XCTAssertEqual(llmCalls, 0)
     }
 
@@ -327,7 +344,8 @@ final class CalendarMatchWiringTests: XCTestCase {
 
         coordinator.recordingFinished(rec, showsRenameSheet: false)
         XCTAssertNil(coordinator.pending, "no sheet was asked for")
-        try await waitFor(self.stored(rec)?.title == "Weekly sync")
+        XCTAssertEqual(stored(rec)?.title, "Weekly sync")
+        try await waitFor(self.stored(rec)?.calendarEvent != nil)
         XCTAssertEqual(stored(rec)?.calendarEvent?.attendees.map(\.name), ["Me", "Dana"])
         XCTAssertEqual(llmCalls, 0)
     }

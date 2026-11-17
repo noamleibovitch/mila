@@ -87,6 +87,10 @@ final class PostRecordingCoordinator: ObservableObject {
     /// whether the match titled the recording, which the auto-title job
     /// awaits before it spends an LLM call.
     private var calendarTasks: [UUID: Task<Bool, Never>] = [:]
+    /// Recordings the calendar named at stop time (`armCalendarMatch`), kept
+    /// while their match task runs. `armAutoSuggestTitle` starts no LLM
+    /// title job for these.
+    private var calendarTitledIDs: Set<UUID> = []
 
     /// Background "Send to <LLM>" work, keyed per-recording. Owned here —
     /// on the app-lifetime coordinator — rather than spawned as a bare
@@ -236,7 +240,10 @@ final class PostRecordingCoordinator: ObservableObject {
                            showsRenameSheet: Bool = true) {
         armCalendarMatch(for: recording, mayTitle: !titleWasUserProvided)
         if showsRenameSheet {
-            present(recording, titleWasUserProvided: titleWasUserProvided)
+            // The row, not the caller's copy: the match may just have
+            // titled it, and the sheet seeds its field from what it is given.
+            let current = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+            present(current, titleWasUserProvided: titleWasUserProvided)
         }
     }
 
@@ -247,16 +254,16 @@ final class PostRecordingCoordinator: ObservableObject {
     /// its machine-default title, the event's title replaces it.
     ///
     /// Returns nil when the calendar match is off or not ready — the common
-    /// case, which starts nothing. Otherwise the task (also kept in
+    /// case, which starts nothing — or when no event qualifies. Otherwise the task (also kept in
     /// `calendarTasks`, where `present` finds it) has as its value whether
     /// the event titled the recording; `armAutoSuggestTitle` awaits it and
     /// skips the LLM call on `true`, so the two can never both write a title.
     ///
-    /// The lookup needs only the recording's times, but the WRITE waits for
-    /// the row to settle, like the title job's: until transcription and the
-    /// offline speaker pass are done, `QuickActionsController`'s drain and
-    /// `TranscriptionService` are still writing the row from copies taken
-    /// earlier, and a field added in between would be written over.
+    /// The event's TITLE is written at once (see below). The `calendarEvent`
+    /// field waits for the row to settle, like the title job's write: until
+    /// transcription and the offline speaker pass are done,
+    /// `QuickActionsController`'s drain and `TranscriptionService` are still
+    /// writing the row, and a field added in between could be written over.
     @discardableResult
     private func armCalendarMatch(for recording: Recording,
                                   mayTitle: Bool) -> Task<Bool, Never>? {
@@ -267,26 +274,49 @@ final class PostRecordingCoordinator: ObservableObject {
         // Same baseline rule as `armAutoSuggestTitle`: the title is replaced
         // only while it is still the default the recording was saved under.
         let baselineTitle = recording.title
+        // The lookup needs only the recording's times, which are final at
+        // stop, so it runs here, once. No event means nothing to wait for
+        // and the LLM title job proceeds as if the feature were off.
+        guard let match = calendar.match(for: recording) else { return nil }
+        // The title does not wait for the row to settle either: a title-only
+        // write to a row that is still transcribing is what the rename
+        // sheet's Save already does (`dismiss(savingTitle:)`). Naming it now
+        // puts the event title in the rename sheet instead of the
+        // date-stamped default, and lets `armAutoSuggestTitle` start no LLM
+        // title job at all.
+        var titledEarly = false
+        if mayTitle, let title = match.resolvedTitle,
+           var row = store.recordings.first(where: { $0.id == id }),
+           row.title == baselineTitle {
+            row.title = title
+            store.update(row)
+            titledEarly = true
+            calendarTitledIDs.insert(id)
+        }
         let waitTimeout = transcriptWaitTimeout
         let task = Task { @MainActor [weak self] () -> Bool in
             defer {
+                self?.calendarTitledIDs.remove(id)
                 if !Task.isCancelled { self?.calendarTasks[id] = nil }
             }
-            guard let self else { return false }
+            guard let self else { return titledEarly }
             // Only the wait matters here; the text is not used. A recording
             // with no speech in it still happened during the meeting.
             _ = await self.awaitFinalTranscript(for: id, timeout: waitTimeout,
                                                 announceSpeakerWait: false)
-            if Task.isCancelled { return false }
+            if Task.isCancelled { return titledEarly }
             // The wait also returns on a timeout, with the row still in
-            // flight. Writing then is exactly what the wait is there to
-            // prevent, so the match is skipped instead.
+            // flight. Adding the event field then is exactly what the wait
+            // is there to prevent, so it is skipped instead.
             guard let settled = self.store.recordings.first(where: { $0.id == id }),
                   settled.status != .pending, settled.status != .running,
-                  !self.transcription.isAwaitingSpeakerFinalization(id),
-                  let match = calendar.match(for: settled) else { return false }
-            return self.applyCalendarMatch(match, to: id,
-                                           titleBaseline: mayTitle ? baselineTitle : nil)
+                  !self.transcription.isAwaitingSpeakerFinalization(id) else { return titledEarly }
+            // Already titled above: store the event only, so a rename the
+            // user made since is left alone.
+            let titled = self.applyCalendarMatch(
+                match, to: id,
+                titleBaseline: (mayTitle && !titledEarly) ? baselineTitle : nil)
+            return titled || titledEarly
         }
         calendarTasks[id] = task
         return task
@@ -335,6 +365,8 @@ final class PostRecordingCoordinator: ObservableObject {
                                      after calendarMatch: Task<Bool, Never>? = nil) {
         guard llm.isConfigured, llm.nameGenerationEnabled else { return }
         let id = recording.id
+        // The calendar already named it: no title job, no CLI call.
+        guard !calendarTitledIDs.contains(id) else { return }
         // The default, machine-generated title at add time. We only apply an
         // AI suggestion later if the recording STILL carries this title —
         // i.e. the user hasn't renamed it (in the sheet or the list).
