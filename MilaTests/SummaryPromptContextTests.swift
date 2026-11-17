@@ -157,6 +157,10 @@ final class SummaryPromptContextTests: XCTestCase {
         XCTAssertEqual(SummaryPromptContext.loadContextFile(at: tempDir.path), .missing)
     }
 
+    func test_zero_byte_regular_file_is_empty() throws {
+        XCTAssertEqual(SummaryPromptContext.loadContextFile(at: try write("")), .empty)
+    }
+
     func test_whitespace_only_file_is_empty() throws {
         XCTAssertEqual(SummaryPromptContext.loadContextFile(at: try write(" \n\t\n")), .empty)
     }

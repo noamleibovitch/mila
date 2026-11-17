@@ -142,7 +142,9 @@ enum SummaryPromptContext {
         }
         guard let file = try? FileHandle(forReadingFrom: url) else { return .unreadable }
         defer { try? file.close() }
-        guard let data = try? file.read(upToCount: maxContextFileBytes + 1) else { return .unreadable }
+        let data: Data
+        do { data = try file.read(upToCount: maxContextFileBytes + 1) ?? Data() }
+        catch { return .unreadable }
         // Re-checked on the bytes actually read: the size attribute is a
         // separate syscall, and a file can grow between the two.
         guard data.count <= maxContextFileBytes else { return .tooLarge }
