@@ -1178,7 +1178,7 @@ struct MilaApp: App {
                 // pipeline ON and is still capturing after the user switched
                 // the toggle OFF — it must finish with its model warm, and
                 // the Stop/finalize flags keep the model through the drain so
-                // its recovery pass and any batch job start warm.
+                // its immediate drain can finish with the warm model.
                 .onChange(of: liveAISettings.runsLivePipeline) { _, _ in
                     syncLocalModelRetention()
                 }
@@ -2522,11 +2522,9 @@ struct MilaApp: App {
             recordingActive: liveRecording,
             stoppingOrFinalizing: postStop,
             remoteActive: remoteTranscriptionSettings.isActive)
-        Task { @MainActor in
-            let wasRetaining = transcription.retainsLocalModel
-            await transcription.updateLocalModelRetention(retains)
-            if retains, !wasRetaining { prewarmDefaultModel() }
-        }
+        let wasRetaining = transcription.retainsLocalModel
+        transcription.updateLocalModelRetention(retains)
+        if retains, !wasRetaining { prewarmDefaultModel() }
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest

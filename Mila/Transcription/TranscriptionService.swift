@@ -297,13 +297,17 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Local model lifetime
 
-    /// Update the retention preference and release an already-warm model when
-    /// it turns off. Awaiting the release makes the transition observable
-    /// (and ordered with in-flight work) for the caller and for tests.
-    func updateLocalModelRetention(_ retains: Bool) async {
+    /// Apply the preference synchronously, so rapid UI changes cannot be
+    /// reordered by task scheduling. Cleanup re-checks the current preference;
+    /// a queued OFF cleanup cannot overwrite a later ON decision. Callers may
+    /// await the returned task when they need to observe cleanup finishing.
+    @discardableResult
+    func updateLocalModelRetention(_ retains: Bool) -> Task<Void, Never> {
         retainsLocalModel = retains
-        guard !retains else { return }
-        await releaseLocalModelIfIdle()
+        return Task { [weak self] in
+            guard let self else { return }
+            await self.releaseLocalModelIfIdle()
+        }
     }
 
     /// Run `body` as one local-model user. The retain is taken before any
@@ -311,6 +315,12 @@ final class TranscriptionService: ObservableObject {
     /// never land between this body's `loadIfNeeded` and its `transcribe`.
     private func withLocalModelUse<T>(_ body: () async throws -> T) async rethrows -> T {
         localModelUsers += 1
+        // Admission waits for an in-flight release to FINISH, rather than
+        // assuming the engine executor processes independent calls FIFO.
+        // Counting this user first prevents another cleanup from overtaking it.
+        while isReleasingLocalModel {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
         do {
             let value = try await body()
             await endLocalModelUse()
@@ -348,11 +358,9 @@ final class TranscriptionService: ObservableObject {
     /// at any time; a no-op while any local user, queued job, live-retention
     /// request or remote-backend switch still needs the engine.
     ///
-    /// The engine is an actor, and the unload request is enqueued before this
-    /// method suspends, so a user that starts while the unload is in flight
-    /// always enqueues its `loadIfNeeded` AFTER the unload and gets a fresh
-    /// context. A user that already began is counted and keeps the guard
-    /// closed.
+    /// New users join the release barrier before touching the engine. Users
+    /// that already began are counted and keep this guard closed, so safety
+    /// does not depend on actor inbox ordering or a non-suspending unload.
     private func releaseLocalModelIfIdle() async {
         // Never enqueue a second unload that could straddle a fresh load.
         // Wait for the running one, then re-evaluate: a new user may have
@@ -1222,7 +1230,7 @@ final class TranscriptionService: ObservableObject {
         // The queue is drained and no job owns the engine. Hand a batch-only
         // session's weights back now; with live retention on this is a no-op.
         // `worker` clears first so an enqueue that lands during the unload
-        // starts a fresh worker (whose load is enqueued after our unload).
+        // starts a fresh worker, which joins the release barrier before loading.
         worker = nil
         await releaseLocalModelIfIdle()
     }

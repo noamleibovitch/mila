@@ -54,7 +54,10 @@ final class ModelLifecycleTests: XCTestCase {
 
     override func tearDown() async throws {
         // Never leave a gated transcribe holding a task into teardown.
-        if let stub = stub { await stub.openTranscribeGate(count: 10_000) }
+        if let stub = stub {
+            await stub.openUnloadGate()
+            await stub.openTranscribeGate(count: 10_000)
+        }
         if let root = root { try? FileManager.default.removeItem(at: root) }
         try await super.tearDown()
     }
@@ -214,7 +217,7 @@ final class ModelLifecycleTests: XCTestCase {
         var unloads = await stub.unloadCount
         XCTAssertEqual(unloads, 0)
 
-        await service.updateLocalModelRetention(false)
+        await service.updateLocalModelRetention(false).value
         unloads = await stub.unloadCount
         let loaded = await stub.isModelLoaded
         XCTAssertEqual(unloads, 1)
@@ -234,7 +237,7 @@ final class ModelLifecycleTests: XCTestCase {
         let oneShot = Task { await svc.transcribeOnce(samples: samples, language: "en") }
         await stub.waitUntilTranscribeEntered(baseline + 1)
 
-        await service.updateLocalModelRetention(false)
+        await service.updateLocalModelRetention(false).value
         var unloads = await stub.unloadCount
         var loaded = await stub.isModelLoaded
         XCTAssertEqual(unloads, 0, "a release must not land under an in-flight transcribe")
@@ -280,6 +283,69 @@ final class ModelLifecycleTests: XCTestCase {
         loaded = await stub.isModelLoaded
         XCTAssertEqual(unloads, 1)
         XCTAssertFalse(loaded)
+    }
+
+    func test_newUseWaitsForAnUnloadingModelBeforeLoading() async throws {
+        service.retainsLocalModel = true
+        _ = await service.transcribeOnce(samples: noisySamples, language: "en")
+        await stub.closeUnloadGate()
+        let firstRelease = service.updateLocalModelRetention(false)
+        let deadline = Date().addingTimeInterval(10)
+        while await stub.unloadEnteredCount == 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let entered = await stub.unloadEnteredCount
+        XCTAssertEqual(entered, 1, "setup must hold an actual unload in flight")
+        let baselineRequests = await stub.loadRequestCount
+        let svc = service!
+        let samples = noisySamples
+        let started = expectation(description: "new user started during unload")
+        let oneShot = Task {
+            started.fulfill()
+            return await svc.transcribeOnce(samples: samples, language: "en")
+        }
+        // A second cleanup caller must also join, rather than enqueueing an
+        // unload that can overtake this new user's load/transcribe pair.
+        let secondRelease = service.updateLocalModelRetention(false)
+        await fulfillment(of: [started], timeout: 10)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let requestsDuringRelease = await stub.loadRequestCount
+        XCTAssertEqual(requestsDuringRelease, baselineRequests,
+                       "no load may enter an engine whose unload is suspended")
+
+        await stub.openUnloadGate()
+        await firstRelease.value
+        await secondRelease.value
+        let text = await oneShot.value
+        XCTAssertEqual(text, "stub")
+        let loaded = await stub.isModelLoaded
+        let unloads = await stub.unloadCount
+        XCTAssertFalse(loaded)
+        XCTAssertEqual(unloads, 2, "only the original and the new user's final release")
+    }
+
+    func test_rapidRetentionChangesKeepTheLatestDecision() async {
+        service.retainsLocalModel = true
+        _ = await service.transcribeOnce(samples: noisySamples, language: "en")
+        // Both changes happen synchronously before either cleanup task runs.
+        // OFF's cleanup must consult the latest ON preference, not replay OFF.
+        let off = service.updateLocalModelRetention(false)
+        let on = service.updateLocalModelRetention(true)
+        XCTAssertTrue(service.retainsLocalModel)
+        await off.value
+        await on.value
+        let loaded = await stub.isModelLoaded
+        let unloads = await stub.unloadCount
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(unloads, 0)
+
+        let nextOn = service.updateLocalModelRetention(true)
+        let finalOff = service.updateLocalModelRetention(false)
+        XCTAssertFalse(service.retainsLocalModel)
+        await nextOn.value
+        await finalOff.value
+        let finalLoaded = await stub.isModelLoaded
+        XCTAssertFalse(finalLoaded)
     }
 
     // MARK: - Failure and cancellation

@@ -58,6 +58,9 @@ actor StubWhisperEngine: TranscribingEngine {
     /// Lets a test hold `transcribe` calls at a known point. Used to prove
     /// that an idle model release waits for in-flight work and cannot land
     /// between a load and its transcribe.
+    private var unloadGateClosed = false
+    private var unloadGateWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var unloadEnteredCount = 0
     private var transcribeGateClosed = false
     private var transcribeGateWaiters: [CheckedContinuation<Void, Never>] = []
     private var transcribeEntryWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
@@ -145,6 +148,10 @@ actor StubWhisperEngine: TranscribingEngine {
     func unload() async {
         guard isModelLoaded else { return }
         unloadCount += 1
+        unloadEnteredCount += 1
+        if unloadGateClosed {
+            await withCheckedContinuation { unloadGateWaiters.append($0) }
+        }
         isModelLoaded = false
     }
 
@@ -163,6 +170,15 @@ actor StubWhisperEngine: TranscribingEngine {
     func setLoadDelay(_ d: Double) { loadDelay = d }
     func setLoadError(_ e: Error?) { loadError = e }
     func setLoadPreparationStatus(_ s: String?) { loadPreparationStatus = s }
+
+    func closeUnloadGate() { unloadGateClosed = true }
+
+    func openUnloadGate() {
+        unloadGateClosed = false
+        let waiters = unloadGateWaiters
+        unloadGateWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 
     /// Hold every subsequent `transcribe` at the gate until `openTranscribeGate`.
     func closeTranscribeGate() {
