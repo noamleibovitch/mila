@@ -244,6 +244,96 @@ final class MeetingAutoRecordingTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
         XCTAssertEqual(recorder.stops, 0)
     }
+    // MARK: - Stop when the meeting ends
+
+    /// A recording started by hand (or from the Ask prompt) after the meeting began.
+    private func startManuallyDuringMeeting() -> URL {
+        detector.meetingStarted.send(zoom)
+        let url = URL(fileURLWithPath: "/tmp/manual-\(UUID()).wav")
+        recorder.meetingRecordingURL = url
+        recorder.changes.send()
+        return url
+    }
+    func test_stop_when_meeting_ends_is_off_by_default() throws {
+        XCTAssertFalse(settings.stopWhenMeetingEnds)
+        _ = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
+    }
+    func test_stop_when_meeting_ends_counts_down_and_stops_a_manual_recording() async throws {
+        settings.stopWhenMeetingEnds = true
+        _ = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        let prompt = try XCTUnwrap(coordinator.pending)
+        XCTAssertEqual(prompt.kind, .stop)
+        XCTAssertTrue(prompt.automatic)
+        XCTAssertEqual(recorder.stops, 0, "A countdown must precede the stop")
+        coordinator.performPrompt(id: prompt.id)
+        coordinator.performPrompt(id: prompt.id)
+        await settle { self.recorder.stops == 1 }
+        XCTAssertNil(recorder.meetingRecordingURL)
+    }
+    func test_stop_when_meeting_ends_spares_a_recording_that_predates_the_meeting() throws {
+        settings.stopWhenMeetingEnds = true
+        recorder.meetingRecordingURL = URL(fileURLWithPath: "/tmp/earlier.wav")
+        detector.meetingStarted.send(zoom)
+        detector.meetingEnded.send(zoom)
+        XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
+        XCTAssertEqual(recorder.stops, 0)
+    }
+    func test_stop_when_meeting_ends_waits_for_the_other_call() throws {
+        settings.stopWhenMeetingEnds = true
+        _ = startManuallyDuringMeeting()
+        detector.meetingStarted.send(other)
+        detector.meetingEnded.send(zoom)
+        XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic)
+    }
+    func test_keep_recording_cancels_stop_when_meeting_ends() throws {
+        settings.stopWhenMeetingEnds = true
+        let url = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        let id = try XCTUnwrap(coordinator.pending).id
+        coordinator.cancelPrompt(id: id)
+        coordinator.performPrompt(id: id)
+        XCTAssertEqual(recorder.meetingRecordingURL, url)
+        XCTAssertEqual(recorder.stops, 0)
+    }
+    func test_turning_stop_when_meeting_ends_off_revokes_the_countdown() async throws {
+        settings.stopWhenMeetingEnds = true
+        let url = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        let id = try XCTUnwrap(coordinator.pending).id
+        settings.stopWhenMeetingEnds = false
+        coordinator.performPrompt(id: id)
+        await settle { self.coordinator.pending == nil }
+        XCTAssertEqual(recorder.meetingRecordingURL, url)
+        XCTAssertEqual(recorder.stops, 0)
+    }
+    func test_rejoin_cancels_stop_when_meeting_ends() throws {
+        settings.stopWhenMeetingEnds = true
+        let url = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        let id = try XCTUnwrap(coordinator.pending).id
+        detector.meetingStarted.send(zoom)
+        coordinator.performPrompt(id: id)
+        XCTAssertEqual(recorder.meetingRecordingURL, url)
+        XCTAssertEqual(recorder.stops, 0)
+        detector.meetingEnded.send(zoom)
+        XCTAssertFalse(try XCTUnwrap(coordinator.pending).automatic,
+                       "The recording predates the rejoined call")
+    }
+    func test_changing_an_app_mode_keeps_the_stop_when_meeting_ends_countdown() throws {
+        settings.stopWhenMeetingEnds = true
+        _ = startManuallyDuringMeeting()
+        detector.meetingEnded.send(zoom)
+        let id = try XCTUnwrap(coordinator.pending).id
+        settings.setMode(.auto, forBundleID: other.bundleID)
+        XCTAssertEqual(coordinator.pending?.id, id)
+    }
+    func test_stop_when_meeting_ends_persists() {
+        settings.stopWhenMeetingEnds = true
+        XCTAssertTrue(MeetingDetectionSettings(defaults: defaults).stopWhenMeetingEnds)
+    }
     func test_keep_recording_cancels_automatic_stop() async throws {
         let url = try await startAuto()
         detector.meetingEnded.send(zoom)

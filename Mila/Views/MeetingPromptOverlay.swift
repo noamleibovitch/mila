@@ -73,6 +73,9 @@ final class MeetingPromptCoordinator: ObservableObject {
         let meetingID: UUID?
         let recordingURL: URL?
         var startUnavailable = false
+        /// An automatic stop authorised by `stopWhenMeetingEnds` rather than
+        /// by the app's `Auto` mode owning the recording.
+        var stopsWithMeeting = false
     }
     private struct Ownership {
         let appID: String
@@ -90,6 +93,9 @@ final class MeetingPromptCoordinator: ObservableObject {
     private var subscriptions: Set<AnyCancellable> = []
     private var running = false
     private var meetings: [String: UUID] = [:]
+    /// The recording already running when an app's meeting began, if any. It
+    /// was not made for that meeting, so `stopWhenMeetingEnds` leaves it alone.
+    private var recordingsBeforeMeeting: [String: URL] = [:]
 
     /// Declines survive detector blips for this app/meeting identity. A confirmed
     /// end, lifecycle reset, or fresh opt-in retires them.
@@ -151,6 +157,7 @@ final class MeetingPromptCoordinator: ObservableObject {
             self.invalidatePendingActions()
             self.owner = nil
             self.meetings.removeAll()
+            self.recordingsBeforeMeeting.removeAll()
             self.declinedStarts.removeAll()
         }.store(in: &subscriptions)
         settings.$autoStartBundleIDs.sink { [weak self] ids in
@@ -196,6 +203,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         subscriptions.removeAll()
         invalidatePendingActions()
         meetings.removeAll()
+        recordingsBeforeMeeting.removeAll()
         declinedStarts.removeAll()
         owner = nil
         if pollsDetector { detector.stop() }
@@ -217,6 +225,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         guard allowed(prompt.app.bundleID), let url = prompt.recordingURL,
               actions.meetingRecordingURL == url else { return false }
         if !prompt.automatic { return true }
+        if prompt.stopsWithMeeting { return settings.stopWhenMeetingEnds && meetings.isEmpty }
         return settings.mode(forBundleID: prompt.app.bundleID) == .auto
             && meetings.isEmpty && owner?.appID == prompt.app.bundleID
             && owner?.recordingURL == url
@@ -228,6 +237,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         // the identity until the detector confirms that this meeting ended.
         if meetings[app.bundleID] == nil {
             meetings[app.bundleID] = UUID()
+            recordingsBeforeMeeting[app.bundleID] = actions.meetingRecordingURL
             // A rejoined call is a new meeting; the previous recording is
             // now controlled explicitly, even when it still has the same URL.
             if owner?.appID == app.bundleID { owner = nil }
@@ -252,6 +262,7 @@ final class MeetingPromptCoordinator: ObservableObject {
 
     private func meetingEnded(_ app: MeetingDetector.App) {
         let endedMeetingID = meetings.removeValue(forKey: app.bundleID)
+        let recordingBeforeMeeting = recordingsBeforeMeeting.removeValue(forKey: app.bundleID)
         // The generation is over: retire its decline so a genuine rejoin (which
         // mints a fresh UUID anyway) and the bounded set both stay clean.
         if let endedMeetingID {
@@ -260,11 +271,15 @@ final class MeetingPromptCoordinator: ObservableObject {
         if pending?.kind == .start, pending?.app.bundleID == app.bundleID { dismissPrompt() }
         if starting?.app.bundleID == app.bundleID { cancelStarting() }
         guard allowed(app.bundleID), pending == nil, let url = actions.meetingRecordingURL else { return }
-        let automatic = settings.mode(forBundleID: app.bundleID) == .auto
+        let owned = settings.mode(forBundleID: app.bundleID) == .auto
             && owner?.appID == app.bundleID && owner?.meetingID == endedMeetingID
             && owner?.recordingURL == url && meetings.isEmpty
-        present(Prompt(app: app, kind: .stop, automatic: automatic,
-                       meetingID: nil, recordingURL: url))
+        // The opt-in covers a recording that began during this meeting however
+        // it was started; one that predates the meeting was made for something else.
+        let stopsWithMeeting = !owned && settings.stopWhenMeetingEnds && endedMeetingID != nil
+            && recordingBeforeMeeting != url && meetings.isEmpty
+        present(Prompt(app: app, kind: .stop, automatic: owned || stopsWithMeeting,
+                       meetingID: nil, recordingURL: url, stopsWithMeeting: stopsWithMeeting))
     }
 
     private func recordingChanged() {
@@ -276,7 +291,8 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     private func revokeAutomation(except allowedIDs: Set<String>) {
-        if let pending, pending.automatic, !allowedIDs.contains(pending.app.bundleID) { dismissPrompt() }
+        if let pending, pending.automatic, !pending.stopsWithMeeting,
+           !allowedIDs.contains(pending.app.bundleID) { dismissPrompt() }
         if let starting, starting.automatic, !allowedIDs.contains(starting.app.bundleID) { cancelStarting() }
         if let owner, !allowedIDs.contains(owner.appID) { self.owner = nil }
     }
@@ -286,7 +302,8 @@ final class MeetingPromptCoordinator: ObservableObject {
             self.owner = nil // revocation does not stop an already-active recording
         }
         if let pending, !allowed(pending.app.bundleID)
-            || (pending.automatic && settings.mode(forBundleID: pending.app.bundleID) != .auto) {
+            || (pending.automatic && (pending.stopsWithMeeting ? !settings.stopWhenMeetingEnds
+                : settings.mode(forBundleID: pending.app.bundleID) != .auto)) {
             dismissPrompt()
         }
         if let starting, !validStart(starting) { cancelStarting() }
@@ -294,6 +311,7 @@ final class MeetingPromptCoordinator: ObservableObject {
             if pollsDetector { detector.start() }
         } else {
             meetings.removeAll()
+            recordingsBeforeMeeting.removeAll()
             declinedStarts.removeAll()
             if pollsDetector { detector.stop() }
         }
