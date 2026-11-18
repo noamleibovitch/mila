@@ -62,6 +62,9 @@ struct StorageSettingsTab: View {
                 // transcripts, one toggle wide until enabled, parked here
                 // instead of a tab of its own.
                 MCPAccessSettingsSection()
+                // And the generic one: hand each finished recording to a
+                // command of the user's own. Off by default, one toggle wide.
+                PostRecordingCommandSettingsSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }

@@ -15,6 +15,12 @@ running through `whisper.cpp` (GPU via Metal).
 - **Record system audio** from a single app (Zoom, Google Meet in Chrome,
   Slack, etc.) via `ScreenCaptureKit` — no virtual audio device required.
 - **Record meetings** = mic + system audio mixed into one mono 16 kHz WAV file.
+- **Keep recording from the menu bar** — closing the main window (X) hides it
+  rather than stopping Mila. The Mila icon in the menu bar shows the current
+  state (Recording, Recording Paused, Processing, and so on), and offers
+  Start/Stop, **Open Mila**, **Settings…**, and **Quit Mila**. The Dock icon and
+  Cmd+Q behave as before; settings or quitting are never blocked by the
+  background-running explanation.
 - **Dictate in two languages** with separate global hotkeys:
     - `⌘2` — English dictation (OpenAI `large-v3-turbo`)
     - `⌘3` — Hebrew dictation (ivrit.ai `large-v3`)

@@ -68,6 +68,24 @@ final class RecordingStorageSettingsTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "recordings.autoSave"), "Other suites stay independent")
     }
 
+    func test_batch_UI_defaults_require_all_flags_and_seed_only_the_UUID_suite() throws {
+        let id = UUID()
+        let suiteFlag = "--ui-test-auto-save-suite=\(id.uuidString)"
+        let flags = ["--uitests", "--ui-test-clean-store", "--ui-test-batch-recording", suiteFlag]
+        defer { UserDefaults().removePersistentDomain(forName: "Mila.AutoSaveUITests.\(id.uuidString)") }
+        for missing in flags {
+            XCTAssertNil(MilaApp.prepareBatchUITestDefaults(arguments: flags.filter { $0 != missing }))
+        }
+        XCTAssertNil(MilaApp.prepareBatchUITestDefaults(arguments:
+            Array(flags.dropLast()) + ["--ui-test-auto-save-suite=NSGlobalDomain"]))
+        let fixture = try XCTUnwrap(MilaApp.prepareBatchUITestDefaults(arguments: flags))
+        XCTAssertEqual(fixture.object(forKey: "liveAI.transcribeWhileRecording") as? Bool, false)
+        XCTAssertEqual(fixture.object(forKey: "liveAI.enabled") as? Bool, false)
+        XCTAssertEqual(fixture.object(forKey: "liveAI.backgroundMode") as? Bool, false)
+        XCTAssertTrue(RecordingStorageSettings(defaults: fixture).autoSaveRecordings)
+        XCTAssertNil(defaults.object(forKey: "liveAI.transcribeWhileRecording"))
+    }
+
     func test_settings_starts_with_no_custom_directory_by_default() {
         let settings = RecordingStorageSettings(defaults: defaults)
         XCTAssertNil(settings.customDirectory)

@@ -160,6 +160,59 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         }
     }
 
+    /// Mirror of the app's `CalendarEventMatch`: the calendar event a
+    /// recording overlapped, captured when the recording finished (the user
+    /// has to turn the calendar match on in the app; most rows have none).
+    /// A snapshot, not a live link — it is not updated if the event changes.
+    public struct CalendarEvent: Codable, Equatable, Sendable {
+        public struct Attendee: Codable, Equatable, Sendable {
+            public var name: String
+            public var email: String?
+
+            public init(name: String, email: String? = nil) {
+                self.name = name
+                self.email = email
+            }
+
+            private enum CodingKeys: String, CodingKey { case name, email }
+
+            public init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+                email = try c.decodeIfPresent(String.self, forKey: .email)
+            }
+        }
+
+        public var title: String
+        public var start: Date
+        public var end: Date
+        public var calendarName: String
+        /// Human invitees only; the calendar's owner first when listed.
+        public var attendees: [Attendee]
+
+        public init(title: String, start: Date, end: Date, calendarName: String = "",
+                    attendees: [Attendee] = []) {
+            self.title = title
+            self.start = start
+            self.end = end
+            self.calendarName = calendarName
+            self.attendees = attendees
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case title, start, end, calendarName, attendees
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+            start = try c.decode(Date.self, forKey: .start)
+            end = try c.decode(Date.self, forKey: .end)
+            calendarName = try c.decodeIfPresent(String.self, forKey: .calendarName) ?? ""
+            attendees = try c.decodeIfPresent([Attendee].self, forKey: .attendees) ?? []
+        }
+    }
+
     public var id: UUID
     public var title: String
     public var createdAt: Date
@@ -213,6 +266,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// See `UntranscribedSpan`. Nil when the transcript covers the whole
     /// recording (the app omits the key then).
     public var untranscribedSpans: [UntranscribedSpan]?
+    /// See `CalendarEvent`. Nil when the recording was not matched to one.
+    public var calendarEvent: CalendarEvent?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
@@ -270,7 +325,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
              status, language, modelName, segments, deletedAt, folder, appName,
              summary, actionItems, speakerNames, appBundleID, summaryLanguage,
              sharedBy, sharedAt, transcriptionDeferredAt, retranscriptionPriorState,
-             untranscribedSpans
+             untranscribedSpans, calendarEvent
         case legacyFullText = "fullText"
     }
 
@@ -303,6 +358,9 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                                                            forKey: .retranscriptionPriorState)
         untranscribedSpans = try? c.decodeIfPresent([UntranscribedSpan].self,
                                                     forKey: .untranscribedSpans)
+        // `try?` for the same reason: an event this helper cannot read (no
+        // dates) is dropped, the row is kept.
+        calendarEvent = try? c.decodeIfPresent(CalendarEvent.self, forKey: .calendarEvent)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -317,6 +375,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 transcriptionDeferredAt: Date? = nil,
                 retranscriptionPriorState: RetranscriptionPriorState? = nil,
                 untranscribedSpans: [UntranscribedSpan]? = nil,
+                calendarEvent: CalendarEvent? = nil,
                 legacyFullText: String? = nil) {
         self.id = id
         self.title = title
@@ -341,6 +400,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.transcriptionDeferredAt = transcriptionDeferredAt
         self.retranscriptionPriorState = retranscriptionPriorState
         self.untranscribedSpans = untranscribedSpans
+        self.calendarEvent = calendarEvent
         self.legacyFullText = legacyFullText
     }
 }

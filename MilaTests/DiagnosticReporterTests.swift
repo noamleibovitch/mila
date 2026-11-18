@@ -34,6 +34,52 @@ final class DiagnosticReporterTests: XCTestCase {
         try? FileManager.default.removeItem(at: zip.deletingLastPathComponent())
     }
 
+    /// A matched recording carries a calendar event title and its guests'
+    /// names and addresses. None of it belongs in a bundle the user mails to
+    /// support — checked across every text file in the zip, not just
+    /// recordings.json, so a later writer cannot leak it either.
+    func test_buildReport_carries_no_calendar_event_data() async throws {
+        let eventTitle = "Zephyr acquisition steering sync"
+        let attendeeName = "Quillon Marrowby"
+        let attendeeEmail = "quillon.marrowby@zephyr-example.test"
+        let calendarName = "Zephyr deal room calendar"
+        store.add(Recording(
+            title: "Matched", duration: 1800, source: .meeting, audioFileName: "matched.wav",
+            calendarEvent: CalendarEventMatch(
+                title: eventTitle,
+                start: Date(timeIntervalSince1970: 1_700_000_000),
+                end: Date(timeIntervalSince1970: 1_700_001_800),
+                calendarName: calendarName,
+                attendees: [.init(name: attendeeName, email: attendeeEmail)])))
+        XCTAssertNotNil(store.recordings.first?.calendarEvent, "precondition: the row carries the event")
+
+        let zip = try await DiagnosticReporter.buildReport(store: store, diarization: nil)
+        defer { try? FileManager.default.removeItem(at: zip.deletingLastPathComponent()) }
+        let unzipped = try unzip(zip)
+        defer { try? FileManager.default.removeItem(at: unzipped) }
+
+        let recordingsJSON = try locate(named: "recordings.json", under: unzipped)
+        let reported = try String(contentsOf: recordingsJSON, encoding: .utf8)
+        XCTAssertTrue(reported.contains("\"segment_count\""),
+                      "precondition: the recording was reported")
+        // Not even the shape: a key would say which recordings were matched.
+        for key in ["calendarEvent", "calendar_event", "attendees"] {
+            XCTAssertFalse(reported.contains(key), "recordings.json must not contain \(key)")
+        }
+
+        var filesRead = 0
+        let files = FileManager.default.enumerator(at: unzipped, includingPropertiesForKeys: nil)
+        while let url = files?.nextObject() as? URL {
+            guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            filesRead += 1
+            for secret in [eventTitle, attendeeName, attendeeEmail, calendarName] {
+                XCTAssertFalse(body.contains(secret),
+                               "\(url.lastPathComponent) must not contain \(secret)")
+            }
+        }
+        XCTAssertGreaterThan(filesRead, 0)
+    }
+
     func test_buildReport_excludes_transcript_text_from_recordings_json() async throws {
         // Important privacy check: even though Recording.fullText might
         // contain whatever the user said, the report's recordings.json
@@ -151,6 +197,16 @@ final class DiagnosticReporterTests: XCTestCase {
     /// by key name; prompts are reported as a length — people paste meeting
     /// agendas into them; the Obsidian written-index is a count, because its
     /// vault paths are derived from recording titles.
+    /// The summary context file is a path the user chose. A path names
+    /// folders and projects, so the report says only whether one is set.
+    func test_scopedSettings_reports_the_summary_context_file_as_set_or_not() {
+        let set = DiagnosticReporter.scopedSettings(
+            from: ["llm.summary.contextFile": "/Users/dana/Clients/Acme layoffs/context.md"])
+        XCTAssertEqual(set["llm.summary.contextFile"] as? String, "<set>")
+        let unset = DiagnosticReporter.scopedSettings(from: ["llm.summary.contextFile": ""])
+        XCTAssertEqual(unset["llm.summary.contextFile"] as? String, "<not set>")
+    }
+
     func test_scopedSettings_redacts_credentials_and_reports_prompts_as_lengths() throws {
         let agenda = "Q3 planning: budget cuts in the Berlin office, layoffs to be discussed Thursday"
         let defaults: [String: Any] = [

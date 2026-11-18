@@ -221,6 +221,50 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertNil(byTitle["My memo"]?["shared_by"])
     }
 
+    /// A recording the app matched to a calendar event says which, on both
+    /// the list row and the transcript; an unmatched one carries no key.
+    func test_calendar_event_is_exposed_only_on_matched_recordings() throws {
+        var matched = meeting("Weekly sync", daysAgo: 1)
+        matched.calendarEvent = .init(
+            title: "Weekly sync",
+            start: Date(timeIntervalSince1970: 1_700_000_000),
+            end: Date(timeIntervalSince1970: 1_700_001_800),
+            calendarName: "Work",
+            attendees: [.init(name: "Dana", email: "dana@example.com"), .init(name: "Uri")])
+        try seedStore([meeting("My memo", daysAgo: 0), matched])
+
+        let rows = try XCTUnwrap(try call("list_recordings")["recordings"] as? [[String: Any]])
+        let byTitle = Dictionary(uniqueKeysWithValues: rows.map { ($0["title"] as! String, $0) })
+        XCTAssertNil(byTitle["My memo"]?["calendar_event"])
+        let listed = try XCTUnwrap(byTitle["Weekly sync"]?["calendar_event"] as? [String: Any])
+        XCTAssertEqual(listed["title"] as? String, "Weekly sync")
+        XCTAssertEqual(listed["start"] as? String, "2023-11-14T22:13:20Z")
+        XCTAssertEqual(listed["end"] as? String, "2023-11-14T22:43:20Z")
+        XCTAssertEqual(listed["calendar"] as? String, "Work")
+        let attendees = try XCTUnwrap(listed["attendees"] as? [[String: Any]])
+        XCTAssertEqual(attendees.map { $0["name"] as? String }, ["Dana", "Uri"])
+        XCTAssertEqual(attendees[0]["email"] as? String, "dana@example.com")
+        XCTAssertNil(attendees[1]["email"], "no address, no key")
+
+        let transcript = try call("get_transcript", ["id": matched.id.uuidString])
+        let fetched = try XCTUnwrap(transcript["calendar_event"] as? [String: Any])
+        XCTAssertEqual(fetched["title"] as? String, "Weekly sync")
+        XCTAssertNil(try call("get_transcript", ["id": rows.first { $0["title"] as? String == "My memo" }?["id"] as? String ?? ""])["calendar_event"])
+    }
+
+    /// A stored event this helper cannot read costs the event, not the store.
+    func test_unreadable_calendar_event_does_not_fail_the_store() throws {
+        let json = """
+        [{"id":"\(UUID().uuidString)","title":"Odd","createdAt":"2023-01-01T00:00:00Z",
+        "duration":1,"source":"meeting","audioFileName":"odd.wav","status":"completed",
+        "language":"en","segments":[],"calendarEvent":{"title":"No dates"}}]
+        """
+        try Data(json.utf8).write(to: root.appendingPathComponent("recordings.json"))
+        let rows = try XCTUnwrap(try call("list_recordings")["recordings"] as? [[String: Any]])
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertNil(rows[0]["calendar_event"])
+    }
+
     /// The tool-layer half of the trashed-recording leak: a client holding a
     /// retained UUID must get a not-found, not the transcript.
     /// (CodeRabbit on #183, CWE-200.)

@@ -498,6 +498,11 @@ final class RecordingStore: ObservableObject {
     @discardableResult
     func update(_ recording: Recording) -> Bool {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
+        // A calendar match can arrive while capture/transcription holds a
+        // stop-time copy. A missing snapshot on that copy is not a request
+        // to erase an independently persisted calendar match.
+        var recording = recording
+        if recording.calendarEvent == nil { recording.calendarEvent = recordings[idx].calendarEvent }
         recordings[idx] = recording
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)

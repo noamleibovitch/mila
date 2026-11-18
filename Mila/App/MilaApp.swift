@@ -365,6 +365,11 @@ struct MilaApp: App {
     /// installed; a second instance would mean two views of one install.
     @StateObject private var claudeSetupSettings: ClaudeSetupSettings
     @StateObject private var obsidianExporter: ObsidianExporter
+    /// The opt-in "run a command after each recording" hook and its runner.
+    /// Like the exporter, the runner is a StateObject so it stays alive — the
+    /// completion hooks capture it weakly.
+    @StateObject private var postRecordingCommandSettings: PostRecordingCommandSettings
+    @StateObject private var postRecordingCommandRunner: PostRecordingCommandRunner
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
     /// Persistent, app-wide list of speaker names — the pick-list behind
@@ -373,6 +378,7 @@ struct MilaApp: App {
     /// Settings → Speakers → "Your name" (issue #348). Read by the speaker
     /// name suggester; one publish per edit, never per audio buffer.
     @StateObject private var speakerIdentitySettings: SpeakerIdentitySettings
+    @StateObject private var calendarSettings: CalendarSettings
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     /// Imports double-clicked `.milashare` bundles — a recording another Mila
@@ -408,6 +414,21 @@ struct MilaApp: App {
         return UserDefaults(suiteName: "Mila.AutoSaveUITests.\(id.uuidString)")!
     }
 
+    /// Seed the synthetic batch fixture INSIDE the target's preference home.
+    /// All three test flags plus a UUID-owned suite are required; a normal
+    /// launch never enters this path or changes the user's preferences.
+    static func prepareBatchUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard arguments.contains("--uitests"),
+              arguments.contains("--ui-test-clean-store"),
+              arguments.contains("--ui-test-batch-recording"),
+              let defaults = autoSaveUITestDefaults(arguments: arguments) else { return nil }
+        defaults.set(false, forKey: "liveAI.transcribeWhileRecording")
+        defaults.set(false, forKey: "liveAI.enabled")
+        defaults.set(false, forKey: "liveAI.backgroundMode")
+        defaults.set(true, forKey: "recordings.autoSave")
+        return defaults
+    }
+
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
@@ -420,7 +441,8 @@ struct MilaApp: App {
         // `--ui-test-auto-save-suite=<UUID>` redirects just this object at a
         // test-owned suite; anything malformed — or the flag absent — keeps
         // normal production behaviour (`.standard`).
-        let storage = RecordingStorageSettings(defaults: Self.autoSaveUITestDefaults() ?? .standard)
+        let fixtureDefaults = Self.prepareBatchUITestDefaults() ?? Self.autoSaveUITestDefaults()
+        let storage = RecordingStorageSettings(defaults: fixtureDefaults ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
         }
@@ -473,7 +495,12 @@ struct MilaApp: App {
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
         let llm = LLMSettings()
-        let coordinator = PostRecordingCoordinator(store: store, transcription: svc, llm: llm)
+        // Calendar match (off by default). Constructing this reads no
+        // calendar and raises no prompt: the EventKit store is created on
+        // first use, and access is requested only from the Settings toggle.
+        let calendar = CalendarSettings()
+        let coordinator = PostRecordingCoordinator(store: store, transcription: svc, llm: llm,
+                                                   calendar: CalendarEventLookup(settings: calendar))
         let actions = QuickActionsController(session: session,
                                              store: store,
                                              transcription: svc,
@@ -511,7 +538,11 @@ struct MilaApp: App {
                 performanceCoreCount: SystemCapabilities.live.performanceCoreCount
             )
             : .live
-        let liveAI = LiveAISettings(capabilities: liveAICapabilities, managed: managedSettings)
+        // The validated fixture suite supplies typed preferences. Launch
+        // arguments are strings, so `object(forKey:) as? Bool` would ignore
+        // an argument-domain "NO" and silently default live transcription ON.
+        let liveAI = LiveAISettings(defaults: fixtureDefaults ?? .standard,
+                                    capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
@@ -586,9 +617,11 @@ struct MilaApp: App {
         }
         let liveDiar = LiveSpeakerDiarizer()
         let liveSession = LiveAISession(llmSettings: llm, liveAISettings: liveAI)
+        let speakerIdentity = SpeakerIdentitySettings()
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
-                                             liveAISettings: liveAI)
+                                             liveAISettings: liveAI,
+                                             myName: { [speakerIdentity] in speakerIdentity.resolvedName })
         // Speaker-name SUGGESTIONS (issue #348): "Your name" for the one voice
         // on a mic-only recording, and names the transcript states, offered
         // for one-click accept. Runs once per fresh completion, after that
@@ -596,7 +629,6 @@ struct MilaApp: App {
         // `finalizeTail`, `suggestIfPending` in `onSummaryFinished`). Owned
         // by `actions` (strong, like its other late-bound collaborators);
         // every closure here holds it weakly.
-        let speakerIdentity = SpeakerIdentitySettings()
         let nameSuggester = SpeakerNameSuggester(store: store,
                                                  llmSettings: llm,
                                                  liveAISettings: liveAI,
@@ -641,15 +673,37 @@ struct MilaApp: App {
             NSWorkspace.shared.open(url)
         })
         let obsidian = ObsidianExporter(settings: obsidianSettings)
+        // The user's own post-recording command: one executable, run once per
+        // fresh recording when its summary state is final, with a JSON handoff
+        // describing the recording. Off by default. Sequenced exactly like the
+        // Obsidian export (`markPending` below and in `finalizeTail`).
+        let postCommandSettings = PostRecordingCommandSettings()
+        let postCommand = PostRecordingCommandRunner(store: store, settings: postCommandSettings)
+        postCommand.awaitRowSettled = { [weak coordinator] id in
+            await coordinator?.postCommandRowSettled(for: id)
+        }
+        postCommand.awaitSummarySettled = { [weak summarizer] id in
+            while summarizer?.isSummarizing(id) == true {
+                do { try await Task.sleep(nanoseconds: 20_000_000) }
+                catch { return }
+            }
+        }
+        postCommand.postStatus = { [weak coordinator] message, isError in
+            coordinator?.postStatus(message, isError: isError)
+        }
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
-        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester] rec in
+        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester, weak postCommand] rec in
             // First, and independent of Obsidian: a no-op unless a fresh
             // completion marked this recording (never for backfill).
             nameSuggester?.suggestIfPending(rec)
-            guard let obsidian, obsidian.isPending(rec.id) else { return }
-            obsidian.export(rec)
-            obsidian.clearPending(rec.id)
+            if let obsidian, obsidian.isPending(rec.id) {
+                obsidian.export(rec)
+                obsidian.clearPending(rec.id)
+            }
+            // After the export, so a command that works on the vault finds
+            // the note there. Same gate: a no-op unless marked pending.
+            postCommand?.runIfPending(rec)
         }
         // Wire the post-transcription summary hook. Fires for every
         // recording that the queue successfully completes — the
@@ -681,7 +735,7 @@ struct MilaApp: App {
         store.isTranscriptEditBlocked = { [weak svc] id in
             svc?.isAwaitingSpeakerFinalization(id) ?? false
         }
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester, weak postCommandSettings, weak postCommand] rec, wasRetranscription in
             // Speaker-name suggestions for this pass's (re-keyed) speakers,
             // once the summary attempt below settles. With no summarizer
             // there is no settle signal to wait for, so run them now rather
@@ -702,6 +756,7 @@ struct MilaApp: App {
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
             let obsidianOn = (obsidianSettings?.enabled == true) && (obsidianSettings?.vaultURL != nil)
+            postCommand?.markPendingIfCaptured(rec.id, enabled: postCommandSettings?.isReady == true)
             if wasRetranscription {
                 // `regenerate` bypasses the "already has a summary" gate by
                 // design (it's also the manual on-demand path), so it does
@@ -715,12 +770,19 @@ struct MilaApp: App {
                     // No summarizer hook here either, so settle the pending
                     // speaker-name suggestions now.
                     nameSuggester?.suggestIfPending(rec)
+                    postCommand?.runIfPending(rec)
                     return
                 }
                 if obsidianOn { obsidian?.markPending(rec.id) }
                 summarizer?.regenerate(rec)
             } else {
                 if obsidianOn { obsidian?.markPending(rec.id) }
+                // The post-recording command runs off the same hook. Marked
+                // on this branch only: unlike the note, which a re-export
+                // overwrites in place, the command's side effects are not
+                // Mila's to repeat, so a re-transcription does not re-run it.
+                // Captured recordings only: this hook also completes imported
+                // files, Voice Memos and recovered orphans.
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
@@ -963,6 +1025,10 @@ struct MilaApp: App {
         // Discard un-exports: the note can already be in the vault by the time
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
+        actions.postCommandSettings = postCommandSettings
+        actions.postCommandRunner = postCommand
+        // Discard stops the command too, even when the row is already gone.
+        coordinator.postCommandRunner = postCommand
         actions.liveSidecarWriter = sidecarWriter
         var meetingDefaults = UserDefaults.standard
         var meetingManagedSettings = managedSettings
@@ -1050,6 +1116,8 @@ struct MilaApp: App {
         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
+        _postRecordingCommandSettings = StateObject(wrappedValue: postCommandSettings)
+        _postRecordingCommandRunner = StateObject(wrappedValue: postCommand)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
@@ -1063,6 +1131,7 @@ struct MilaApp: App {
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: speakerDirectory)
         _speakerIdentitySettings = StateObject(wrappedValue: speakerIdentity)
+        _calendarSettings = StateObject(wrappedValue: calendar)
         _configImporter = StateObject(wrappedValue: configImporter)
         _shareImporter = StateObject(wrappedValue: shareImporter)
         _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
@@ -1072,6 +1141,20 @@ struct MilaApp: App {
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
+
+        // Seed the local-model retention BEFORE any `.task` can call
+        // `prewarm`. Live transcription needs the weights warm; a batch-only
+        // session must not load them at launch. A remote-backend user has no
+        // local model to keep either way. Later changes go through
+        // `syncLocalModelRetention()` (the `.onChange` modifiers in `body`),
+        // which releases a warm model when live transcription is switched
+        // off and re-warms when it is switched back on.
+        svc.retainsLocalModel = Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAI.runsLivePipeline,
+            recordingRunsLivePipeline: false,
+            recordingActive: false,
+            stoppingOrFinalizing: false,
+            remoteActive: remoteSettings.isActive)
 
         #if DEBUG
         // Hand every App-level object to the churn probe by property name,
@@ -1111,9 +1194,12 @@ struct MilaApp: App {
                 .of("mcpAccessSettings", mcpAccess),
                 .of("claudeSetupSettings", claudeSetup),
                 .of("obsidianExporter", obsidian),
+                .of("postRecordingCommandSettings", postCommandSettings),
+                .of("postRecordingCommandRunner", postCommand),
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
                 .of("speakerIdentitySettings", speakerIdentity),
+                .of("calendarSettings", calendar),
                 .of("configImporter", configImporter),
                 .of("shareImporter", shareImporter),
                 .of("liveSidecarWriter", sidecarWriter),
@@ -1128,7 +1214,7 @@ struct MilaApp: App {
         // this body when it publishes, and each evaluation re-diffs every
         // scene below — see `AppSceneChurnProbe` for why that is counted.
         let _ = AppSceneChurnProbe.noteBodyEvaluation()
-        WindowGroup("Mila") {
+        WindowGroup("Mila", id: "main") {
             ContentView()
                 .environmentObject(store)
                 .environmentObject(storageSettings)
@@ -1157,6 +1243,11 @@ struct MilaApp: App {
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .task { prewarmDefaultModel() }
+                // Observe the combined decision once: six separate modifiers
+                // push this large window expression past Swift's type-check limit.
+                .onChange(of: needsWarmLocalModel) { _, _ in
+                    syncLocalModelRetention()
+                }
                 .task { await diarizationSettings.runHealthCheck() }
                 .task { await diarizationSettings.runStartupCheckDepsIfNeeded() }
                 .task { await diarizationSettings.startAutoBootstrapIfNeeded() }
@@ -1176,6 +1267,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(speakerIdentitySettings)
+                .environmentObject(calendarSettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
@@ -1227,6 +1319,12 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(postRecordingCommandSettings)
+                .environmentObject(postRecordingCommandRunner)
+                // Register ONLY this window with the resident controller:
+                // X hides it (keeping the recording and view state alive)
+                // instead of destroying it. Settings/panels are untouched.
+                .background(MenuBarMainWindowBridge(controller: appDelegate.menuBarWindow))
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -1277,6 +1375,16 @@ struct MilaApp: App {
             }
         }
 
+        // Resident menu-bar control. A leaf scene: it observes the app
+        // delegate's model, never re-evaluating this App body on each state
+        // change (and never subscribing to progress/meters).
+        MenuBarExtra {
+            MenuBarMenuView(controller: appDelegate.menuBar)
+        } label: {
+            MenuBarStatusLabel(controller: appDelegate.menuBar)
+        }
+        .menuBarExtraStyle(.menu)
+
         Settings {
             SettingsView()
                 .environmentObject(store)
@@ -1297,6 +1405,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(speakerIdentitySettings)
+                .environmentObject(calendarSettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
@@ -1310,6 +1419,8 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                .environmentObject(postRecordingCommandSettings)
+                .environmentObject(postRecordingCommandRunner)
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
         // `SettingsView`; since #177 it is a resizable sidebar window whose
@@ -1355,11 +1466,20 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
+        appDelegate.postCommand = postRecordingCommandRunner
         // Route `.milaconfig` / `.milashare` opens through their importers,
         // and drain any that arrived during a cold launch (before this
         // wiring ran).
         appDelegate.configImporter = configImporter
         appDelegate.shareImporter = shareImporter
+        appDelegate.configureMenuBar(actions: actions,
+                                     transcription: transcription,
+                                     session: session,
+                                     postRecording: postRecording,
+                                     shareImporter: shareImporter,
+                                     configImporter: configImporter,
+                                     store: store,
+                                     updater: updater)
         appDelegate.flushBufferedOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
@@ -2441,7 +2561,52 @@ struct MilaApp: App {
         guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
+        // Batch-only mode (live transcription OFF) must not preload the
+        // model at launch. The first real transcription after Stop loads it.
+        guard liveAISettings.runsLivePipeline else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
+    }
+
+    /// Pure decision behind `syncLocalModelRetention`. Factored out so the
+    /// settings/session transition matrix is unit-testable without a running
+    /// app: the case that matters most is live transcription ON at record
+    /// start and switched OFF mid-recording — the recording must keep its warm
+    /// model until it stops and its drain finishes, then release it.
+    static func localModelRetentionRequired(
+        livePipelineEnabled: Bool,
+        recordingRunsLivePipeline: Bool,
+        recordingActive: Bool,
+        stoppingOrFinalizing: Bool,
+        remoteActive: Bool
+    ) -> Bool {
+        guard !remoteActive else { return false }
+        return livePipelineEnabled
+            || stoppingOrFinalizing
+            || (recordingRunsLivePipeline && recordingActive)
+    }
+
+    /// All inputs to residency participate in one observed decision. A live
+    /// recording keeps its snapshotted pipeline through Stop even when the
+    /// user changes the setting to OFF partway through the recording.
+    private var needsWarmLocalModel: Bool {
+        let liveRecording = session.state == .recording || session.state == .paused
+        let postStop = actions.isStoppingRecording || actions.isFinalizingRecording
+        return Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAISettings.runsLivePipeline,
+            recordingRunsLivePipeline: actions.recordingRunsLivePipeline,
+            recordingActive: liveRecording,
+            stoppingOrFinalizing: postStop,
+            remoteActive: remoteTranscriptionSettings.isActive)
+    }
+
+    /// Apply preference changes synchronously. Turning retention back on also
+    /// warms the model for live transcription; cleanup rechecks the latest
+    /// decision so a queued OFF cleanup cannot undo a subsequent ON change.
+    private func syncLocalModelRetention() {
+        let retains = needsWarmLocalModel
+        let wasRetaining = transcription.retainsLocalModel
+        transcription.updateLocalModelRetention(retains)
+        if retains, !wasRetaining { prewarmDefaultModel() }
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest
@@ -2527,6 +2692,19 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var actions: QuickActionsController?
     weak var configImporter: MilaConfigImporter?
     weak var shareImporter: RecordingShareImporter?
+    weak var postCommand: PostRecordingCommandRunner?
+
+    /// Resident window + menu-bar leaf. Both live for the app's lifetime with
+    /// the delegate, not with a window/menu that can close. Neither is an
+    /// App-level `@StateObject`, so their publishes never re-evaluate
+    /// `MilaApp.body`.
+    let menuBar = MenuBarController()
+    let menuBarWindow: MenuBarWindowController
+
+    override init() {
+        menuBarWindow = MenuBarWindowController(defaults: MenuBarDefaults.resolve())
+        super.init()
+    }
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
@@ -2589,6 +2767,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quit (Cmd+Q or the menu item) must never show the background
+        // explanation or hide a window on the way out.
+        menuBarWindow.beginTermination()
         if didShutDown { return .terminateNow }
         didShutDown = true
         Task { @MainActor [weak self] in
@@ -2598,7 +2779,22 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
+    /// Closing every window must not end the app: capture and background
+    /// transcription keep running behind the menu-bar icon. Explicit still,
+    /// even though macOS does not generally quit non-document apps.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    /// Dock click / `open` on the running app brings the SAME resident window
+    /// back (deminiaturizing first), rather than creating a second window.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        menuBarWindow.restoreMainWindow()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        postCommand?.cancelAll()
+        menuBarWindow.beginTermination()
         // Backstop: if `applicationShouldTerminate` was bypassed (e.g. a force
         // quit through the dock), we still get a chance to free the metal
         // context here. A second call is a no-op via `didShutDown`.
@@ -2606,6 +2802,138 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             didShutDown = true
             Task { @MainActor [weak self] in await self?.gracefulShutdown() }
         }
+    }
+
+    /// Wire the menu-bar leaf to the existing controllers. Idempotent — the
+    /// main window's `.onAppear` can run more than once.
+    func configureMenuBar(actions: QuickActionsController,
+                          transcription: TranscriptionService,
+                          session: RecordingSession,
+                          postRecording: PostRecordingCoordinator,
+                          shareImporter: RecordingShareImporter,
+                          configImporter: MilaConfigImporter,
+                          store: RecordingStore,
+                          updater: UpdaterViewModel) {
+        guard !menuBar.isConfigured else { return }
+        menuBarWindow.statusProvider = { [weak menuBar] in
+            menuBar?.currentStatus() ?? .ready
+        }
+
+        let runtime = MenuBarController.Runtime(
+            input: {
+                MenuBarStatusInput(
+                    activeJob: actions.activeJob,
+                    sessionState: session.state,
+                    isStoppingRecording: actions.isStoppingRecording,
+                    isCaptureStartInFlight: actions.captureStartInFlight,
+                    isPreparingModel: transcription.isPreparingModel,
+                    isImporting: shareImporter.isImporting
+                        || shareImporter.isStaging
+                        || Self.isFileImport(actions.activeJob),
+                    isTranscriptionBusy: Self.hasTranscriptionWork(transcription)
+                )
+            },
+            start: { microphone, appAudio in
+                await actions.toggleRecord(microphone: microphone, appAudio: appAudio)
+            },
+            stop: {
+                await actions.stopRecording()
+            },
+            startBegan: {
+                actions.isRecording || actions.isStartingRecording
+            },
+            blockingState: {
+                Self.hasBlockingUIState(actions: actions,
+                                        transcription: transcription,
+                                        postRecording: postRecording,
+                                        shareImporter: shareImporter,
+                                        configImporter: configImporter,
+                                        store: store,
+                                        updater: updater)
+            },
+            revealIfHidden: { [weak self] in
+                self?.menuBarWindow.revealIfHidden()
+            },
+            restoreMainWindow: { [weak self] in
+                self?.menuBarWindow.restoreMainWindow() ?? false
+            }
+        )
+        menuBar.configure(runtime: runtime,
+                          changes: [
+                              actions.objectWillChange.eraseToAnyPublisher(),
+                              session.objectWillChange.eraseToAnyPublisher(),
+                              postRecording.objectWillChange.eraseToAnyPublisher(),
+                              shareImporter.objectWillChange.eraseToAnyPublisher(),
+                              configImporter.objectWillChange.eraseToAnyPublisher(),
+                              store.objectWillChange.eraseToAnyPublisher(),
+                              updater.objectWillChange.eraseToAnyPublisher(),
+                              Self.menuBarTranscriptionChanges(transcription)
+                          ])
+    }
+
+    /// Menu-relevant transcription changes only. Deliberately excludes
+    /// `$progress`: the menu derives Processing from the deduplicated job
+    /// IDs/state below, and an `objectWillChange` subscription would wake it
+    /// at whisper's progress cadence.
+    static func menuBarTranscriptionChanges(_ service: TranscriptionService) -> AnyPublisher<Void, Never> {
+        let publishers: [AnyPublisher<Void, Never>] = [
+            service.$activeRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$pendingIDs.map { _ in () }.eraseToAnyPublisher(),
+            service.$stoppingRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$diarizingRecordingID.map { _ in () }.eraseToAnyPublisher(),
+            service.$speakerFinalizationPendingIDs.map { _ in () }.eraseToAnyPublisher(),
+            service.$isPreparingModel.map { _ in () }.eraseToAnyPublisher(),
+            service.$lastError.map { _ in () }.eraseToAnyPublisher()
+        ]
+        var merged = publishers[0]
+        for publisher in publishers.dropFirst() {
+            merged = merged.merge(with: publisher).eraseToAnyPublisher()
+        }
+        return merged
+    }
+
+    /// `activeJob` intentionally has no URL-free accessor for its import case,
+    /// so the controller's file-import state is detected from the job itself.
+    static func isFileImport(_ job: QuickActionsController.ActiveJob) -> Bool {
+        if case .importingFile = job { return true }
+        return false
+    }
+
+    /// Deduplicated job IDs/state only. Never `TranscriptionService.progress`;
+    /// adding that here would reintroduce the #280 class of App-level churn
+    /// through a new observer.
+    static func hasTranscriptionWork(_ service: TranscriptionService) -> Bool {
+        service.activeRecordingID != nil
+            || service.stoppingRecordingID != nil
+            || service.diarizingRecordingID != nil
+            || !service.speakerFinalizationPendingIDs.isEmpty
+            || !service.pendingIDs.isEmpty
+    }
+
+    /// Existing blocking UI in ContentView. The leaf observes this set and
+    /// reveals the resident window when one appears while it is hidden,
+    /// leaving the original alerts/sheets/errors untouched.
+    static func hasBlockingUIState(actions: QuickActionsController,
+                                   transcription: TranscriptionService,
+                                   postRecording: PostRecordingCoordinator,
+                                   shareImporter: RecordingShareImporter,
+                                   configImporter: MilaConfigImporter,
+                                   store: RecordingStore,
+                                   updater: UpdaterViewModel) -> Bool {
+        transcription.lastError != nil
+            || actions.microphonePermissionMissing
+            || actions.screenRecordingPermissionMissing
+            || actions.sleepInterruption != nil
+            || actions.noSoundWarningShown
+            || postRecording.pending != nil
+            || (postRecording.activityIsError && postRecording.activityStatus != nil)
+            || configImporter.pending != nil
+            || configImporter.errorMessage != nil
+            || shareImporter.pending != nil
+            || shareImporter.errorMessage != nil
+            || store.trimNotice != nil
+            || actions.isAppPickerShown
+            || updater.availableUpdate != nil
     }
 
     /// Subscribe to the events that affect a live recording:
@@ -2892,6 +3220,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func gracefulShutdown() async {
+        await postCommand?.shutdown()
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()

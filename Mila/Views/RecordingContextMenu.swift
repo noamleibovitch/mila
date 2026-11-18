@@ -34,6 +34,8 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var liveAI: LiveAISettings
     @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
     @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
+    @EnvironmentObject private var postCommand: PostRecordingCommandSettings
+    @EnvironmentObject private var postCommandRunner: PostRecordingCommandRunner
 
     @State private var renameRequest: String?
     /// Non-nil while the `.milashare` export sheet (voice-profile opt-in) is
@@ -181,6 +183,18 @@ private struct RecordingContextMenu: ViewModifier {
                             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                     onPick: { summarizer.setSummaryLanguage($0, for: recording.id) }
                 )
+            }
+            // Only once the user has turned the hook on and typed a command;
+            // otherwise the feature adds nothing to this menu. Cheap checks
+            // on purpose — `isReady` stats the script, and this builder runs
+            // per row. A command that no longer resolves is reported by the
+            // run itself.
+            if postCommand.enabled, !postCommand.command.isEmpty {
+                Divider()
+                Button("Run Post-Recording Command") {
+                    postCommandRunner.run(recordingID: recording.id, trigger: .manual)
+                }
+                .disabled(recording.status != .completed)
             }
             Divider()
             Button("Share Recording…") {

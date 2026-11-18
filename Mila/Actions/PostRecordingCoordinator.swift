@@ -37,6 +37,10 @@ final class PostRecordingCoordinator: ObservableObject {
     /// user throwing the recording away.
     var obsidianExporter: ObsidianExporter?
 
+    /// Late-bound by `MilaApp`. Discard has to stop the user's post-recording
+    /// command as well: it is queued off the same completion hook.
+    var postCommandRunner: PostRecordingCommandRunner?
+
     /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
     /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
     /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
@@ -73,6 +77,25 @@ final class PostRecordingCoordinator: ObservableObject {
     /// torn down, and so the in-flight handle survives the SwiftUI redraws
     /// that would otherwise re-create local `@State`.
     private var llmTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Finds the calendar event a finished recording overlapped. nil (the
+    /// default, and what most tests pass) means the feature does not exist
+    /// for this coordinator; a real one still answers nothing until
+    /// `CalendarSettings.isReady`.
+    private let calendar: CalendarEventLookup?
+
+    /// The calendar match per recording (`armCalendarMatch`). Its own map,
+    /// not a slot in `llmTasks`: a manual Suggest replaces — and cancels —
+    /// whatever `llmTasks` holds for the recording, and asking an LLM for a
+    /// title must not cost the recording its calendar event. The value is
+    /// whether the match titled the recording, which the auto-title job
+    /// awaits before it spends an LLM call.
+    private var calendarTasks: [UUID: Task<Bool, Never>] = [:]
+    /// Recordings the calendar named at stop time (`armCalendarMatch`), kept
+    /// while their match task runs. `armAutoSuggestTitle` starts no LLM
+    /// title job for these.
+    private var calendarTitledIDs: Set<UUID> = []
+    private var calendarMatchedIDs: Set<UUID> = []
 
     /// Background "Send to <LLM>" work, keyed per-recording. Owned here —
     /// on the app-lifetime coordinator — rather than spawned as a bare
@@ -112,6 +135,7 @@ final class PostRecordingCoordinator: ObservableObject {
     init(store: RecordingStore,
          transcription: TranscriptionService,
          llm: LLMSettings,
+         calendar: CalendarEventLookup? = nil,
          runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport, feature, delivery in
         try await LLMRunner.run(
             tool: tool,
@@ -132,6 +156,7 @@ final class PostRecordingCoordinator: ObservableObject {
         self.store = store
         self.transcription = transcription
         self.llm = llm
+        self.calendar = calendar
         self.runLLM = runLLM
 
         // Every permanent delete (context menu, Queue "Remove", Empty
@@ -156,8 +181,8 @@ final class PostRecordingCoordinator: ObservableObject {
             .store(in: &cancellables)
     }
 
-    /// Cancel the auto-title / Suggest task and the background Send for
-    /// `recordingID`. Cancelling the task is what stops the CLI:
+    /// Cancel the auto-title / Suggest task, the calendar match and the
+    /// background Send for `recordingID`. Cancelling the task is what stops the CLI:
     /// `LLMRunner.run` turns it into SIGTERM, then SIGKILL, for the CLI's
     /// whole process group. Removing the handles first is what the tasks'
     /// own `defer`s expect of a cancel: they leave the slot alone when
@@ -165,6 +190,7 @@ final class PostRecordingCoordinator: ObservableObject {
     func cancelLLMWork(for recordingID: UUID) {
         autoSuggestingIDs.remove(recordingID)
         llmTasks.removeValue(forKey: recordingID)?.cancel()
+        calendarTasks.removeValue(forKey: recordingID)?.cancel()
         sendTasks.removeValue(forKey: recordingID)?.cancel()
     }
 
@@ -192,7 +218,125 @@ final class PostRecordingCoordinator: ObservableObject {
         guard pending == nil else { return }
         pending = recording
         guard !titleWasUserProvided else { return }
-        armAutoSuggestTitle(for: recording)
+        // The recording's calendar match, when `recordingFinished` armed one.
+        armAutoSuggestTitle(for: recording, after: calendarTasks[recording.id])
+    }
+
+    /// Every recording Mila itself finished comes through here, once, from
+    /// `QuickActionsController.stopRecording` right after `store.add(...)`.
+    ///
+    /// This — not `present` — is where the calendar match is armed, because
+    /// `present` is not reached by every recording: a stop caused by the Mac
+    /// going to sleep shows no rename sheet (`showsRenameSheet` false), and
+    /// a recording that finishes while the sheet is still up for the
+    /// previous one is dropped by `present`'s `pending == nil` guard. Both
+    /// happened during a meeting like any other, and both used to be left
+    /// without their event.
+    ///
+    /// The match is armed BEFORE the sheet so `present`'s auto-title job can
+    /// wait on it. It is armed for a user-named recording too: the event is
+    /// still worth storing, it just must not become the title.
+    ///
+    /// Imports (audio files, Voice Memos, `.milashare`) deliberately do not
+    /// come here: their `createdAt` is not the moment a recording stopped,
+    /// which is what the match window is built on.
+    func recordingFinished(_ recording: Recording,
+                           startedAt: Date? = nil,
+                           titleWasUserProvided: Bool = false,
+                           showsRenameSheet: Bool = true) {
+        armCalendarMatch(for: recording, startedAt: startedAt, mayTitle: !titleWasUserProvided)
+        if showsRenameSheet {
+            // The row, not the caller's copy: the match may just have
+            // titled it, and the sheet seeds its field from what it is given.
+            let current = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+            present(current, titleWasUserProvided: titleWasUserProvided)
+        }
+    }
+
+    // MARK: - Calendar match
+
+    /// The event a recording that starts now is most likely for, for the
+    /// recording screen to show. nil when the calendar match is off, not
+    /// ready, or nothing is on. Never stored: `recordingFinished` matches
+    /// the finished recording and that match is the one that titles it.
+    func calendarEventAtRecordingStart() async -> CalendarEventMatch? {
+        await calendar?.currentEvent()
+    }
+
+    /// Returns once the calendar match for `id` has stored its event, or at
+    /// once when none is in flight. For a reader of the row that must not
+    /// miss `calendarEvent` (the post-recording command's handoff).
+    func calendarMatchSettled(for id: UUID) async {
+        while calendarTasks[id] != nil {
+            do { try await Task.sleep(nanoseconds: 20_000_000) }
+            catch { return }
+        }
+    }
+
+    func postCommandRowSettled(for id: UUID) async {
+        await calendarMatchSettled(for: id)
+        guard !Task.isCancelled else { return }
+        _ = await awaitFinalTranscript(for: id, timeout: transcriptWaitTimeout,
+                                       announceSpeakerWait: false)
+    }
+
+    /// Look up the calendar event `recording` overlapped, once, and store it
+    /// on the row. When `mayTitle` is set and the recording still carries
+    /// its machine-default title, the event's title replaces it.
+    ///
+    /// Returns nil when the calendar match is off or not ready — the common
+    /// case, which starts nothing — or when no event qualifies. Otherwise the task (also kept in
+    /// `calendarTasks`, where `present` finds it) has as its value whether
+    /// the event titled the recording; `armAutoSuggestTitle` awaits it and
+    /// skips the LLM call on `true`, so the two can never both write a title.
+    ///
+    /// Persist the match independently of transcription completion. The
+    /// title still respects the user-provided baseline, and LLM naming
+    /// waits for this task before deciding whether it has work to do.
+    @discardableResult
+    private func armCalendarMatch(for recording: Recording,
+                                  startedAt: Date? = nil,
+                                  mayTitle: Bool) -> Task<Bool, Never>? {
+        guard let calendar, calendar.isReady else { return nil }
+        let id = recording.id
+        if let inFlight = calendarTasks[id] { return inFlight }
+        guard calendarMatchedIDs.insert(id).inserted else { return nil }
+        let baselineTitle = recording.title
+        let task = Task { @MainActor [weak self] () -> Bool in
+            defer { if !Task.isCancelled { self?.calendarTasks[id] = nil } }
+            guard let match = await calendar.match(for: recording, startedAt: startedAt),
+                  !Task.isCancelled, let self else { return false }
+            // The event is independent of transcription: persist it even
+            // when transcription is deferred. Store.update preserves this
+            // snapshot when a stop-time/transcription copy arrives later.
+            let titled = self.applyCalendarMatch(match, to: id,
+                                                  titleBaseline: mayTitle ? baselineTitle : nil)
+            if titled { self.calendarTitledIDs.insert(id) }
+            return titled
+        }
+        calendarTasks[id] = task
+        return task
+    }
+
+    /// Store `match` on the recording and, when `titleBaseline` is given and
+    /// the recording still carries it, take the event's title. One
+    /// `store.update` for both, read and written in the same main-actor turn.
+    /// Returns whether the title was set from the event.
+    private func applyCalendarMatch(_ match: CalendarEventMatch,
+                                    to id: UUID,
+                                    titleBaseline: String?) -> Bool {
+        guard var recording = store.recordings.first(where: { $0.id == id }), !recording.isTrashed else { return false }
+        recording.calendarEvent = match
+        var titled = false
+        if let titleBaseline, recording.title == titleBaseline, let title = match.resolvedTitle {
+            recording.title = title
+            titled = true
+        }
+        store.update(recording)
+        if pending?.id == id { pending = recording }
+        // Counts only: an event title and its guest list are user content.
+        postRecordingLog.log("calendar match stored \(id.uuidString.prefix(8), privacy: .public) attendees=\(match.attendees.count, privacy: .public) titled=\(titled, privacy: .public)")
+        return titled
     }
 
     /// Auto-save path (issue #288): run the background title suggestion for a
@@ -208,7 +352,9 @@ final class PostRecordingCoordinator: ObservableObject {
     /// baseline the suggestion would be compared against.
     func autoSuggestOnly(_ recording: Recording, titleWasUserProvided: Bool = false) {
         guard !titleWasUserProvided else { return }
-        armAutoSuggestTitle(for: recording)
+        // Wait on the calendar match `recordingFinished` armed, as `present`
+        // does, so an event title and an LLM title cannot both be written.
+        armAutoSuggestTitle(for: recording, after: calendarTasks[recording.id])
     }
 
     // MARK: - Background auto-suggest title
@@ -226,9 +372,16 @@ final class PostRecordingCoordinator: ObservableObject {
     /// The transcript is usually still being finalized at add time, so we
     /// reuse `awaitFinalTranscript` (the same poller "Send to <LLM>" uses) to
     /// wait for it — text and speaker labels both — before invoking the CLI.
-    private func armAutoSuggestTitle(for recording: Recording) {
+    ///
+    /// `calendarMatch` is the recording's `armCalendarMatch` task, when there
+    /// is one. A title from the user's own calendar beats a generated one, so
+    /// this job waits for it and runs the CLI only if it titled nothing.
+    private func armAutoSuggestTitle(for recording: Recording,
+                                     after calendarMatch: Task<Bool, Never>? = nil) {
         guard llm.isConfigured, llm.nameGenerationEnabled else { return }
         let id = recording.id
+        // The calendar already named it: no title job, no CLI call.
+        guard !calendarTitledIDs.contains(id) else { return }
         // The default, machine-generated title at add time. We only apply an
         // AI suggestion later if the recording STILL carries this title —
         // i.e. the user hasn't renamed it (in the sheet or the list).
@@ -259,6 +412,11 @@ final class PostRecordingCoordinator: ObservableObject {
                 if !Task.isCancelled { self?.clearLLM(for: id) }
             }
             guard let self else { return }
+            // A calendar title needs no transcript. Resolve it before the
+            // transcript wait so a deferred recording does not keep the
+            // title spinner active after its event has already named it.
+            if let calendarMatch, await calendarMatch.value { return }
+            if Task.isCancelled { return }
             // Same wait as the Send path, and for the same reason (issue
             // #211): a title generated from the live diarizer's
             // over-segmented speakers is less wrong than a summary built on
@@ -701,7 +859,8 @@ final class PostRecordingCoordinator: ObservableObject {
     ///     unwinds within ~100ms instead of finishing
     ///  3. permanently delete the recording + its audio file
     ///  4. un-export it from the Obsidian vault
-    ///  5. dismiss the sheet
+    ///  5. stop the post-recording command for it and remove its handoff
+    ///  6. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
         // The `permanentlyDeleted` hook installed in `init` does this too,
@@ -717,6 +876,10 @@ final class PostRecordingCoordinator: ObservableObject {
         // title is what named the note on disk, and the `pending` snapshot's
         // may predate a rename made in the sheet.
         obsidianExporter?.discardNote(for: stored ?? recording)
+        // The runner's own `permanentlyDeleted` hook covers a row that was
+        // still in the store. This covers one that was already gone, whose
+        // `finalizeTail` can still mark it pending.
+        postCommandRunner?.discard(recording.id)
         pending = nil
     }
 

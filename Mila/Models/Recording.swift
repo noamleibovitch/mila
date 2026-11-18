@@ -253,6 +253,16 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `StoredRecording`.
     var untranscribedSpans: [UntranscribedSpan]?
 
+    /// The calendar event this recording overlapped, when the calendar match
+    /// is on (`CalendarSettings`) and `CalendarEventMatcher` found one as the
+    /// recording finished. A snapshot — see `CalendarEventMatch`. Nil (and
+    /// omitted from recordings.json, so every row without one encodes exactly
+    /// as before) otherwise. Mirrored in MilaKit's `StoredRecording`;
+    /// deliberately NOT carried in a `.milashare` (allowlisted in
+    /// `ShareManifestTests`): the attendee list is other people's names and
+    /// addresses from the sender's calendar.
+    var calendarEvent: CalendarEventMatch?
+
     /// Total seconds of audio missing from the transcript.
     var untranscribedSeconds: Double {
         (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
@@ -365,7 +375,8 @@ struct Recording: Identifiable, Codable, Hashable {
          transcriptionDeferredAt: Date? = nil,
          retranscriptionPriorState: RetranscriptionPriorState? = nil,
          speakerNameSuggestions: [SpeakerNameSuggestion] = [],
-         untranscribedSpans: [UntranscribedSpan]? = nil) {
+         untranscribedSpans: [UntranscribedSpan]? = nil,
+         calendarEvent: CalendarEventMatch? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -393,6 +404,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.retranscriptionPriorState = retranscriptionPriorState
         self.speakerNameSuggestions = speakerNameSuggestions
         self.untranscribedSpans = untranscribedSpans
+        self.calendarEvent = calendarEvent
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -437,7 +449,7 @@ struct Recording: Identifiable, Codable, Hashable {
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
              speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
              retranscriptionPriorState, speakerNameSuggestions,
-             untranscribedSpans
+             untranscribedSpans, calendarEvent
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -484,6 +496,9 @@ struct Recording: Identifiable, Codable, Hashable {
         let spans = try? c.decodeIfPresent([UntranscribedSpan].self, forKey: .untranscribedSpans)
         let validSpans = (spans ?? []).filter(\.isValid)
         self.untranscribedSpans = validSpans.isEmpty ? nil : validSpans
+        // `try?` for the same all-or-nothing reason: losing this costs only
+        // the link to the calendar, never the library.
+        self.calendarEvent = try? c.decodeIfPresent(CalendarEventMatch.self, forKey: .calendarEvent)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -530,6 +545,7 @@ struct Recording: Identifiable, Codable, Hashable {
         if !validSpans.isEmpty {
             try c.encode(validSpans, forKey: .untranscribedSpans)
         }
+        try c.encodeIfPresent(calendarEvent, forKey: .calendarEvent)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 
