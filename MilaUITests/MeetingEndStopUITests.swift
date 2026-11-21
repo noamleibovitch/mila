@@ -34,17 +34,31 @@ final class MeetingEndStopUITests: XCTestCase {
         meetings.click()
         let toggle = element(app, "meetings.stopWhenMeetingEnds")
         XCTAssertTrue(toggle.waitForExistence(timeout: 10))
-        XCTAssertEqual(toggle.value as? String, "0", "The setting must start off in the reset test suite")
+        assertToggle(toggle, isOn: false)
         toggle.click()
-        XCTAssertEqual(toggle.value as? String, "1")
+        assertToggle(toggle, isOn: true)
         let settings = app.windows.containing(.any, identifier: "meetings.stopWhenMeetingEnds").firstMatch
         XCTAssertTrue(settings.exists)
         let attachment = XCTAttachment(screenshot: settings.screenshot())
         attachment.name = "meeting-end-stop-opt-in"
         attachment.lifetime = .keepAlways
         add(attachment)
-        // Use the ordinary Settings close action; the main fixture window stays open.
-        app.typeKey("w", modifierFlags: .command)
+        // Target Settings explicitly so focus cannot redirect Cmd+W.
+        let close = settings.buttons["_XCUI:CloseWindow"]
+        XCTAssertTrue(close.isHittable)
+        close.click()
+        let closed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: settings)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed)
+    }
+
+    private func assertToggle(_ toggle: XCUIElement, isOn: Bool) {
+        let predicate = NSPredicate { _, _ in
+            if let value = toggle.value as? NSNumber { return value.boolValue == isOn }
+            return (toggle.value as? String) == (isOn ? "1" : "0")
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: toggle)],
+                                     timeout: 5), .completed, "Native switch must expose the expected state")
     }
 
     private func startFromAsk(_ app: XCUIApplication) {
