@@ -90,6 +90,9 @@ final class RecordingLocationCoordinator: ObservableObject {
     private let storage: RecordingStorageSettings
     private let readiness: RecordingLibraryReadiness
     private let capacity: (URL) -> UInt64?
+    /// Optional deterministic verification boundary for held-worker tests.
+    /// Production leaves it nil; no suspension is added to the commit turn.
+    private let beforeFinalVerification: (@MainActor () async -> Void)?
     private let commitFolderSelection: (RecordingStorageSettings.PreparedSelection) -> Bool
     private let fileManager = FileManager.default
 
@@ -121,7 +124,9 @@ final class RecordingLocationCoordinator: ObservableObject {
          storage: RecordingStorageSettings,
          readiness: RecordingLibraryReadiness,
          capacity: @escaping (URL) -> UInt64? = RecordingLibraryMigration.availableCapacity,
-         commitSelection: ((RecordingStorageSettings.PreparedSelection) -> Bool)? = nil) {
+         commitSelection: ((RecordingStorageSettings.PreparedSelection) -> Bool)? = nil,
+         beforeFinalVerification: (@MainActor () async -> Void)? = nil) {
+        self.beforeFinalVerification = beforeFinalVerification
         self.capacity = capacity
         self.commitFolderSelection = commitSelection ?? { storage.commitSelection($0) }
         self.store = store
@@ -625,6 +630,7 @@ final class RecordingLocationCoordinator: ObservableObject {
                 try RecordingLibraryFileCopy.recheck(source.files,
                     cancellation: { try Self.checkCancellation(flag) })
             }.value
+            if let beforeFinalVerification { await beforeFinalVerification() }
             try Self.checkCancellation(flag)
             guard let capturedReadiness, let capturedStoreActivity,
                   readiness.snapshot() == capturedReadiness,

@@ -337,6 +337,109 @@ final class RecordingLocationCoordinatorTests: XCTestCase {
         XCTAssertEqual(store.recordings.map(\.id), [original.id])
     }
 
+    func test_startup_recovery_blocks_entry_until_its_whole_lifetime_finishes() async throws {
+        let recovery = StartupRecoveryWork()
+        readiness.add { recovery.libraryWorkState }
+        let destination = try makeCustom("RecoveryEntry")
+        recovery.begin()
+        await coordinator.inspectSelection(destination)
+        guard case .failure = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        recovery.finish()
+        coordinator.dismiss()
+        await coordinator.inspectSelection(destination)
+        guard case .presenting = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+    }
+
+    func test_recovery_admitted_during_copy_refuses_final_activation() async throws {
+        let recovery = StartupRecoveryWork()
+        readiness.add { recovery.libraryWorkState }
+        let original = row()
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let previous = store.recordingsDirectory
+        let destination = try makeCustom("RecoveryDuringCopy")
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.copy)
+        var admitted = false
+        let observer = coordinator.progressModel.$progress.sink { value in
+            guard let value, value.copiedBytes > 0, !admitted else { return }
+            admitted = true
+            recovery.begin()
+        }
+        defer { observer.cancel(); recovery.finish() }
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        XCTAssertTrue(admitted)
+        guard case .failure = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertEqual(store.recordingsDirectory, previous)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+    }
+
+    func test_work_finished_during_copy_still_invalidates_the_final_revision() async throws {
+        let original = row()
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let originalIndex = try Data(contentsOf: root.appendingPathComponent("recordings.json"))
+        let previous = store.recordingsDirectory
+        let destination = try makeCustom("TransientWork")
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.copy)
+        var admitted = false
+        let observer = coordinator.progressModel.$progress.sink { value in
+            guard let value, value.copiedBytes > 0, !admitted else { return }
+            admitted = true
+            guard let ticket = self.store.beginLibraryWork() else { return XCTFail("Work was unexpectedly refused") }
+            self.store.finishLibraryWork(ticket)
+        }
+        defer { observer.cancel() }
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        XCTAssertTrue(admitted)
+        XCTAssertEqual(store.libraryActivity.snapshot.outstandingCount, 0)
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("recordings.json")), originalIndex)
+        guard case .failure = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertEqual(store.recordingsDirectory, previous,
+                       "Matching bytes and no live jobs cannot erase a transient admitted job")
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+    }
+
+    func test_postactivation_cleanup_failure_keeps_new_library_and_discloses_retained_stage() async throws {
+        let original = row()
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let destination = try makeCustom("RetainAfterSwitch")
+        var planted: URL?
+        store.onLibraryActivated = {
+            do {
+                let names = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+                let stageName = try XCTUnwrap(names.first { $0.hasPrefix(RecordingLibraryMigration.stagePrefix) })
+                let file = destination.appendingPathComponent(stageName)
+                    .appendingPathComponent(RecordingLibraryMigration.stageFilesName)
+                    .appendingPathComponent("unowned.txt")
+                try Data("Keep this external file".utf8).write(to: file)
+                planted = file
+            } catch { XCTFail("Could not inject the cleanup refusal: \(error)") }
+        }
+        defer { store.onLibraryActivated = nil }
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.copy)
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        guard case .success(let message) = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertTrue(message.contains(destination.path))
+        XCTAssertTrue(coordinator.lastMessage?.contains("retained a hidden staging copy") == true)
+        XCTAssertEqual(store.recordingsDirectory.standardizedFileURL, destination.standardizedFileURL)
+        XCTAssertEqual(store.recordings.map(\.id), [original.id])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(planted)), Data("Keep this external file".utf8))
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("meeting.wav")), Data("audio".utf8))
+    }
+
     func test_same_folder_is_a_no_op_with_no_writes_or_bookmark() async throws {
         let path = store.recordingsDirectory
         await coordinator.inspectSelection(path)

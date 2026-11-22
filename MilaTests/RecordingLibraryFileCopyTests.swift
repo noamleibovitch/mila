@@ -55,6 +55,32 @@ final class RecordingLibraryFileCopyTests: XCTestCase {
         }
     }
 
+    func test_staged_byte_corruption_is_refused_before_publication() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("corruption.wav")
+            let bytes = Data(repeating: 7, count: 2_097_152)
+            try bytes.write(to: source)
+            let entries = try RecordingLibraryFileCopy.inspect([source])
+            var corrupted = false
+            XCTAssertThrowsError(try RecordingLibraryFileCopy.copy(entries, into: stage,
+                progress: { _ in
+                    guard !corrupted else { return }
+                    corrupted = true
+                    do {
+                        let handle = try FileHandle(forWritingTo: stage.appendingPathComponent("corruption.wav"))
+                        defer { try? handle.close() }
+                        try handle.write(contentsOf: Data([99]))
+                        try handle.synchronize()
+                    } catch { XCTFail("Could not inject corruption: \(error)") }
+                })) { XCTAssertEqual($0 as? RecordingLibraryFileCopy.Problem, .changed) }
+            XCTAssertTrue(corrupted)
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                           Set(["corruption.wav", stage.lastPathComponent]),
+                           "A failed hidden-stage copy must not publish visible library files")
+        }
+    }
+
     func test_source_changed_after_inspection_refuses_before_copying() throws {
         try fixture { root, stage in
             let source = root.appendingPathComponent("audio.wav")

@@ -15,7 +15,8 @@ enum FileTranscriber {
                            createdAt: Date? = nil,
                            voiceMemoUniqueID: String? = nil,
                            voiceMemoFolderUUID: String? = nil,
-                           folder: String? = nil) async throws -> Recording {
+                           folder: String? = nil,
+                           reencodeAudio: (@MainActor (URL, URL) async throws -> Double)? = nil) async throws -> Recording {
         guard let ticket = store.beginLibraryWork() else { throw CancellationError() }
         defer { store.finishLibraryWork(ticket) }
         let didStart = sourceURL.startAccessingSecurityScopedResource()
@@ -31,7 +32,12 @@ enum FileTranscriber {
             .replacingOccurrences(of: ":", with: "-")
         let destURL = store.freshAudioURL(suggestedName: safeStem)
 
-        let duration = try await reencode(source: sourceURL, destination: destURL)
+        let duration: Double
+        if let reencodeAudio {
+            duration = try await reencodeAudio(sourceURL, destURL)
+        } else {
+            duration = try await reencode(source: sourceURL, destination: destURL)
+        }
 
         // Ensure the destination folder exists in the sidebar list before the
         // recording references it — `createFolder` is idempotent, so a shared
