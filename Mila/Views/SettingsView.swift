@@ -3331,7 +3331,15 @@ private struct MeetingsSettingsTab: View {
                 }
                 .padding(.vertical, 4)
             }
-            Text("Ask: show start and stop prompts. Auto: start after a cancellable 10-second countdown, and offer the same countdown to stop a recording started by that meeting. Manual recordings always require confirmation to stop. Off: ignore this app.")
+            Text("Ask: show start and stop prompts. Auto: start after a cancellable 10-second countdown, and offer the same countdown to stop a recording started by that meeting. Manual recordings require confirmation to stop unless the option below is on. Off: ignore this app.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Stop recording when the meeting ends", isOn: $settings.stopWhenMeetingEnds)
+                .disabled(!settings.enabled)
+                .accessibilityIdentifier("meetings.stopWhenMeetingEnds")
+                .padding(.top, 6)
+            Text("Runs the 10-second stop countdown for any recording that began during the meeting, including one you started yourself. Keep recording cancels it. A recording that was already running when the meeting began still asks first.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

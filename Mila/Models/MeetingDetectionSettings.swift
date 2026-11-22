@@ -52,6 +52,14 @@ final class MeetingDetectionSettings: ObservableObject {
         }
     }
 
+    /// When on, a meeting that ends offers the cancellable stop countdown to
+    /// any recording that began during it — one started from the prompt or by
+    /// hand, not only one `Auto` started. OFF by default: an unattended stop
+    /// of a recording the user started themselves has to be opted into.
+    @Published var stopWhenMeetingEnds: Bool {
+        didSet { defaults.set(stopWhenMeetingEnds, forKey: Keys.stopWhenMeetingEnds) }
+    }
+
     /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
     /// `MilaApp` passes the system's managed preferences. Only `enabled` is
     /// manageable; the per-app silence list stays the user's.
@@ -79,6 +87,7 @@ final class MeetingDetectionSettings: ObservableObject {
         self.autoStartBundleIDs = Set(
             autoRaw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         )
+        self.stopWhenMeetingEnds = defaults.bool(forKey: Keys.stopWhenMeetingEnds)
     }
 
     func isDisabled(forBundleID bundleID: String) -> Bool {
@@ -167,5 +176,6 @@ final class MeetingDetectionSettings: ObservableObject {
         static let enabled = "meetingDetection.enabled"
         static let disabledBundleIDs = "meetingDetection.disabledBundleIDs"
         static let autoStartBundleIDs = "meetingDetection.autoStartBundleIDs"
+        static let stopWhenMeetingEnds = "meetingDetection.stopWhenMeetingEnds"
     }
 }
