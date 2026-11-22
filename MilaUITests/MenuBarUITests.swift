@@ -211,11 +211,19 @@ final class MenuBarUITests: XCTestCase {
         startFromMenu(application)
         waitForStatusLabel(application, containing: "Recording")
         let ready = tempRoot.appendingPathComponent("watchdog-ready-\(suiteID.uuidString)")
+        let arm = tempRoot.appendingPathComponent("watchdog-arm-\(suiteID.uuidString)")
+        let armed = tempRoot.appendingPathComponent("watchdog-armed-\(suiteID.uuidString)")
         let release = tempRoot.appendingPathComponent("watchdog-release-\(suiteID.uuidString)")
         let rebuilding = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             FileManager.default.fileExists(atPath: ready.path)
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [rebuilding], timeout: 10), .completed)
+        try Data().write(to: arm, options: .atomic)
+        let productionDeadline = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            FileManager.default.fileExists(atPath: armed.path)
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [productionDeadline], timeout: 5), .completed,
+                       "fixture must restore the production Stop deadline before the click")
 
         openMenu(application)
         let stop = menuItem(application, identifier: "menuBar.record", title: "Stop Recording")
@@ -224,7 +232,7 @@ final class MenuBarUITests: XCTestCase {
         stop.click()
         waitForStatusLabel(application, containing: "Stopping", timeout: 5)
         openMenu(application)
-        let stopping = menuItem(application, identifier: "menuBar.record", title: "Stopping Recording")
+        let stopping = menuItem(application, identifier: "menuBar.record", title: "Start Recording")
         XCTAssertTrue(stopping.waitForExistence(timeout: 5))
         XCTAssertFalse(stopping.isEnabled, "another capture must not start while Stop is settling")
         try Data().write(to: release, options: .atomic)

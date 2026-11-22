@@ -577,18 +577,32 @@ final class QuickActionsController: ObservableObject {
                 // AVAudioEngine or ask for microphone access on this path.
                 let root = URL(fileURLWithPath: directory, isDirectory: true)
                 let ready = root.appendingPathComponent("watchdog-ready-\(id.uuidString)")
+                let arm = root.appendingPathComponent("watchdog-arm-\(id.uuidString)")
+                let armed = root.appendingPathComponent("watchdog-armed-\(id.uuidString)")
                 let release = root.appendingPathComponent("watchdog-release-\(id.uuidString)")
                 let attempts = OSAllocatedUnfairLock(initialState: 0)
+                let mic = session.mic
+                let stopTimeout = mic.bringUpTimeout
+                // Give native automation time to open the menu, then restore
+                // the production deadline before the test can click Stop.
+                mic.bringUpTimeout = 30
                 session.mic.captureStallTimeout = 0.1
                 session.mic.watchdogInterval = 0.05
                 session.mic.bringUpOverride = {
                     let attempt = attempts.withLock { count in count += 1; return count }
                     guard attempt > 1 else { return }
                     try Data().write(to: ready, options: .atomic)
-                    let deadline = Date().addingTimeInterval(10)
+                    let deadline = Date().addingTimeInterval(30)
+                    var didArm = false
                     while !FileManager.default.fileExists(atPath: release.path), Date() < deadline {
+                        if !didArm, FileManager.default.fileExists(atPath: arm.path) {
+                            await MainActor.run { mic.bringUpTimeout = stopTimeout }
+                            try Data().write(to: armed, options: .atomic)
+                            didArm = true
+                        }
                         try await Task.sleep(nanoseconds: 20_000_000)
                     }
+                    await MainActor.run { mic.bringUpTimeout = stopTimeout }
                 }
                 do { try await session.mic.start() }
                 catch { return } // A failed fixture must never fall back to real capture.
