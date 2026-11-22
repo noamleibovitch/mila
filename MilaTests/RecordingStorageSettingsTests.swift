@@ -288,3 +288,55 @@ final class RecordingStorageSettingsTests: XCTestCase {
         XCTAssertEqual(store.recordings.map(\.title), ["FromAlt"])
     }
 }
+
+@MainActor
+extension RecordingStorageSettingsTests {
+    func test_prepared_selection_is_not_persisted_until_commit_and_restores_on_failure() throws {
+        let chosen = tempRoot.appendingPathComponent("Prepared", isDirectory: true)
+        try FileManager.default.createDirectory(at: chosen, withIntermediateDirectories: true)
+        let settings = RecordingStorageSettings(defaults: defaults)
+        XCTAssertNil(settings.customDirectory)
+        let prepared = try settings.prepareSelection(for: chosen)
+        XCTAssertNil(settings.customDirectory)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertTrue(settings.commitSelection(prepared))
+        XCTAssertEqual(settings.customDirectory?.standardizedFileURL, chosen.standardizedFileURL)
+        XCTAssertNotNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+
+        let defaultPrepared = try settings.prepareSelection(for: nil)
+        XCTAssertTrue(settings.commitSelection(defaultPrepared))
+        XCTAssertNil(settings.customDirectory)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+    }
+
+    func test_bookmark_minting_failure_keeps_previous_selection() throws {
+        let chosen = tempRoot.appendingPathComponent("First", isDirectory: true)
+        let other = tempRoot.appendingPathComponent("Second", isDirectory: true)
+        try FileManager.default.createDirectory(at: chosen, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let settings = RecordingStorageSettings(defaults: defaults)
+        XCTAssertTrue(settings.setDirectory(chosen))
+        struct Boom: Error {}
+        settings.bookmarkMinter = { _ in throw Boom() }
+        XCTAssertThrowsError(try settings.prepareSelection(for: other))
+        XCTAssertEqual(settings.customDirectory?.standardizedFileURL, chosen.standardizedFileURL)
+    }
+}
+
+@MainActor
+extension RecordingStorageSettingsTests {
+    func test_commit_failure_restores_previous_bookmark() throws {
+        let first = tempRoot.appendingPathComponent("First", isDirectory: true)
+        let second = tempRoot.appendingPathComponent("Second", isDirectory: true)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        let settings = RecordingStorageSettings(defaults: defaults)
+        XCTAssertTrue(settings.setDirectory(first))
+        let previous = defaults.data(forKey: RecordingStorageSettings.bookmarkKey)
+        settings.bookmarkMinter = { _ in Data("not a bookmark".utf8) }
+        let bad = try settings.prepareSelection(for: second)
+        XCTAssertFalse(settings.commitSelection(bad))
+        XCTAssertEqual(settings.customDirectory?.standardizedFileURL, first.standardizedFileURL)
+        XCTAssertEqual(defaults.data(forKey: RecordingStorageSettings.bookmarkKey), previous)
+    }
+}

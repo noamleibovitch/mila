@@ -130,6 +130,21 @@ final class PostRecordingCommandRunner: ObservableObject {
     private var tail: Task<Void, Never>?
 
     private var cancellables: Set<AnyCancellable> = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Post-recording command", reason: "A post-recording command is still running.")
+
+    func resetLibraryContext() {
+        captured.removeAll()
+        discarded.removeAll()
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !pending.isEmpty || !tasks.isEmpty || !libraryLedger.outstanding.isEmpty {
+            return .busy("Post-recording command", "Finish the post-recording command before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Post-recording command", generation: libraryLedger.generation)
+    }
 
     init(store: RecordingStore,
          settings: PostRecordingCommandSettings,
@@ -226,7 +241,9 @@ final class PostRecordingCommandRunner: ObservableObject {
             return false
         }
         let previous = tail
+        let lifetime = libraryLedger.begin()
         let task = Task { @MainActor [weak self] in
+            defer { self?.libraryLedger.finish(lifetime) }
             await previous?.value
             guard let self, !Task.isCancelled else { return }
             await self.perform(id, trigger: trigger)

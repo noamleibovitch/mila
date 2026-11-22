@@ -153,6 +153,7 @@ enum RecordingShareExporter {
     static func exportInteractively(_ recording: Recording,
                                     store: RecordingStore,
                                     profiles: [SharedSpeakerProfile] = []) async throws -> URL? {
+        let context = store.libraryActivity.context
         let panel = NSSavePanel()
         panel.title = "Share Recording"
         panel.prompt = "Save"
@@ -160,6 +161,9 @@ enum RecordingShareExporter {
         panel.nameFieldStringValue = suggestedFileName(for: recording)
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return nil }
+        // A save panel runs a nested event loop. Do not resolve a retained
+        // recording against a library selected while the panel was open.
+        guard store.admitLibraryInput(context) else { return nil }
 
         let built = try await buildBundle(for: recording, store: store, profiles: profiles,
                                           exportedBy: exporterName())

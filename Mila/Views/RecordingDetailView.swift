@@ -42,6 +42,11 @@ struct RecordingDetailView: View {
     @State private var follow = FollowCoordinator()
     @State private var isEditingTitle = false
     @State private var titleDraft = ""
+    /// Library epoch captured when this detail view was presented. Delayed
+    /// confirmations and tasks recheck it so they cannot act on a same-UUID
+    /// row after a folder switch. ContentView also keys the view on this
+    /// epoch, so the usual case rebuilds the whole view.
+    @State private var libraryContext: RecordingLibraryActivity.Context?
     /// Set when the user picks a merge target in the speaker popover; drives
     /// the confirmation alert, which is what actually performs the merge.
     @State private var pendingMerge: PendingSpeakerMerge?
@@ -82,12 +87,12 @@ struct RecordingDetailView: View {
                 recordingLanguage: recording.language,
                 isSummarizing: summarizer.isSummarizing(recording.id),
                 onRegenerateSummary: canRegenerateSummary
-                    ? { summarizer.regenerate(recording) }
+                    ? { if belongsToCurrentLibrary { summarizer.regenerate(recording) } }
                     : nil,
                 summaryLanguage: recording.summaryLanguageOverride,
                 globalOutputLanguage: liveAI.outputLanguage,
                 onSetSummaryLanguage: canRegenerateSummary
-                    ? { summarizer.setSummaryLanguage($0, for: recording.id) }
+                    ? { if belongsToCurrentLibrary { summarizer.setSummaryLanguage($0, for: recording.id) } }
                     : nil,
                 isTranscribing: isTranscriptionBusy
             )
@@ -95,6 +100,7 @@ struct RecordingDetailView: View {
                 suggestions: recording.actionableSpeakerNameSuggestions,
                 language: recording.transcriptLanguage,
                 onAccept: { suggestion in
+                    guard belongsToCurrentLibrary else { return }
                     // The normal rename path: directory first (canonical
                     // spelling, future pick-lists), then `setSpeakerName`.
                     _ = store.acceptSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
@@ -102,6 +108,7 @@ struct RecordingDetailView: View {
                                                           canonicalName: { speakerDirectory.add($0) })
                 },
                 onDismiss: { suggestion in
+                    guard belongsToCurrentLibrary else { return }
                     store.dismissSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
                                                        recordingID: recording.id)
                 }
@@ -119,10 +126,14 @@ struct RecordingDetailView: View {
             Divider()
             playbackBar
         }
-        // ContentView applies .id(rec.id) at the call site, so navigating
-        // between recordings rebuilds this view and `onAppear` configures
+        // ContentView applies an id built from the recording id plus the
+        // library epoch at the call site, so navigating between recordings or
+        // switching libraries rebuilds this view and `onAppear` configures
         // the player for the new one.
-        .onAppear { configurePlayer() }
+        .onAppear {
+            libraryContext = store.libraryActivity.context
+            configurePlayer()
+        }
         .onDisappear { teardownPlayer() }
         // A `.milashare` import that replaces THIS recording keeps its id —
         // so nothing above rebuilds — but swaps the audio file and deletes
@@ -142,7 +153,8 @@ struct RecordingDetailView: View {
         // (count changes) or a re-transcription (new ids; status settles).
         .onChange(of: recording.segments.count) { _, _ in pruneSelection() }
         .onChange(of: recording.status) { _, _ in pruneSelection() }
-        .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
+        .recordingShareSheet(selection: $shareSelection, recording: recording, store: store,
+                             libraryContext: libraryContext)
         .onChange(of: playbackSpeed) { _, newValue in
             let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
             player?.defaultRate = rate
@@ -171,7 +183,8 @@ struct RecordingDetailView: View {
                     Text(formatDuration(recording.duration))
                     Text("·")
                     RecordingFolderMenu(recordingID: recording.id,
-                                        currentFolder: recording.folder)
+                                        currentFolder: recording.folder,
+                                        libraryContext: libraryContext)
                     if let sharedBy = recording.sharedBy {
                         Text("·")
                         Label("Shared by \(sharedBy)", systemImage: "person.crop.circle.badge.checkmark")
@@ -225,10 +238,18 @@ struct RecordingDetailView: View {
         DispatchQueue.main.async { titleFieldFocused = true }
     }
 
+    /// True while the library this view was presented for is still current.
+    /// All delayed edits (alerts, Tasks) check this instead of trusting the
+    /// recording UUID, which can exist in the newly adopted library too.
+    private var belongsToCurrentLibrary: Bool {
+        guard let libraryContext else { return false }
+        return store.admitLibraryInput(libraryContext)
+    }
+
     private func commitTitle() {
         guard isEditingTitle else { return }
         let trimmed = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, trimmed != recording.title {
+        if !trimmed.isEmpty, trimmed != recording.title, belongsToCurrentLibrary {
             store.rename(recording, to: trimmed)
         }
         isEditingTitle = false
@@ -253,7 +274,9 @@ struct RecordingDetailView: View {
                     // language-switch action) so status + audioFileName handling
                     // stays consistent and we never enqueue a stale snapshot
                     // whose `.wav` a since-run compression already deleted.
-                    guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
+                    guard belongsToCurrentLibrary,
+                          let prepared = store.prepareForRetranscription(id: recording.id)
+                    else { return }
                     transcription.enqueue(prepared, isRetranscription: true)
                 } label: {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
@@ -309,12 +332,14 @@ struct RecordingDetailView: View {
     /// Produce a `.milashare` for a colleague — the voice-profile opt-in
     /// sheet first when there is something to offer, else the save panel.
     private func shareForMila() {
+        guard let context = libraryContext, store.admitLibraryInput(context) else { return }
         if let selection = RecordingShareExporter.exportSelection(
             for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
             shareSelection = selection
         } else {
             let recording = recording
             Task { @MainActor in
+                guard store.admitLibraryInput(context) else { return }
                 await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
             }
         }
@@ -340,6 +365,7 @@ struct RecordingDetailView: View {
     /// Updates the persisted `Recording.language` so the downstream
     /// `TranscriptionService` picks the right model on its own.
     private func retranscribe(in language: RecordingLanguage) {
+        guard belongsToCurrentLibrary else { return }
         // Mutate only language+status on the LIVE record so we don't clobber a
         // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
         guard let prepared = store.prepareForRetranscription(id: recording.id,
@@ -460,8 +486,16 @@ struct RecordingDetailView: View {
                 ProgressView().controlSize(.small)
             } else if retryable > 0 {
                 Button("Retry missing parts") {
+                    guard let context = libraryContext,
+                          store.admitLibraryInput(context) else { return }
                     let id = recording.id
-                    Task { await transcription.retryUntranscribedSpans(of: id) }
+                    Task { @MainActor in
+                        // The retry runs after the current MainActor turn; a
+                        // library switch in between must not retry a same-UUID
+                        // row in the adopted library.
+                        guard store.admitLibraryInput(context) else { return }
+                        await transcription.retryUntranscribedSpans(of: id)
+                    }
                 }
                 .controlSize(.small)
                 .help("Transcribe just the missing parts of the audio and add them to the transcript in place.")
@@ -628,6 +662,7 @@ struct RecordingDetailView: View {
                                            allSpeakers: distinctSpeakers,
                                            onTap: { rowClicked(seg) },
                                            onAssignName: { raw, name in
+                                               guard belongsToCurrentLibrary else { return }
                                                store.setSpeakerName(name, forSpeaker: raw,
                                                                     recordingID: recording.id)
                                            },
@@ -635,16 +670,19 @@ struct RecordingDetailView: View {
                                            // line to keep — see `lineCountsBySpeaker`.
                                            onSplit: (seg.speaker.map { lineCounts[$0] ?? 0 } ?? 0) > 1
                                                ? {
+                                                   guard belongsToCurrentLibrary else { return }
                                                    store.splitSegmentSpeaker(segmentID: seg.id,
                                                                              recordingID: recording.id)
                                                }
                                                : nil,
                                            onMoveLine: { target in
+                                               guard belongsToCurrentLibrary else { return }
                                                store.reassignSegmentSpeaker(segmentID: seg.id,
                                                                             toSpeaker: target,
                                                                             recordingID: recording.id)
                                            },
                                            onRequestMerge: { source, target in
+                                               guard belongsToCurrentLibrary else { return }
                                                pendingMerge = PendingSpeakerMerge(
                                                    source: source,
                                                    target: target,
@@ -756,6 +794,10 @@ struct RecordingDetailView: View {
                                         set: { if !$0 { pendingMerge = nil } }),
                    presenting: pendingMerge) { merge in
                 Button("Merge", role: .destructive) {
+                    guard belongsToCurrentLibrary else {
+                        pendingMerge = nil
+                        return
+                    }
                     store.mergeSpeakers(from: merge.source, into: merge.target,
                                         recordingID: recording.id)
                     pendingMerge = nil
@@ -894,6 +936,10 @@ struct RecordingDetailView: View {
     }
 
     private func requestDelete(_ ids: Set<TranscriptSegment.ID>) {
+        guard belongsToCurrentLibrary else {
+            NSSound.beep()
+            return
+        }
         let live = Set(recording.segments.map(\.id))
         let target = ids.intersection(live)
         // Nothing to delete, or everything: emptying the transcript is not a
@@ -906,6 +952,7 @@ struct RecordingDetailView: View {
     }
 
     private func requestEndConversation(after segmentID: TranscriptSegment.ID) {
+        guard belongsToCurrentLibrary else { return }
         let removed = TranscriptTrim.linesAfter(segmentID, in: recording.segments)
         guard canEditTranscript, removed > 0 else { return }
         let cut = store.canTrimAudio(for: recording)
@@ -948,6 +995,9 @@ struct RecordingDetailView: View {
     }
 
     private func perform(_ edit: PendingTranscriptEdit) {
+        // The confirmation alert can outlive a library switch; refuse before
+        // touching a same-UUID row in the newly adopted library.
+        guard let libraryContext, store.admitLibraryInput(libraryContext) else { return }
         let recordingID = recording.id
         let regenerate = trimRegeneratesOverview
         // Captured before any await: an environment object read from a task
@@ -965,6 +1015,9 @@ struct RecordingDetailView: View {
             // audio cut that did not happen is reported by the store itself
             // (`trimNotice`, shown by ContentView), not from here.
             Task { @MainActor in
+                // Recheck at task start: the store can have adopted another
+                // library while this was queued behind the MainActor turn.
+                guard store.admitLibraryInput(libraryContext) else { return }
                 guard let result = await store.endConversation(afterSegment: segmentID,
                                                                recordingID: recordingID) else { return }
                 if regenerate { summarizer.regenerate(result.recording) }

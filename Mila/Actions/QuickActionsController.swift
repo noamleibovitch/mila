@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 import Combine
 import OSLog
 import ScreenCaptureKit
@@ -447,6 +448,32 @@ final class QuickActionsController: ObservableObject {
     /// safe to overlap a fresh live recording. Mirrors
     /// `RecordingSummarizer`'s id-keyed background-task ownership model.
     private var finalizeTasks: [UUID: Task<Void, Never>] = [:]
+    /// One token per `finalizeTail` invocation, independent of the per-id map
+    /// that a replacement cancels and overwrites. A canceled or replaced tail
+    /// stays counted until its own body and downstream handoffs return.
+    private var finalizeLifetimeTokens: Set<UUID> = []
+    private var libraryWorkGeneration: UInt64 = 0
+    private var lastLocationRefusalFeedback = Date.distantPast
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Recording", reason: "A recording is starting, stopping or finishing.")
+
+    func resetLibraryContext() {
+        recordingCalendarTitle = nil
+        autoSaveRevealID = nil
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if isStoppingRecording || isFinalizingRecording || captureStartInFlight
+            || activeJob != .none || isAwaitingLivePipeline || !finalizeLifetimeTokens.isEmpty {
+            return .busy("Recording", "Finish recording or processing before changing folders.",
+                         generation: libraryWorkGeneration &+ libraryLedger.generation)
+        }
+        return .idle("Recording", generation: libraryWorkGeneration &+ libraryLedger.generation)
+    }
+
+    private func noteLibraryWorkAdmission() {
+        if libraryWorkGeneration < UInt64.max { libraryWorkGeneration += 1 }
+    }
 
     /// Returns true — and sets a user-facing `lastError` — when starting
     /// a new recording would exceed the configured storage cap. Called at
@@ -483,6 +510,22 @@ final class QuickActionsController: ObservableObject {
     /// in-progress recording. The "include app audio" preference is
     /// held by the caller (HomeView's @AppStorage toggle) so we can
     /// stay stateless about it here.
+    /// Called from every start entry point before a URL is allocated or an
+    /// `await` begins. The Settings folder change owns the library until its
+    /// sheet/commit settles; a hotkey/menu start gets a beep and visible text,
+    /// never a modal over the sheet and never a queued retry.
+    func refuseStartDuringLocationChange() -> Bool {
+        guard store.isChangingRecordingsLocation else { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastLocationRefusalFeedback) >= 2 else { return true }
+        lastLocationRefusalFeedback = now
+        NSSound.beep()
+        transcription.lastError = "Finish changing the recordings folder before recording. Cancel to record first."
+        AccessibilityNotification.Announcement(
+            "Finish changing the recordings folder before recording. Cancel to record first.").post()
+        return true
+    }
+
     func toggleRecord(withSystemAudio: Bool) async {
         // Block re-entry only while `stopRecording` is closing the WAV and
         // saving the row (`isStoppingRecording`) — a tap there would either
@@ -608,6 +651,7 @@ final class QuickActionsController: ObservableObject {
                 catch { return } // A failed fixture must never fall back to real capture.
             }
             #endif
+            if refuseStartDuringLocationChange() { return }
             let url = store.freshAudioURL(suggestedName: "Recording")
             await startFakeRecordingForTesting(outputURL: url)
             return
@@ -645,6 +689,7 @@ final class QuickActionsController: ObservableObject {
     /// never has — so the hand-over it requests carries no session start
     /// either.
     func startFakeRecordingForTesting(outputURL: URL) async {
+        if refuseStartDuringLocationChange() { return }
         if isStoppingRecording {
             quickActionsLog.log("startFakeRecordingForTesting ignored — stop in progress")
             return
@@ -825,6 +870,7 @@ final class QuickActionsController: ObservableObject {
 
     private func startRecording(withSystemAudio: Bool,
                                 isStillValid: () -> Bool = { true }) async {
+        if refuseStartDuringLocationChange() { return }
         guard activeJob == .none, !isStoppingRecording, !captureStartInFlight,
               isStillValid() else { return }
         captureStartInFlight = true
@@ -1144,6 +1190,7 @@ final class QuickActionsController: ObservableObject {
 
     func startAppRecording(app: SCRunningApplication?, includeMic: Bool) async {
         isAppPickerShown = false
+        if refuseStartDuringLocationChange() { return }
         guard activeJob == .none, !isStoppingRecording, !captureStartInFlight else { return }
         captureStartInFlight = true
         defer { captureStartInFlight = false }
@@ -2062,8 +2109,13 @@ final class QuickActionsController: ObservableObject {
         // defensive; ids are unique per recording so this shouldn't
         // collide in practice.
         finalizeTasks[id]?.cancel()
+        let lifetimeToken = UUID()
+        finalizeLifetimeTokens.insert(lifetimeToken)
+        noteLibraryWorkAdmission()
         finalizeTasks[id] = Task { @MainActor [weak self] in
             defer {
+                self?.finalizeLifetimeTokens.remove(lifetimeToken)
+                self?.noteLibraryWorkAdmission()
                 self?.finalizeTasks[id] = nil
                 // Belt and braces. The marker is released explicitly below,
                 // the moment the labels and the `.srt` carrying them are on
@@ -2354,6 +2406,13 @@ final class QuickActionsController: ObservableObject {
     }
 
     func transcribeFile(_ url: URL) async {
+        if refuseStartDuringLocationChange() { return }
+        let ticket = libraryLedger.begin()
+        noteLibraryWorkAdmission()
+        defer {
+            libraryLedger.finish(ticket)
+            noteLibraryWorkAdmission()
+        }
         // Storage cap applies to imports too — they copy a new audio file
         // into the library, same as a recording.
         if storageCapReached() { return }

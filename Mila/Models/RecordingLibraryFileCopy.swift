@@ -46,7 +46,9 @@ enum RecordingLibraryFileCopy {
     /// Caller cleanup must use the receipt and may never remove the source.
     static func copy(_ entries: [Entry], into stage: URL,
                      cancellation: () throws -> Void = {},
-                     progress: (UInt64) -> Void = { _ in }) throws {
+                     progress: (UInt64) -> Void = { _ in },
+                     completedFile: (Int) -> Void = { _ in },
+                     created: (String, UInt64, UInt64) -> Void = { _, _, _ in }) throws {
         let fm = FileManager.default
         let normalized = stage.standardizedFileURL
         guard normalized == normalized.resolvingSymlinksInPath(),
@@ -57,7 +59,7 @@ enum RecordingLibraryFileCopy {
         }
         try recheck(entries, cancellation: cancellation)
         var copiedBytes: UInt64 = 0
-        for entry in entries {
+        for (index, entry) in entries.enumerated() {
             try cancellation()
             try validateName(entry.name)
             let destination = normalized.appendingPathComponent(entry.name)
@@ -66,6 +68,11 @@ enum RecordingLibraryFileCopy {
             guard output >= 0 else { throw errno == EEXIST ? Problem.destinationExists : Problem.ioFailure }
             let writer = FileHandle(fileDescriptor: output, closeOnDealloc: true)
             defer { try? writer.close() }
+            var createdInfo = stat()
+            guard fstat(output, &createdInfo) == 0,
+                  createdInfo.st_mode & S_IFMT == S_IFREG else { throw Problem.ioFailure }
+            let createdDevice = UInt64(createdInfo.st_dev)
+            let createdInode = UInt64(createdInfo.st_ino)
             let input = open(entry.source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
             guard input >= 0 else { throw Problem.unsafeFile }
             let reader = FileHandle(fileDescriptor: input, closeOnDealloc: true)
@@ -93,14 +100,20 @@ enum RecordingLibraryFileCopy {
             try writer.close()
             guard length == entry.size, hex(hash.finalize()) == entry.digest else { throw Problem.changed }
             let copied = try fingerprint(destination, name: entry.name, cancellation: cancellation)
-            guard copied.size == entry.size, copied.digest == entry.digest else { throw Problem.changed }
+            guard copied.size == entry.size, copied.digest == entry.digest,
+                  copied.device == createdDevice, copied.inode == createdInode else {
+                throw Problem.changed
+            }
+            created(entry.name, createdDevice, createdInode)
+            completedFile(index + 1)
         }
         try recheck(entries, cancellation: cancellation)
     }
 
     private static func validateName(_ name: String) throws {
         guard !name.isEmpty, !name.hasPrefix("."), !name.contains("/"), !name.contains("\\"),
-              !name.contains("\0"), (name as NSString).lastPathComponent == name else { throw Problem.invalidName }
+              !name.contains(":"), !name.contains("\0"),
+              (name as NSString).lastPathComponent == name else { throw Problem.invalidName }
     }
 
     private static func fingerprint(_ source: URL, name: String,

@@ -712,6 +712,17 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(text, "")
     }
 
+    func test_completed_transcription_retires_library_work_ticket() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Completed library job")
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 0.5, text: "Done")])
+        service.enqueue(fixture.recording)
+        XCTAssertFalse(service.libraryWorkState.isIdle)
+        await service.waitForIdle()
+        XCTAssertEqual(store.recordings.first(where: { $0.id == fixture.recording.id })?.status, .completed)
+        XCTAssertTrue(service.libraryWorkState.isIdle,
+                      "Completed queue work must not block future folder changes")
+    }
+
     // MARK: - Cancellation
 
     /// Cancelling a recording while it's still pending in the queue should
@@ -745,6 +756,8 @@ final class TranscriptionServiceTests: XCTestCase {
 
         let calls = await stub.transcribeCalls
         XCTAssertEqual(calls.count, 1, "Only the blocker should have hit whisper")
+        XCTAssertTrue(service.libraryWorkState.isIdle,
+                      "Both the completed and cancelled queue reservations must retire")
     }
 
     /// Cancelling while the recording is the active job should trip the

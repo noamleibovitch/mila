@@ -175,6 +175,7 @@ private struct HistoryRow: View {
     let recording: Recording
     @Binding var selection: SidebarSelection?
 
+    @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
 
     @State private var hovering = false
@@ -250,8 +251,10 @@ private struct HistoryRow: View {
         // rows carry their id as a `RecordingDragPayload` so the sidebar
         // folder rows can pick them up via `.dropDestination`.
         .draggable(recording.isTrashed
-                   ? RecordingDragPayload(id: UUID())   // unused — won't be matched
-                   : RecordingDragPayload(id: recording.id))
+                   ? RecordingDragPayload(id: UUID(),
+                                          contextToken: store.libraryActivity.contextToken)  // unused — won't be matched
+                   : RecordingDragPayload(id: recording.id,
+                                          contextToken: store.libraryActivity.contextToken))
         .recordingContextMenu(recording: recording, selection: $selection)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("history.row.\(recording.title)")

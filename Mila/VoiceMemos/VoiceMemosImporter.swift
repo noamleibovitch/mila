@@ -118,6 +118,17 @@ final class VoiceMemosImporter: ObservableObject {
     /// the status line stays steady. This is the flag the coalescing guard
     /// keys on so two scans never overlap.
     private var scanInFlight = false
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Voice Memos", reason: "A Voice Memos scan or import is still running.")
+    private var scanTicket: RecordingLibraryWorkLedger.Ticket?
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if scanInFlight || pendingResync || scanTicket != nil {
+            return .busy("Voice Memos", "Finish the Voice Memos scan before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Voice Memos", generation: libraryLedger.generation)
+    }
 
     init(store: RecordingStore,
          transcription: TranscriptionService,
@@ -195,6 +206,8 @@ final class VoiceMemosImporter: ObservableObject {
 
     /// Run a sync, coalescing requests so two never overlap.
     private func requestSync() {
+        guard settings.isEnabled, settings.hasSelection else { return }
+        if scanTicket == nil { scanTicket = libraryLedger.begin() }
         // Guard on `scanInFlight` (set synchronously at the top of `sync()`),
         // NOT the published `isSyncing` — the latter now only tracks visible
         // import work, so an idle scan leaves it false and two requests would
@@ -207,7 +220,10 @@ final class VoiceMemosImporter: ObservableObject {
     }
 
     private func sync() async {
-        guard settings.isEnabled, settings.hasSelection else { return }
+        guard settings.isEnabled, settings.hasSelection else {
+            if let ticket = scanTicket { scanTicket = nil; libraryLedger.finish(ticket) }
+            return
+        }
         // Re-check on entry: `requestSync`'s guard runs when the request is
         // made, but the flag only flips once this Task actually starts. Two
         // requests landing in the same main-actor drain (e.g. "Rescan now" +
@@ -225,10 +241,14 @@ final class VoiceMemosImporter: ObservableObject {
             // A folder change / FSEvents burst that arrived mid-sync set
             // `pendingResync`; kick the next pass now that the flag is clear
             // (doing this before clearing it would just re-set the flag and
-            // the second pass would never run).
+            // the second pass would never run). The SAME full-lifetime ticket
+            // carries across the handoff.
             if pendingResync {
                 pendingResync = false
                 requestSync()
+            } else if let ticket = scanTicket {
+                scanTicket = nil
+                libraryLedger.finish(ticket)
             }
         }
 

@@ -115,6 +115,21 @@ final class OfflineVoiceEmbedder {
     /// In-flight extractions, keyed by a token so each clears its own entry.
     /// Exists for `awaitPending()` — see there.
     private var pending: [UUID: Task<Void, Never>] = [:]
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Voice profiles", reason: "A voice-profile observation, relabel or match is still running.")
+
+    func resetLibraryContext() {
+        clearedByPass = nil
+        snapshots.removeAll()
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !pending.isEmpty || !libraryLedger.outstanding.isEmpty {
+            return .busy("Voice profiles", "Finish voice recognition before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Voice profiles", generation: libraryLedger.generation)
+    }
 
     /// What the pass whose completion is being announced right now took off
     /// the row, waiting for the `matchAfterPass` that follows it.
@@ -515,9 +530,13 @@ final class OfflineVoiceEmbedder {
 
     private func spawn(_ body: @escaping @Sendable () async -> Void) {
         let token = UUID()
+        let ticket = libraryLedger.begin()
         pending[token] = Task.detached(priority: .utility) { [weak self] in
             await body()
-            await MainActor.run { self?.pending[token] = nil }
+            await MainActor.run {
+                self?.pending[token] = nil
+                self?.libraryLedger.finish(ticket)
+            }
         }
     }
 

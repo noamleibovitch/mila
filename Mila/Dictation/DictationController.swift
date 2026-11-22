@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 import Combine
 import AVFoundation
 import OSLog
@@ -34,6 +35,28 @@ final class DictationController: ObservableObject {
     /// `state = .recording` — the two awaits in that window (mic permission,
     /// engine bring-up) are where a hotkey double-press could re-enter.
     private var isStarting = false
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Dictation", reason: "A dictation is still running, transcribing or saving.")
+    private var libraryOperationTicket: RecordingLibraryWorkLedger.Ticket?
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if isStarting || state != .idle || libraryOperationTicket != nil {
+            return .busy("Dictation", "Finish dictation before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Dictation", generation: libraryLedger.generation)
+    }
+
+    private func beginLibraryOperation() {
+        if libraryOperationTicket == nil { libraryOperationTicket = libraryLedger.begin() }
+    }
+
+    private func finishLibraryOperation() {
+        if let ticket = libraryOperationTicket {
+            libraryLedger.finish(ticket)
+            libraryOperationTicket = nil
+        }
+    }
 
     /// Live transcriber used to surface partial transcripts in the
     /// dictation overlay AND to remove the post-release transcription
@@ -106,6 +129,7 @@ final class DictationController: ObservableObject {
     /// during graceful shutdown.
     func cancelInFlight() async {
         guard case .recording = state else { return }
+        beginLibraryOperation()
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
         liveTextObserver?.cancel(); liveTextObserver = nil
@@ -115,6 +139,7 @@ final class DictationController: ObservableObject {
         DictationOverlayWindow.shared.hide()
         state = .idle
         level = 0
+        finishLibraryOperation()
     }
 
     // MARK: - Recording
@@ -131,7 +156,18 @@ final class DictationController: ObservableObject {
             return
         }
         isStarting = true
-        defer { isStarting = false }
+        beginLibraryOperation()
+        defer {
+            isStarting = false
+            if case .recording = state {} else { finishLibraryOperation() }
+        }
+        if store.isChangingRecordingsLocation {
+            NSSound.beep()
+            transcription.lastError = "Finish changing the recordings folder before recording. Cancel to record first."
+            AccessibilityNotification.Announcement(
+                "Finish changing the recordings folder before recording. Cancel to record first.").post()
+            return
+        }
 
         // Storage cap: a full library blocks new dictation clips too
         // (consistent with Settings copy). A beep is the right-sized signal
@@ -206,6 +242,8 @@ final class DictationController: ObservableObject {
     }
 
     private func stopAndTranscribe(action: HotkeyAction) async {
+        beginLibraryOperation()
+        defer { finishLibraryOperation() }
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
         state = .transcribing(action)

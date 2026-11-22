@@ -95,6 +95,26 @@ final class SpeakerNameSuggester {
     var maxConcurrent = 1
 
     private var cancellables: Set<AnyCancellable> = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Speaker names", reason: "A speaker-name suggestion is still running.")
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !pending.isEmpty || !queue.isEmpty || !inFlight.isEmpty
+            || !cancelledRuns.isEmpty || !rerunRequested.isEmpty
+            || !libraryLedger.outstanding.isEmpty {
+            return .busy("Speaker names", "Finish speaker-name suggestions before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Speaker names", generation: libraryLedger.generation)
+    }
+
+    func resetLibraryContext() {
+        // Activation is permitted only after every producer has settled.
+        guard libraryWorkState.isIdle else { return }
+        pending.removeAll()
+        queue.removeAll()
+        rerunRequested.removeAll()
+    }
 
     init(store: RecordingStore,
          llmSettings: LLMSettings,
@@ -243,8 +263,12 @@ final class SpeakerNameSuggester {
         let runLLM = self.runLLM
         suggesterLog.log("started \(Self.shortID(id), privacy: .public) unnamed=\(unnamed.count, privacy: .public)")
 
+        let lifetime = libraryLedger.begin()
         let task = Task { @MainActor [weak self] in
-            defer { self?.runEnded(id: id, token: token) }
+            defer {
+                self?.libraryLedger.finish(lifetime)
+                self?.runEnded(id: id, token: token)
+            }
             let raw: String
             do {
                 raw = try await runLLM(call)

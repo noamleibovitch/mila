@@ -112,6 +112,22 @@ final class PostRecordingCoordinator: ObservableObject {
 
     /// The `RecordingStore.permanentlyDeleted` subscription (see `init`).
     private var cancellables: Set<AnyCancellable> = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Post-recording", reason: "A title, calendar, send or rename decision is still running.")
+
+    func resetLibraryContext() {
+        calendarTitledIDs.removeAll()
+        calendarMatchedIDs.removeAll()
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if pending != nil || !llmTasks.isEmpty || !calendarTasks.isEmpty || !sendTasks.isEmpty
+            || !autoSuggestingIDs.isEmpty || !libraryLedger.outstanding.isEmpty {
+            return .busy("Post-recording", "Finish naming or sending before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Post-recording", generation: libraryLedger.generation)
+    }
 
     /// How long the background send will wait for an as-yet-unfinished
     /// transcript before giving up. "Send to Claude" can now be pressed
@@ -302,8 +318,12 @@ final class PostRecordingCoordinator: ObservableObject {
         if let inFlight = calendarTasks[id] { return inFlight }
         guard calendarMatchedIDs.insert(id).inserted else { return nil }
         let baselineTitle = recording.title
+        let lifetime = libraryLedger.begin()
         let task = Task { @MainActor [weak self] () -> Bool in
-            defer { if !Task.isCancelled { self?.calendarTasks[id] = nil } }
+            defer {
+                self?.libraryLedger.finish(lifetime)
+                if !Task.isCancelled { self?.calendarTasks[id] = nil }
+            }
             guard let match = await calendar.match(for: recording, startedAt: startedAt),
                   !Task.isCancelled, let self else { return false }
             // The event is independent of transcription: persist it even
@@ -402,8 +422,10 @@ final class PostRecordingCoordinator: ObservableObject {
             ? openAIModelName : nil
         let waitTimeout = transcriptWaitTimeout
         autoSuggestingIDs.insert(id)
+        let lifetime = libraryLedger.begin()
         let task = Task { @MainActor [weak self] in
             defer {
+                self?.libraryLedger.finish(lifetime)
                 self?.autoSuggestingIDs.remove(id)
                 // Only relinquish the tracked-task slot if we finished on our
                 // own. If we were cancelled it's because a replacement task
@@ -583,8 +605,10 @@ final class PostRecordingCoordinator: ObservableObject {
         // are resolved later, inside the Task — they only exist once
         // transcription has written them.
         let byPath = llm.actionDeliversTranscriptByPath
+        let lifetime = libraryLedger.begin()
         let task = Task { @MainActor [weak self] in
             defer {
+                self?.libraryLedger.finish(lifetime)
                 // Only relinquish the slot if we finished on our own. If we
                 // were cancelled, a replacement send (or `cancelAndDiscard`)
                 // took over the slot — clearing it here would orphan the

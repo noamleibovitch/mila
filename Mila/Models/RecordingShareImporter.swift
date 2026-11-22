@@ -157,6 +157,22 @@ final class RecordingShareImporter: ObservableObject {
 
     private let fileManager = FileManager.default
     private var queue: [URL] = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Shared recording import", reason: "A shared recording is being staged or saved.")
+    private var stageTicket: RecordingLibraryWorkLedger.Ticket?
+
+    func resetLibraryContext() {
+        lastImport = nil
+        refusalMessage = nil
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !queue.isEmpty || isStaging || isImporting || pending != nil || stageTicket != nil {
+            return .busy("Shared recording import", "Finish the shared recording import before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Shared recording import", generation: libraryLedger.generation)
+    }
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingShare")
 
     init(store: RecordingStore,
@@ -233,6 +249,7 @@ final class RecordingShareImporter: ObservableObject {
         // same run-loop turn, and two concurrent stagings would race to set
         // `pending`, leaking the loser's staging directory.
         isStaging = true
+        stageTicket = libraryLedger.begin()
         Task { await stage(next) }
     }
 
@@ -241,6 +258,10 @@ final class RecordingShareImporter: ObservableObject {
     private func stage(_ url: URL) async {
         defer {
             isStaging = false
+            if let ticket = stageTicket {
+                stageTicket = nil
+                libraryLedger.finish(ticket)
+            }
             pumpQueue()
         }
         // The file may live outside anything the app was granted (a download
@@ -529,6 +550,8 @@ final class RecordingShareImporter: ObservableObject {
         // staged) may start even if the abandoned copy is still unwinding.
         guard let pending, inFlightTicket != pending.id else { return }
         let ticket = pending.id
+        let lifetime = libraryLedger.begin()
+        defer { libraryLedger.finish(lifetime) }
         inFlightTicket = ticket
         isImporting = true
         defer {
@@ -695,7 +718,12 @@ final class RecordingShareImporter: ObservableObject {
         // A shared .wav gets the same storage treatment as a local one.
         if compressImportedWAV, manifest.audio.format == "wav" {
             let id = recording.id
-            Task { await store.compressRecordingAudio(id: id) }
+            if let ticket = store.beginLibraryWork() {
+                Task {
+                    await store.compressRecordingAudio(id: id)
+                    store.finishLibraryWork(ticket)
+                }
+            }
         }
     }
 

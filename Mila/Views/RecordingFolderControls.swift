@@ -74,6 +74,7 @@ struct RecordingFolderMenu: View {
     @EnvironmentObject private var store: RecordingStore
     let recordingID: UUID
     let currentFolder: String?
+    let libraryContext: RecordingLibraryActivity.Context?
 
     @State private var showingNewFolderAlert = false
     @State private var newFolderName = ""
@@ -119,6 +120,7 @@ struct RecordingFolderMenu: View {
     }
 
     private func assign(_ folder: String?) {
+        guard let libraryContext, store.admitLibraryInput(libraryContext) else { return }
         guard let rec = store.recordings.first(where: { $0.id == recordingID }) else { return }
         store.assign(rec, toFolder: folder)
     }

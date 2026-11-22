@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import Mila
 
 final class RecordingLibraryFileCopyTests: XCTestCase {
@@ -30,6 +31,27 @@ final class RecordingLibraryFileCopyTests: XCTestCase {
                 XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(name)), Data(text.utf8))
                 XCTAssertEqual(try Data(contentsOf: stage.appendingPathComponent(name)), Data(text.utf8))
             }
+        }
+    }
+
+    func test_file_completion_counts_follow_verified_files_including_empty_files() throws {
+        try fixture { root, stage in
+            let names = ["empty.txt", "large.wav", "small.srt"]
+            let bytes = [Data(), Data(repeating: 7, count: 2_097_152), Data([1])]
+            for (name, data) in zip(names, bytes) {
+                try data.write(to: root.appendingPathComponent(name))
+            }
+            let entries = try RecordingLibraryFileCopy.inspect(names.map { root.appendingPathComponent($0) })
+            var counts: [Int] = []
+            var lastBytes: UInt64 = 0
+            try RecordingLibraryFileCopy.copy(entries, into: stage,
+                progress: { lastBytes = $0 }, completedFile: { count in
+                    counts.append(count)
+                    let file = stage.appendingPathComponent(names[count - 1])
+                    XCTAssertEqual(try? Data(contentsOf: file), bytes[count - 1])
+                })
+            XCTAssertEqual(counts, [1, 2, 3])
+            XCTAssertEqual(lastBytes, 2_097_153)
         }
     }
 
@@ -84,6 +106,26 @@ final class RecordingLibraryFileCopyTests: XCTestCase {
             XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
                            Set(["large.wav", stage.lastPathComponent]))
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: stage.path), ["large.wav"])
+        }
+    }
+}
+
+extension RecordingLibraryFileCopyTests {
+    func test_created_callback_reports_the_verified_staged_identity() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("audio.wav")
+            try Data("verified bytes".utf8).write(to: source)
+            let entries = try RecordingLibraryFileCopy.inspect([source])
+            var reported: (name: String, device: UInt64, inode: UInt64)?
+            try RecordingLibraryFileCopy.copy(entries, into: stage, created: { name, device, inode in
+                reported = (name, device, inode)
+            })
+            let staged = stage.appendingPathComponent("audio.wav")
+            var info = stat()
+            XCTAssertEqual(lstat(staged.path, &info), 0)
+            XCTAssertEqual(reported?.name, "audio.wav")
+            XCTAssertEqual(reported?.device, UInt64(info.st_dev))
+            XCTAssertEqual(reported?.inode, UInt64(info.st_ino))
         }
     }
 }

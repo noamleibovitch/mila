@@ -130,7 +130,8 @@ extension View {
     /// it and runs the save panel with the chosen profiles.
     func recordingShareSheet(selection: Binding<SharedSpeakersExportSelection?>,
                              recording: Recording,
-                             store: RecordingStore) -> some View {
+                             store: RecordingStore,
+                             libraryContext: RecordingLibraryActivity.Context?) -> some View {
         sheet(isPresented: Binding(
             get: { selection.wrappedValue != nil },
             set: { if !$0 { selection.wrappedValue = nil } }
@@ -143,10 +144,15 @@ extension View {
                         set: { selection.wrappedValue = $0 }
                     ),
                     onSave: {
+                        guard let libraryContext, store.admitLibraryInput(libraryContext) else {
+                            selection.wrappedValue = nil
+                            return
+                        }
                         let profiles = SharedSpeakerProfileExporter.manifestEntries(
                             selection.wrappedValue ?? current)
                         selection.wrappedValue = nil
                         Task { @MainActor in
+                            guard store.admitLibraryInput(libraryContext) else { return }
                             await RecordingShareExporter.saveInteractively(
                                 recording, store: store, profiles: profiles)
                         }

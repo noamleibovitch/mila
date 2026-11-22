@@ -123,9 +123,15 @@ final class RecordingLibraryInspectionTests: XCTestCase {
             }
             row.status = .completed
             _ = try encode([row], into: layout.index)
-            XCTAssertThrowsError(try RecordingLibraryInspection.inspect(layout)) {
-                XCTAssertEqual($0 as? RecordingLibraryInspection.Problem, .missingAudio)
+            // A historically lost audio file is preserved metadata, not a
+            // reason to lock the user out of their own library. The preview
+            // counts it so the UI can warn without dropping the row or UUID.
+            guard case .existing(let missing) = try RecordingLibraryInspection.inspect(layout) else {
+                return XCTFail("A completed row with missing audio must remain adoptable")
             }
+            XCTAssertEqual(missing.missingAudioCount, 1)
+            XCTAssertEqual(missing.recordings.first?.id, row.id)
+            XCTAssertTrue(missing.files.contains { $0.name == "recordings.json" })
             try Data("wav".utf8).write(to: custom.appendingPathComponent("same.wav"))
             let second = Recording(title: "Other", duration: 1, source: .microphone,
                                    audioFileName: "same.m4a", status: .completed)
@@ -155,6 +161,22 @@ final class RecordingLibraryInspectionTests: XCTestCase {
             let nested = try RecordingLibraryInspection.Layout(directory: custom.appendingPathComponent("nested"), defaultRoot: app)
             XCTAssertFalse(layout.isSeparate(from: nested))
             XCTAssertFalse(layout.isSeparate(from: layout))
+        }
+    }
+}
+
+extension RecordingLibraryInspectionTests {
+    func test_folder_metadata_without_an_index_is_preserved_as_a_copy_case() throws {
+        try fixture { _, app, custom in
+            let layout = try RecordingLibraryInspection.Layout(directory: custom, defaultRoot: app)
+            try Data("[\"Empty folder\"]".utf8).write(to: layout.folders)
+            guard case .existing(let snapshot) = try RecordingLibraryInspection.inspect(layout) else {
+                return XCTFail("A named empty folder is metadata, not an empty folder")
+            }
+            XCTAssertTrue(snapshot.recordings.isEmpty)
+            XCTAssertEqual(snapshot.folderNames, ["Empty folder"])
+            XCTAssertEqual(snapshot.files.map(\.name), ["folders.json"])
+            XCTAssertEqual(snapshot.indexBytes, Data())
         }
     }
 }

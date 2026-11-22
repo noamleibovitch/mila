@@ -10,6 +10,14 @@ final class RecordingLibraryActivity {
         fileprivate let id: UUID
     }
 
+    /// Codable, opaque handle for a `Context` that must travel outside the
+    /// MainActor — chiefly the drag-and-drop payload. Possession of the token
+    /// proves nothing; it only lets a drop ask whether the library it was
+    /// dragged from is still current.
+    struct ContextToken: Codable, Hashable, Sendable {
+        fileprivate let rawValue: UUID
+    }
+
     struct Ticket: Hashable, Sendable {
         let context: Context
         fileprivate let id: UUID
@@ -17,7 +25,7 @@ final class RecordingLibraryActivity {
 
     struct Snapshot: Equatable, Sendable {
         let context: Context
-        fileprivate let generation: UInt64
+        let generation: UInt64
         let outstandingCount: Int
     }
 
@@ -39,6 +47,8 @@ final class RecordingLibraryActivity {
 
     var isCommitting: Bool { committing }
 
+    var contextToken: ContextToken { ContextToken(rawValue: context.id) }
+
     /// nil means admission was refused. Callers must surface a busy outcome;
     /// they must not start work and later drop its completion.
     func beginWork() -> Ticket? {
@@ -56,6 +66,10 @@ final class RecordingLibraryActivity {
 
     func isCurrent(_ captured: Context) -> Bool {
         captured == context
+    }
+
+    func isCurrent(_ token: ContextToken) -> Bool {
+        token.rawValue == context.id
     }
 
     /// Count every attempted library mutation, including failed persistence.

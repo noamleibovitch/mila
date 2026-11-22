@@ -399,13 +399,14 @@ struct ContentView: View {
             FolderListView(folderName: name, search: search, selection: $selection)
         case .recording(let id):
             if let rec = store.recordings.first(where: { $0.id == id }) {
-                // .id(rec.id) forces SwiftUI to discard and rebuild the view
-                // when the user navigates between recordings. Without it,
-                // @State like isEditingTitle / titleDraft survives, and the
-                // focus-loss commit on the next view would rename the new
-                // recording with the previous one's draft.
+                // The identity includes the library epoch as well as the row
+                // id: a different library can hold the same UUID (and file
+                // name), and cached player / title-edit state must never
+                // follow it across the switch.
                 RecordingDetailView(recording: rec)
-                    .id(rec.id)
+                    .id(RecordingDetailIdentity(
+                        recordingID: rec.id,
+                        libraryContext: store.libraryActivity.contextToken))
                     .onAppear {
                         print("ContentView.detail: showing recording \(rec.id.uuidString.prefix(8)) status=\(rec.status) segs=\(rec.segments.count) summary=\(rec.summary?.isEmpty == false) items=\(rec.actionItems?.count ?? 0)")
                     }
@@ -418,6 +419,11 @@ struct ContentView: View {
             }
         }
     }
+}
+
+private struct RecordingDetailIdentity: Hashable {
+    let recordingID: UUID
+    let libraryContext: RecordingLibraryActivity.ContextToken
 }
 
 private struct ModelDownloadBanner: View {
@@ -746,6 +752,9 @@ private struct QueueRow: View {
     /// Trash to restore from (same rationale as the context menu's permanent
     /// delete), so a stray click can't silently discard a recording.
     @State private var confirmingRemove = false
+    /// Epoch captured when this queue row was presented, so its delayed
+    /// Remove confirmation cannot delete a same-UUID row after a switch.
+    @State private var libraryContext: RecordingLibraryActivity.Context?
 
     private var isActive: Bool {
         transcription.activeRecordingID == recording.id
@@ -831,6 +840,7 @@ private struct QueueRow: View {
         } message: {
             Text("Transcription stops and the audio file is permanently deleted. This can't be undone.")
         }
+        .onAppear { libraryContext = store.libraryActivity.context }
     }
 
     /// Stop the transcription and move the recording to Recently Deleted so it
@@ -849,6 +859,7 @@ private struct QueueRow: View {
     /// the selection home if this row was selected so we don't leave a dangling
     /// detail pane.
     private func remove() {
+        guard let libraryContext, store.admitLibraryInput(libraryContext) else { return }
         transcription.cancel(recordingID: recording.id)
         store.permanentlyDelete(recording)
         if case .recording(let id) = selection, id == recording.id {

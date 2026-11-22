@@ -329,6 +329,9 @@ struct MilaApp: App {
 
     @StateObject private var store: RecordingStore
     @StateObject private var storageSettings: RecordingStorageSettings
+    @StateObject private var libraryReadiness: RecordingLibraryReadiness
+    @StateObject private var recordingLocation: RecordingLocationCoordinator
+    @StateObject private var startupRecoveryWork: StartupRecoveryWork
     @StateObject private var modelManager: ModelManager
     @StateObject private var transcription: TranscriptionService
     @StateObject private var dictation: DictationController
@@ -414,6 +417,17 @@ struct MilaApp: App {
         return UserDefaults(suiteName: "Mila.AutoSaveUITests.\(id.uuidString)")!
     }
 
+    /// Settings location UI tests use their own UUID-owned defaults suite so
+    /// a bookmark never lands in the user's standard domain.
+    static func storageUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard arguments.contains("--uitests"),
+              arguments.contains("--ui-test-clean-store"),
+              let arg = arguments.first(where: { $0.hasPrefix("--ui-test-storage-suite=") }) else { return nil }
+        let raw = String(arg.dropFirst("--ui-test-storage-suite=".count))
+        guard let id = UUID(uuidString: raw) else { return nil }
+        return UserDefaults(suiteName: "Mila.StorageUITests.\(id.uuidString)")
+    }
+
     /// Seed the synthetic batch fixture INSIDE the target's preference home.
     /// All three test flags plus a UUID-owned suite are required; a normal
     /// launch never enters this path or changes the user's preferences.
@@ -436,12 +450,16 @@ struct MilaApp: App {
         // resolution; we apply any user override by calling
         // `relocateRecordings(to:)` once both are constructed.
         let store = RecordingStore()
+        let startupWork = StartupRecoveryWork()
+        startupWork.begin()
         // The auto-save end-to-end check needs its preference to persist
         // across a relaunch without ever touching the user's real defaults.
         // `--ui-test-auto-save-suite=<UUID>` redirects just this object at a
         // test-owned suite; anything malformed — or the flag absent — keeps
         // normal production behaviour (`.standard`).
-        let fixtureDefaults = Self.prepareBatchUITestDefaults() ?? Self.autoSaveUITestDefaults()
+        let fixtureDefaults = Self.prepareBatchUITestDefaults()
+            ?? Self.storageUITestDefaults()
+            ?? Self.autoSaveUITestDefaults()
         let storage = RecordingStorageSettings(defaults: fixtureDefaults ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
@@ -1142,6 +1160,39 @@ struct MilaApp: App {
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
 
+        let readiness = RecordingLibraryReadiness()
+        readiness.add { store.libraryMigrationWorkState }
+        readiness.add { actions.libraryWorkState }
+        readiness.add { dictationController.libraryWorkState }
+        readiness.add { svc.libraryWorkState }
+        readiness.add { summarizer.libraryWorkState }
+        readiness.add { nameSuggester.libraryWorkState }
+        readiness.add { coordinator.libraryWorkState }
+        readiness.add { postCommand.libraryWorkState }
+        readiness.add { vmImporter.libraryWorkState }
+        readiness.add { shareImporter.libraryWorkState }
+        readiness.add { offlineEmbedder.libraryWorkState }
+        readiness.add { startupWork.libraryWorkState }
+        let location = RecordingLocationCoordinator(store: store,
+                                                      storage: storage,
+                                                      readiness: readiness)
+        _libraryReadiness = StateObject(wrappedValue: readiness)
+        _recordingLocation = StateObject(wrappedValue: location)
+        _startupRecoveryWork = StateObject(wrappedValue: startupWork)
+        location.isMCPEnabled = { [weak mcpAccess] in mcpAccess?.enabled == true }
+        store.onLibraryActivated = { [weak coordinator, weak postCommand, weak offlineEmbedder,
+                                     weak svc, weak shareImporter, weak actions,
+                                     weak summarizer, weak nameSuggester] in
+            coordinator?.resetLibraryContext()
+            postCommand?.resetLibraryContext()
+            offlineEmbedder?.resetLibraryContext()
+            svc?.resetLibraryContext()
+            shareImporter?.resetLibraryContext()
+            actions?.resetLibraryContext()
+            summarizer?.resetLibraryContext()
+            nameSuggester?.resetLibraryContext()
+        }
+
         // Seed the local-model retention BEFORE any `.task` can call
         // `prewarm`. Live transcription needs the weights warm; a batch-only
         // session must not load them at launch. A remote-backend user has no
@@ -1218,6 +1269,8 @@ struct MilaApp: App {
             ContentView()
                 .environmentObject(store)
                 .environmentObject(storageSettings)
+                .environmentObject(libraryReadiness)
+                .environmentObject(recordingLocation)
                 .environmentObject(modelManager)
                 .environmentObject(transcription)
                 .environmentObject(dictation)
@@ -1345,7 +1398,7 @@ struct MilaApp: App {
                     Task { await actions.toggleVoiceMemo() }
                 }
                 .keyboardShortcut("n", modifiers: .command)
-                .disabled(actions.isStartingRecording)
+                .disabled(actions.isStartingRecording || store.isChangingRecordingsLocation)
                 Button("Open Audio File…") {
                     Task { await actions.openFiles() }
                 }
@@ -1361,9 +1414,11 @@ struct MilaApp: App {
                 Button("English Dictation (\(hotkeySettings.binding(for: .dictateEnglish).displayName))") {
                     Task { await dictation.toggle(action: .dictateEnglish) }
                 }
+                .disabled(store.isChangingRecordingsLocation)
                 Button("Hebrew Dictation (\(hotkeySettings.binding(for: .dictateHebrew).displayName))") {
                     Task { await dictation.toggle(action: .dictateHebrew) }
                 }
+                .disabled(store.isChangingRecordingsLocation)
             }
             // Surface the diagnostic-report action under Help so a user
             // with a bug to report can hand off a zip without us asking
@@ -1389,6 +1444,8 @@ struct MilaApp: App {
             SettingsView()
                 .environmentObject(store)
                 .environmentObject(storageSettings)
+                .environmentObject(libraryReadiness)
+                .environmentObject(recordingLocation)
                 .environmentObject(modelManager)
                 .environmentObject(hotkeySettings)
                 .environmentObject(transcription)
@@ -1472,6 +1529,7 @@ struct MilaApp: App {
         // wiring ran).
         appDelegate.configImporter = configImporter
         appDelegate.shareImporter = shareImporter
+        appDelegate.recordingLocation = recordingLocation
         appDelegate.configureMenuBar(actions: actions,
                                      transcription: transcription,
                                      session: session,
@@ -2446,6 +2504,8 @@ struct MilaApp: App {
     /// `.failed` in the list so empty orphans don't nag the user at
     /// launch.
     private func enqueueRecoveredRecordings() async {
+        startupRecoveryWork.begin()
+        defer { startupRecoveryWork.finish() }
         // 1. Resurrect stale mid-flight recordings. The current process
         //    hasn't started its worker loop yet, so anything still flagged
         //    `.running` (died mid-transcription) or `.pending` (queued but
@@ -2693,6 +2753,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var configImporter: MilaConfigImporter?
     weak var shareImporter: RecordingShareImporter?
     weak var postCommand: PostRecordingCommandRunner?
+    weak var recordingLocation: RecordingLocationCoordinator?
 
     /// Resident window + menu-bar leaf. Both live for the app's lifetime with
     /// the delegate, not with a window/menu that can close. Neither is an
@@ -2771,6 +2832,28 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // explanation or hide a window on the way out.
         menuBarWindow.beginTermination()
         if didShutDown { return .terminateNow }
+        if let recordingLocation, recordingLocation.isSettlingCopy {
+            let alert = NSAlert()
+            alert.messageText = "Stop copying and quit?"
+            alert.informativeText = "Mila is still copying your recordings. Your original recordings are unchanged. Keep copying to finish the folder change, or stop and quit."
+            alert.addButton(withTitle: "Keep copying")
+            alert.addButton(withTitle: "Stop and quit")
+            switch alert.runModal() {
+            case .alertSecondButtonReturn:
+                didShutDown = true
+                recordingLocation.cancel()
+                Task { @MainActor [weak self] in
+                    while recordingLocation.isSettlingCopy {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                    await self?.gracefulShutdown()
+                    sender.reply(toApplicationShouldTerminate: true)
+                }
+                return .terminateLater
+            default:
+                return .terminateCancel
+            }
+        }
         didShutDown = true
         Task { @MainActor [weak self] in
             await self?.gracefulShutdown()
@@ -3175,6 +3258,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             if let dictation = self.dictation, case .recording = dictation.state {
                 print("Sleep guard: cancelling dictation before system sleeps")
                 await dictation.cancelInFlight()
+            }
+            if let location = self.recordingLocation, location.isSettlingCopy {
+                location.cancel()
             }
         }
     }

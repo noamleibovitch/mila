@@ -20,11 +20,32 @@ enum SidebarSelection: Hashable {
 /// Wire payload for drag-and-drop of recordings from a list row onto a
 /// sidebar folder. Transferable-conforming so SwiftUI's `.draggable` /
 /// `.dropDestination` can carry it without manual NSItemProvider plumbing.
+///
+/// The context token is captured when the drag starts. A drop must refuse a
+/// payload whose token is missing (a payload written by an older build) or no
+/// longer current: the destination library may hold a different recording
+/// with the same UUID and file name.
 struct RecordingDragPayload: Codable, Transferable, Hashable {
     let id: UUID
+    let contextToken: RecordingLibraryActivity.ContextToken?
+
+    init(id: UUID, contextToken: RecordingLibraryActivity.ContextToken?) {
+        self.id = id
+        self.contextToken = contextToken
+    }
 
     static var transferRepresentation: some TransferRepresentation {
         CodableRepresentation(contentType: .islandWhisperRecording)
+    }
+
+    /// The current-library recording this drag names, or nil when the token
+    /// is missing/stale or the row is gone. Drop handlers must use this
+    /// rather than `store.recordings.first(where:)`, which would happily
+    /// resolve a same-UUID row in a different library.
+    @MainActor
+    func recording(in store: RecordingStore) -> Recording? {
+        guard let contextToken, store.admitLibraryInput(contextToken) else { return nil }
+        return store.recordings.first(where: { $0.id == id })
     }
 }
 
@@ -36,6 +57,7 @@ struct SidebarView: View {
     @Binding var selection: SidebarSelection?
     @EnvironmentObject private var store: RecordingStore
 
+    @State private var folderInputContext: RecordingLibraryActivity.Context?
     @State private var showingNewFolderSheet = false
     @State private var newFolderName = ""
     @State private var renameTarget: String?
@@ -52,6 +74,7 @@ struct SidebarView: View {
     private var allTranscriptionsExpanded = false
 
     var body: some View {
+        let context = store.libraryActivity.context
         List(selection: $selection) {
             Section {
                 Label("Home", systemImage: "house")
@@ -79,10 +102,9 @@ struct SidebarView: View {
                     expanded: $allTranscriptionsExpanded,
                     hasRecordings: !unfiled.isEmpty
                 ) { payload in
-                    if let id = payload?.id,
-                       let rec = store.recordings.first(where: { $0.id == id }) {
-                        store.assign(rec, toFolder: nil)
-                    }
+                    guard let rec = payload?.recording(in: store) else { return false }
+                    store.assign(rec, toFolder: nil)
+                    return true
                 }
 
                 if allTranscriptionsExpanded {
@@ -96,18 +118,20 @@ struct SidebarView: View {
                               systemImage: "folder",
                               selection: .folder(name),
                               identifier: "sidebar.folder.\(name)") { payload in
-                        if let id = payload?.id,
-                           let rec = store.recordings.first(where: { $0.id == id }) {
-                            store.assign(rec, toFolder: name)
-                        }
+                        guard let rec = payload?.recording(in: store) else { return false }
+                        store.assign(rec, toFolder: name)
+                        return true
                     }
                     .contextMenu {
                         Button("Rename Folder…") {
+                            guard store.admitLibraryInput(context) else { return }
+                            folderInputContext = context
                             renameDraft = name
                             renameError = nil
                             renameTarget = name
                         }
                         Button("Delete Folder", role: .destructive) {
+                            guard store.admitLibraryInput(context) else { return }
                             store.deleteFolder(name)
                             if case .folder(let sel) = selection, sel == name {
                                 selection = .defaultFolder
@@ -125,6 +149,8 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
                     .onTapGesture {
+                        guard store.admitLibraryInput(context) else { return }
+                        folderInputContext = context
                         newFolderName = ""
                         showingNewFolderSheet = true
                     }
@@ -157,6 +183,10 @@ struct SidebarView: View {
                 confirmLabel: "Create",
                 name: $newFolderName,
                 onConfirm: {
+                    guard let folderInputContext, store.admitLibraryInput(folderInputContext) else {
+                        showingNewFolderSheet = false
+                        return
+                    }
                     if let created = store.createFolder(newFolderName) {
                         selection = .folder(created)
                     }
@@ -175,6 +205,10 @@ struct SidebarView: View {
                 name: $renameDraft,
                 errorText: $renameError,
                 onConfirm: {
+                    guard let folderInputContext, store.admitLibraryInput(folderInputContext) else {
+                        renameTarget = nil
+                        return
+                    }
                     // nil = rejected (name collides with an existing
                     // folder). Keep the sheet open with an inline error
                     // instead of silently closing as if it worked.
@@ -211,7 +245,7 @@ extension SidebarView {
                    systemImage: String,
                    selection: SidebarSelection,
                    identifier: String,
-                   onDrop: @escaping (RecordingDragPayload?) -> Void) -> some View {
+                   onDrop: @escaping (RecordingDragPayload?) -> Bool) -> some View {
         FolderRow(label: label,
                   systemImage: systemImage,
                   selection: selection,
@@ -234,7 +268,7 @@ private struct FolderRow: View {
     let systemImage: String
     let selection: SidebarSelection
     let identifier: String
-    let onDrop: (RecordingDragPayload?) -> Void
+    let onDrop: (RecordingDragPayload?) -> Bool
 
     @State private var isTargeted = false
 
@@ -246,8 +280,7 @@ private struct FolderRow: View {
         .contentShape(Rectangle())
         .dropDestination(for: RecordingDragPayload.self) { items, _ in
             guard let first = items.first else { return false }
-            onDrop(first)
-            return true
+            return onDrop(first)
         } isTargeted: { isTargeted = $0 }
         .tag(selection)
         .accessibilityIdentifier(identifier)
@@ -272,7 +305,7 @@ private struct AllTranscriptionsRow: View {
     /// When there are no unfiled recordings the triangle is hidden (but its
     /// space is kept) so the label stays aligned with the sibling folders.
     let hasRecordings: Bool
-    let onDrop: (RecordingDragPayload?) -> Void
+    let onDrop: (RecordingDragPayload?) -> Bool
 
     @State private var isTargeted = false
 
@@ -300,8 +333,7 @@ private struct AllTranscriptionsRow: View {
         .contentShape(Rectangle())
         .dropDestination(for: RecordingDragPayload.self) { items, _ in
             guard let first = items.first else { return false }
-            onDrop(first)
-            return true
+            return onDrop(first)
         } isTargeted: { isTargeted = $0 }
         .tag(SidebarSelection.defaultFolder)
         .accessibilityIdentifier("sidebar.folder.default")
@@ -327,6 +359,8 @@ private struct RecordingSubRow: View {
     let recording: Recording
     @Binding var selection: SidebarSelection?
 
+    @EnvironmentObject private var store: RecordingStore
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(recording.title)
@@ -343,7 +377,8 @@ private struct RecordingSubRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .tag(SidebarSelection.recording(recording.id))
-        .draggable(RecordingDragPayload(id: recording.id))
+        .draggable(RecordingDragPayload(id: recording.id,
+                                        contextToken: store.libraryActivity.contextToken))
         .recordingContextMenu(recording: recording, selection: $selection)
         .accessibilityIdentifier("sidebar.recording.\(recording.title)")
     }
@@ -490,8 +525,7 @@ private struct SidebarFooter: View {
             .foregroundStyle(.secondary)
             .accessibilityIdentifier("sidebar.trash")
             .dropDestination(for: RecordingDragPayload.self) { items, _ in
-                if let id = items.first?.id,
-                   let rec = store.recordings.first(where: { $0.id == id }) {
+                if let rec = items.first?.recording(in: store) {
                     store.softDelete(rec)
                     return true
                 }

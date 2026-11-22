@@ -9,23 +9,20 @@ import AppKit
 /// The chosen folder is persisted via a security-scoped bookmark; see
 /// `RecordingStorageSettings` for the resolution / fallback rules.
 ///
-/// Picking a new directory swaps the in-flight `RecordingStore` over to it
-/// — new recordings land in the new folder immediately, and the sidebar
-/// re-scans the new location for any pre-existing `recordings.json`.
-/// Old recordings stay where they were on disk; this tab does **not**
-/// move them, by design (a multi-GB copy on the main thread is not a
-/// thing we want to do during a settings change). The user can hand-
-/// move them or use the "Move existing recordings…" affordance below.
+/// A folder choice is provisional until the user confirms one explicit
+/// choice in the change sheet. Mila can copy the existing library, start an
+/// empty list, or adopt a complete existing library; it never merges two
+/// folders and never deletes the originals. The copy and its verification run
+/// off the main actor.
 struct StorageSettingsTab: View {
     @EnvironmentObject private var storage: RecordingStorageSettings
     @EnvironmentObject private var store: RecordingStore
-    /// Watched so the "Choose…" / "Reset" affordances can refuse to
-    /// relocate mid-recording — see `applyChosenDirectory` for the
-    /// failure mode this guards (in-flight WAV orphaned in the old
-    /// directory after the store flips its `recordingsDirectory`).
+    /// Watched so the location affordances can refuse while a real writer is
+    /// active. The coordinator aggregates every owner's full-lifetime state.
     @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var coordinator: RecordingLocationCoordinator
+    @EnvironmentObject private var readiness: RecordingLibraryReadiness
 
-    @State private var lastError: String?
     @State private var isCompressing = false
     @State private var compressStatus: String?
 
@@ -39,11 +36,18 @@ struct StorageSettingsTab: View {
                 if storage.lastResolutionWasStale {
                     staleBookmarkNotice
                 }
-                if let lastError {
-                    Text(lastError)
+                if case .noOp(let message) = coordinator.phase {
+                    Text(message)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !coordinator.isSheetPresented, case .failure(let message) = coordinator.phase {
+                    Text(message)
                         .font(.callout)
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityAddTraits(.isStaticText)
                 }
                 // Obsidian vault destination lives under Storage rather than
                 // in a top-level tab (originally to keep the tab bar from
@@ -68,13 +72,25 @@ struct StorageSettingsTab: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .task {
+            // Settings-local polling only; it never publishes from the App
+            // scene and stops when the tab goes away.
+            while !Task.isCancelled {
+                readiness.refresh()
+                try? await Task.sleep(nanoseconds: 750_000_000)
+            }
+        }
+        .sheet(isPresented: Binding(get: { coordinator.isSheetPresented },
+                                    set: { if !$0 { coordinator.dismiss() } })) {
+            RecordingLocationChangeSheet(coordinator: coordinator)
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Recordings location")
                 .font(.title3.weight(.semibold))
-            Text("New voice memos, dictations, and meeting transcripts are saved here together with their metadata. Existing recordings stay where they were — pick a new folder and Mila re-scans it for any prior content, otherwise it starts fresh.")
+            Text("Choose a folder for your recordings. Mila can copy your recordings there, start with an empty list, or use an existing Mila recordings folder. Your current recordings stay where they are.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -87,11 +103,13 @@ struct StorageSettingsTab: View {
                 Image(systemName: "folder.fill")
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(displayPath(store.recordingsDirectory))
+                    Text(verbatim: displayPath(store.recordingsDirectory))
                         .font(.callout.monospaced())
                         .textSelection(.enabled)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
+                        .environment(\.layoutDirection, .leftToRight)
                     Text(isCustom ? "Custom location" : "Default location")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -99,24 +117,54 @@ struct StorageSettingsTab: View {
                 Spacer()
             }
             HStack(spacing: 8) {
-                Button("Choose…") { chooseFolder() }
-                    .disabled(actions.isRecording)
-                    .help(actions.isRecording
-                          ? "Stop the current recording to change the storage location"
-                          : "Pick a folder for new recordings")
-                    .accessibilityIdentifier("storage.chooseFolder.button")
+                Button("Choose…") { coordinator.chooseFolder() }
+                .disabled(isLocationBusy)
+                .help(isLocationBusy ? busyText : "Check a recordings folder before switching.")
+                .accessibilityValue(isLocationBusy ? busyText : "Ready")
+                .accessibilityIdentifier("storage.chooseFolder.button")
                 Button("Reveal in Finder") { revealInFinder() }
                 Spacer()
-                Button("Reset to default") { resetToDefault() }
-                    .disabled(!isCustom || actions.isRecording)
-                    .help(actions.isRecording
-                          ? "Stop the current recording to reset the storage location"
-                          : "Use the default Application Support location")
-                    .accessibilityIdentifier("storage.resetDefault.button")
+                Button("Use default location…") { coordinator.useDefaultLocation() }
+                .disabled(isLocationBusy)
+                .help(isLocationBusy ? busyText : "Check the default recordings folder before switching.")
+                .accessibilityValue(isLocationBusy ? busyText : "Ready")
+                .accessibilityIdentifier("storage.resetDefault.button")
+            }
+            if isLocationBusy {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "hourglass")
+                        .foregroundStyle(.secondary)
+                    Text(busyText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(busyText)
             }
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var isLocationBusy: Bool {
+        coordinator.isWorking || !readiness.latest.isIdle
+    }
+
+    private var busyText: String {
+        if case .finishing = coordinator.phase {
+            return "Finishing the folder change. This can’t be canceled."
+        }
+        if coordinator.isSettlingCopy {
+            return "Finish changing the recordings folder before recording. Cancel to record first."
+        }
+        if coordinator.isWorking {
+            return "Finish checking or choosing the recordings folder before trying again."
+        }
+        if let reason = readiness.latest.firstBlocker?.reason {
+            return "Finish recording or processing before changing folders. \(reason)"
+        }
+        return "Finish recording or processing before changing folders."
     }
 
     /// Storage cap: a stepper for the GB limit + the current usage. New
@@ -257,69 +305,6 @@ struct StorageSettingsTab: View {
             return "~" + path.dropFirst(home.count)
         }
         return path
-    }
-
-    private func chooseFolder() {
-        lastError = nil
-        let panel = NSOpenPanel()
-        panel.title = "Choose a folder for new recordings"
-        panel.prompt = "Choose"
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true
-        panel.directoryURL = storage.customDirectory ?? store.recordingsDirectory
-        // Show modal — Settings is its own window, so a sheet-style
-        // presentation feels off; the standard open panel matches the
-        // pattern other macOS apps use for their "pick a folder"
-        // affordances.
-        let response = panel.runModal()
-        guard response == .OK, let url = panel.url else { return }
-        applyChosenDirectory(url)
-    }
-
-    private func applyChosenDirectory(_ url: URL) {
-        // Refuse to relocate while a recording is in progress. The
-        // in-flight WAV is being written to the OLD
-        // `recordingsDirectory` (the URL was resolved at recording
-        // start via `freshAudioURL`); after `relocateRecordings`,
-        // `store.audioURL(for:)` would resolve under the NEW
-        // directory, so `stopRecording → store.add` would register a
-        // recording whose audio file physically lives at a stale
-        // path. Playback and transcription would both fail with the
-        // file missing. Bugbot finding on PR #26.
-        if actions.isRecording {
-            lastError = "A recording is in progress. Stop the recording before changing the storage location."
-            return
-        }
-        // Don't allow picking the model cache — it's inside the
-        // Application Support tree and the user almost certainly
-        // didn't mean to mix recordings into it. Trying to do that
-        // would also break in subtle ways because we'd start treating
-        // model files as orphan recordings.
-        if url.path == store.modelsDirectory.path {
-            lastError = "That folder is reserved for whisper models. Please pick a different location."
-            return
-        }
-        guard storage.setDirectory(url) else {
-            lastError = "Couldn't save that folder. Try a different location (some network/cloud volumes can't be bookmarked)."
-            return
-        }
-        store.relocateRecordings(to: storage.customDirectory)
-    }
-
-    private func resetToDefault() {
-        // Same recording-in-progress guard as applyChosenDirectory —
-        // resetting also calls `store.relocateRecordings(to:)`, which
-        // would orphan an in-flight WAV at the previous custom
-        // location.
-        if actions.isRecording {
-            lastError = "A recording is in progress. Stop the recording before resetting the storage location."
-            return
-        }
-        lastError = nil
-        storage.clearDirectory()
-        store.relocateRecordings(to: nil)
     }
 
     private func revealInFinder() {

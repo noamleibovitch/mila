@@ -16,6 +16,7 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var summarizer: RecordingSummarizer
     @EnvironmentObject private var liveAI: LiveAISettings
 
+    @State private var libraryContext: RecordingLibraryActivity.Context?
     @State private var title: String
     /// Mila folder the recording should be filed under (nil = unfiled).
     /// Seeded from the recording and applied on Save via `store.assign`.
@@ -213,6 +214,7 @@ struct RenameRecordingSheet: View {
         // Drop the previous pick so applyFolder() cannot file the new
         // recording under the last one.
         .onChange(of: initialRecording.id) { _, _ in
+            libraryContext = store.libraryActivity.context
             // `title` has exactly the same exposure as the folder below, and
             // is the worse half to get wrong: with `userEditedTitle` left true
             // from the previous presentation, both mirrors (`onAppear` and
@@ -229,6 +231,7 @@ struct RenameRecordingSheet: View {
         // being installed — otherwise a Save could write the stale default
         // back over the stored suggestion.
         .onAppear {
+            if libraryContext == nil { libraryContext = store.libraryActivity.context }
             if !userEditedTitle { title = liveRecording.title }
             if !userEditedFolder { selectedFolder = liveRecording.folder }
         }
@@ -251,6 +254,7 @@ struct RenameRecordingSheet: View {
                             isPresented: $confirmingDiscard,
                             titleVisibility: .visible) {
             Button("Discard", role: .destructive) {
+                guard belongsToCurrentLibrary else { return }
                 coordinator.cancelAndDiscard()
             }
             Button("Keep", role: .cancel) { }
@@ -286,6 +290,7 @@ struct RenameRecordingSheet: View {
     /// the two don't run two CLIs at once. Auto-clears its own handle on
     /// completion so we don't keep dead Task references around.
     private func startFetchName() {
+        guard belongsToCurrentLibrary else { return }
         let recordingID = liveRecording.id
         let task = Task { @MainActor in
             await fetchNameFromLLM()
@@ -461,7 +466,7 @@ struct RenameRecordingSheet: View {
             summaryLanguage: liveRecording.summaryLanguageOverride,
             globalOutputLanguage: liveAI.outputLanguage,
             onSetSummaryLanguage: canRegenerateSummary
-                ? { summarizer.setSummaryLanguage($0, for: liveRecording.id) }
+                ? { if belongsToCurrentLibrary { summarizer.setSummaryLanguage($0, for: liveRecording.id) } }
                 : nil,
             // From the row's status, not `TranscriptionService`: the sheet
             // body deliberately does not observe the service (only
@@ -487,7 +492,13 @@ struct RenameRecordingSheet: View {
             .isEmpty
     }
 
+    private var belongsToCurrentLibrary: Bool {
+        guard let libraryContext else { return false }
+        return store.admitLibraryInput(libraryContext)
+    }
+
     private func save() {
+        guard belongsToCurrentLibrary else { return }
         applyFolder()
         coordinator.dismiss(savingTitle: title)
     }
@@ -497,6 +508,7 @@ struct RenameRecordingSheet: View {
     /// `dismiss` on every exit path so anything triggered by the save sees the
     /// recording already filed.
     private func applyFolder() {
+        guard belongsToCurrentLibrary else { return }
         guard let rec = store.recordings.first(where: { $0.id == initialRecording.id }) else { return }
         if rec.folder != selectedFolder {
             store.assign(rec, toFolder: selectedFolder)
@@ -516,6 +528,7 @@ struct RenameRecordingSheet: View {
     /// transcript snapshot may be empty if the user pressed Send before
     /// transcription finished — the coordinator waits for it in that case.
     private func saveAndSend() {
+        guard belongsToCurrentLibrary else { return }
         let recordingID = liveRecording.id
         let prompt = llm.postActionPrompt
         let transcriptSnapshot = transcript
@@ -543,6 +556,7 @@ struct RenameRecordingSheet: View {
     /// review/edit before saving. The hands-off background path lives in
     /// `PostRecordingCoordinator`; this one stays for the explicit button.
     private func fetchNameFromLLM() async {
+        guard let context = libraryContext, store.libraryActivity.isCurrent(context) else { return }
         llmError = nil
         isFetchingName = true
         defer { isFetchingName = false }
@@ -566,6 +580,7 @@ struct RenameRecordingSheet: View {
                 jsonMode: false,
                 feature: .name
             )
+            guard store.libraryActivity.isCurrent(context), !Task.isCancelled else { return }
             let cleaned = PostRecordingCoordinator.cleanedTitle(from: suggestion)
             if cleaned.isEmpty {
                 throw LLMRunnerError.emptyOutput

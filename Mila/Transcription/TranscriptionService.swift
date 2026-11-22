@@ -193,8 +193,29 @@ final class TranscriptionService: ObservableObject {
     var shouldAutoDropShortEmpty: ((_ duration: Double, _ transcript: String) -> Bool)?
 
     private var queue: [Recording] = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Transcription", reason: "A transcription, diarization or span retry is still running.")
+    private var queueTickets: [(id: UUID, ticket: RecordingLibraryWorkLedger.Ticket)] = []
     private var worker: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
+
+    func resetLibraryContext() {
+        retranscriptionIDs.removeAll()
+        stoppingRecordingID = nil
+        cancellation.resetIDs()
+    }
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !queue.isEmpty || processingID != nil || activeRecordingID != nil
+            || !pendingIDs.isEmpty || diarizingRecordingID != nil
+            || !speakerFinalizationPendingIDs.isEmpty || !spanRetryIDs.isEmpty
+            || shutdownTask != nil || !queueTickets.isEmpty
+            || !libraryLedger.outstanding.isEmpty {
+            return .busy("Transcription", "Finish transcription or diarization before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Transcription", generation: libraryLedger.generation)
+    }
     private var prewarmTasks: [UUID: Task<Void, Never>] = [:]
 
     /// Whether the local whisper model should stay resident between uses.
@@ -488,6 +509,7 @@ final class TranscriptionService: ObservableObject {
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
+        queueTickets.append((recording.id, libraryLedger.begin()))
         publishPending()
         startWorkerIfNeeded()
         serviceLog.log("""
@@ -966,6 +988,8 @@ final class TranscriptionService: ObservableObject {
     /// recording is queued or running — that pass replaces the transcript
     /// (and clears the spans) anyway.
     func retryUntranscribedSpans(of recordingID: UUID) async {
+        let ticket = libraryLedger.begin()
+        defer { libraryLedger.finish(ticket) }
         guard !spanRetryIDs.contains(recordingID),
               !isQueuedOrActive(recordingID),
               let row = store.recordings.first(where: { $0.id == recordingID }),
@@ -1054,6 +1078,8 @@ final class TranscriptionService: ObservableObject {
     /// recording being re-diarized — the transcript text is already final
     /// here, so calling this "Transcribing" would mislead.
     func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> [TranscriptSegment]? {
+        let ticket = libraryLedger.begin()
+        defer { libraryLedger.finish(ticket) }
         guard !cancellation.isStopped, diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
         diarizingRecordingID = recordingID
         defer { diarizingRecordingID = nil }
@@ -1084,6 +1110,18 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    private func finishQueueTicket(for id: UUID) {
+        guard let index = queueTickets.firstIndex(where: { $0.id == id }) else { return }
+        let entry = queueTickets.remove(at: index)
+        libraryLedger.finish(entry.ticket)
+    }
+
+    private func finishAllQueueTickets(for id: UUID) {
+        let matching = queueTickets.filter { $0.id == id }
+        queueTickets.removeAll { $0.id == id }
+        for entry in matching { libraryLedger.finish(entry.ticket) }
+    }
+
     /// Free engine resources synchronously. Called from the AppDelegate at
     /// shutdown so the ggml-metal device tear-down happens before libc++
     /// global destructors run (which is what triggered SIGABRT on quit).
@@ -1097,6 +1135,8 @@ final class TranscriptionService: ObservableObject {
         cancellation.stopAll()
         worker?.cancel() // also cancels the structured diarization subprocess
         queue.removeAll()
+        for entry in queueTickets { libraryLedger.finish(entry.ticket) }
+        queueTickets.removeAll()
         retranscriptionIDs.removeAll()
         publishPending()
         isPreparingModel = false
@@ -1134,6 +1174,7 @@ final class TranscriptionService: ObservableObject {
     func cancel(recordingID: UUID) {
         if queue.contains(where: { $0.id == recordingID }) {
             queue.removeAll { $0.id == recordingID }
+            finishAllQueueTickets(for: recordingID)
             retranscriptionIDs.remove(recordingID)
             publishPending()
             return
@@ -1164,6 +1205,7 @@ final class TranscriptionService: ObservableObject {
         if queue.contains(where: { $0.id == recordingID }) {
             // Never started: dropping it from the queue is the whole stop.
             queue.removeAll { $0.id == recordingID }
+            finishAllQueueTickets(for: recordingID)
             retranscriptionIDs.remove(recordingID)
             publishPending()
         } else if processingID == recordingID {
@@ -1219,6 +1261,9 @@ final class TranscriptionService: ObservableObject {
             await withLocalModelUse {
                 await process(next)
             }
+            // The ticket spans the entire worker, including model release and
+            // completion callbacks. Cancellation alone never retires it.
+            finishQueueTicket(for: next.id)
             processingID = nil
             if stoppingRecordingID == next.id { stoppingRecordingID = nil }
             // A stop that landed during this run belongs to this run, and the
@@ -1759,7 +1804,12 @@ final class TranscriptionService: ObservableObject {
                 // trash is emptied, and a restore shouldn't come back
                 // uncompressed.
                 let compressID = persisted.id
-                Task { await store.compressRecordingAudio(id: compressID) }
+                if let ticket = store.beginLibraryWork() {
+                    Task {
+                        await store.compressRecordingAudio(id: compressID)
+                        store.finishLibraryWork(ticket)
+                    }
+                }
             }
         } catch is CancellationError {
             // The user hit Cancel mid-run. The rename sheet's coordinator is
@@ -2116,5 +2166,9 @@ final class CancellationFlag: @unchecked Sendable {
     func contains(_ id: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return stopped || ids.contains(id)
+    }
+
+    func resetIDs() {
+        lock.lock(); ids.removeAll(); lock.unlock()
     }
 }

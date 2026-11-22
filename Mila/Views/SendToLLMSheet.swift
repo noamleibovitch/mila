@@ -8,6 +8,10 @@ import MilaKit
 /// background just like the RenameRecordingSheet's "Send" path.
 struct SendToLLMSheet: View {
     let recording: Recording
+    /// The library epoch captured when the presenting menu was built. The
+    /// sheet never refreshes this: if the library moved under it, the send is
+    /// refused instead of targeting a same-UUID row in the new library.
+    let libraryContext: RecordingLibraryActivity.Context?
 
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
@@ -17,15 +21,25 @@ struct SendToLLMSheet: View {
     @State private var prompt: String = ""
 
     /// Live recording from the store so an in-flight re-transcription
-    /// updates the preview without the sheet needing to be reopened.
+    /// updates the preview without the sheet needing to be reopened. While
+    /// the captured library is no longer current, keep the immutable
+    /// presentation snapshot instead of resolving the same UUID elsewhere.
     private var liveRecording: Recording {
-        store.recordings.first(where: { $0.id == recording.id }) ?? recording
+        guard let libraryContext, store.admitLibraryInput(libraryContext) else {
+            return recording
+        }
+        return store.recordings.first(where: { $0.id == recording.id }) ?? recording
     }
 
     private var transcript: String {
         TranscriptFormatter.plainText(segments: liveRecording.segments,
                                       fallback: liveRecording.fullText,
                                       names: liveRecording.speakerNames)
+    }
+
+    private var belongsToCurrentLibrary: Bool {
+        guard let libraryContext else { return false }
+        return store.admitLibraryInput(libraryContext)
     }
 
     var body: some View {
@@ -40,7 +54,9 @@ struct SendToLLMSheet: View {
                 Button("Send to \(llm.tool.displayName)") { send() }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(transcript.isEmpty || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!belongsToCurrentLibrary
+                              || transcript.isEmpty
+                              || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)
@@ -107,6 +123,12 @@ struct SendToLLMSheet: View {
     }
 
     private func send() {
+        // Recheck immediately before the hand-off; the sheet can outlive a
+        // folder switch even though the button above is disabled in that case.
+        guard belongsToCurrentLibrary else {
+            dismiss()
+            return
+        }
         let recordingID = liveRecording.id
         let promptSnapshot = prompt
         let transcriptSnapshot = transcript

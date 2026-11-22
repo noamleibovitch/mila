@@ -38,17 +38,25 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var postCommandRunner: PostRecordingCommandRunner
 
     @State private var renameRequest: String?
+    /// Library epoch captured when each delayed surface was presented. The
+    /// confirmation must act on the library the user opened it for, never a
+    /// freshly computed epoch (which could be a same-UUID row after a switch).
+    @State private var renameContext: RecordingLibraryActivity.Context?
+    @State private var newFolderContext: RecordingLibraryActivity.Context?
     /// Non-nil while the `.milashare` export sheet (voice-profile opt-in) is
     /// up; nil goes straight to the save panel.
     @State private var shareSelection: SharedSpeakersExportSelection?
+    @State private var shareContext: RecordingLibraryActivity.Context?
     @State private var promptForNewFolder = false
     @State private var newFolderDraft = ""
     @State private var showingSendSheet = false
+    @State private var sendContext: RecordingLibraryActivity.Context?
     /// Confirmation gate before "Delete Permanently" actually removes the
     /// files — unlike soft-delete there's no Trash to restore from, and
     /// accidental loss of recordings was the #1 user complaint (same
     /// rationale as the rename sheet's Discard confirm).
     @State private var confirmingPermanentDelete = false
+    @State private var deleteContext: RecordingLibraryActivity.Context?
 
     func body(content: Content) -> some View {
         content
@@ -60,10 +68,16 @@ private struct RecordingContextMenu: ViewModifier {
                 RenameSheet(
                     initialTitle: draft.title,
                     onConfirm: { newTitle in
-                        store.rename(recording, to: newTitle)
+                        if let renameContext, store.admitLibraryInput(renameContext) {
+                            store.rename(recording, to: newTitle)
+                        }
                         renameRequest = nil
+                        renameContext = nil
                     },
-                    onCancel: { renameRequest = nil }
+                    onCancel: {
+                        renameRequest = nil
+                        renameContext = nil
+                    }
                 )
             }
             .sheet(isPresented: $promptForNewFolder) {
@@ -72,28 +86,40 @@ private struct RecordingContextMenu: ViewModifier {
                     confirmLabel: "Create",
                     name: $newFolderDraft,
                     onConfirm: {
-                        if let created = store.createFolder(newFolderDraft) {
-                            store.assign(recording, toFolder: created)
+                        if let newFolderContext, store.admitLibraryInput(newFolderContext) {
+                            if let created = store.createFolder(newFolderDraft) {
+                                store.assign(recording, toFolder: created)
+                            }
                         }
                         promptForNewFolder = false
+                        newFolderContext = nil
                     },
-                    onCancel: { promptForNewFolder = false }
+                    onCancel: {
+                        promptForNewFolder = false
+                        newFolderContext = nil
+                    }
                 )
             }
-            .sheet(isPresented: $showingSendSheet) {
-                SendToLLMSheet(recording: recording)
+            .sheet(isPresented: $showingSendSheet, onDismiss: { sendContext = nil }) {
+                SendToLLMSheet(recording: recording, libraryContext: sendContext)
             }
-            .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
+            .recordingShareSheet(selection: $shareSelection, recording: recording, store: store,
+                                 libraryContext: shareContext)
             .confirmationDialog("Delete “\(recording.title)” permanently?",
                                 isPresented: $confirmingPermanentDelete,
                                 titleVisibility: .visible) {
                 Button("Delete Permanently", role: .destructive) {
-                    store.permanentlyDelete(recording)
-                    if case .recording(let id) = selection, id == recording.id {
-                        selection = .home
+                    if let deleteContext, store.admitLibraryInput(deleteContext) {
+                        store.permanentlyDelete(recording)
+                        if case .recording(let id) = selection, id == recording.id {
+                            selection = .home
+                        }
                     }
+                    deleteContext = nil
                 }
-                Button("Cancel", role: .cancel) { }
+                Button("Cancel", role: .cancel) {
+                    deleteContext = nil
+                }
             } message: {
                 Text("The audio file and any transcript will be permanently deleted. This can't be undone.")
             }
@@ -101,30 +127,41 @@ private struct RecordingContextMenu: ViewModifier {
 
     @ViewBuilder
     private var menuItems: some View {
+        // Captured when this menu is built, so a retained menu closure cannot
+        // act on a same-UUID row after the library epoch moved.
+        let context = store.libraryActivity.context
         if recording.isTrashed {
-            Button("Restore") { store.restore(recording) }
+            Button("Restore") {
+                guard store.admitLibraryInput(context) else { return }
+                store.restore(recording)
+            }
             Divider()
             Button("Delete Permanently", role: .destructive) {
+                deleteContext = context
                 confirmingPermanentDelete = true
             }
         } else {
             Button("Rename…") {
+                renameContext = context
                 renameRequest = recording.title
             }
             Menu("Move to Folder") {
                 Button(recording.folder == nil ? "✓ None" : "None") {
+                    guard store.admitLibraryInput(context) else { return }
                     store.assign(recording, toFolder: nil)
                 }
                 if !store.folders.isEmpty {
                     Divider()
                     ForEach(store.folders, id: \.self) { folder in
                         Button(recording.folder == folder ? "✓ \(folder)" : folder) {
+                            guard store.admitLibraryInput(context) else { return }
                             store.assign(recording, toFolder: folder)
                         }
                     }
                 }
                 Divider()
                 Button("New Folder…") {
+                    newFolderContext = context
                     newFolderDraft = ""
                     promptForNewFolder = true
                 }
@@ -146,6 +183,7 @@ private struct RecordingContextMenu: ViewModifier {
                 // Take the run off the CPU now and keep the recording; the
                 // Re-transcribe items below start it again later.
                 Button("Stop Transcribing") {
+                    guard store.admitLibraryInput(context) else { return }
                     transcription.deferTranscription(of: recording.id)
                 }
             }
@@ -153,19 +191,21 @@ private struct RecordingContextMenu: ViewModifier {
                 // Route through the live-store chokepoint (same as the
                 // language-switch action) so we never enqueue a stale snapshot
                 // whose `.wav` a since-run compression already deleted.
-                guard !isBusy,
+                guard store.admitLibraryInput(context),
+                      !isBusy,
                       let prepared = store.prepareForRetranscription(id: recording.id)
                 else { return }
                 transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
             Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
-                retranscribe(recording, in: currentLang.other)
+                retranscribe(recording, in: currentLang.other, context: context)
             }
             .disabled(isBusy)
             if llm.isConfigured {
                 Divider()
                 Button("Send to \(llm.tool.displayName)…") {
+                    sendContext = context
                     showingSendSheet = true
                 }
                 .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
@@ -181,7 +221,10 @@ private struct RecordingContextMenu: ViewModifier {
                         || summarizer.isSummarizing(recording.id)
                         || recording.fullText
                             .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                    onPick: { summarizer.setSummaryLanguage($0, for: recording.id) }
+                    onPick: { code in
+                        guard store.admitLibraryInput(context) else { return }
+                        summarizer.setSummaryLanguage(code, for: recording.id)
+                    }
                 )
             }
             // Only once the user has turned the hook on and typed a command;
@@ -192,24 +235,28 @@ private struct RecordingContextMenu: ViewModifier {
             if postCommand.enabled, !postCommand.command.isEmpty {
                 Divider()
                 Button("Run Post-Recording Command") {
+                    guard store.admitLibraryInput(context) else { return }
                     postCommandRunner.run(recordingID: recording.id, trigger: .manual)
                 }
                 .disabled(recording.status != .completed)
             }
             Divider()
             Button("Share Recording…") {
-                shareRecording()
+                shareRecording(context: context)
             }
             .disabled(!RecordingShareExporter.canExport(recording))
             Button("Export Subtitles (.srt)…") {
+                guard store.admitLibraryInput(context) else { return }
                 exportSRT()
             }
             .disabled(recording.segments.isEmpty)
             Button("Reveal in Finder") {
+                guard store.admitLibraryInput(context) else { return }
                 NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
             }
             Divider()
             Button("Delete", role: .destructive) {
+                guard store.admitLibraryInput(context) else { return }
                 store.softDelete(recording)
                 if case .recording(let id) = selection, id == recording.id {
                     selection = .home
@@ -222,7 +269,12 @@ private struct RecordingContextMenu: ViewModifier {
     /// `TranscriptionService` reads `recording.language` to pick the right
     /// model (ivrit.ai for Hebrew, OpenAI for English), so updating the
     /// store before enqueueing is enough to re-run with the other model.
-    private func retranscribe(_ recording: Recording, in language: RecordingLanguage) {
+    private func retranscribe(_ recording: Recording,
+                              in language: RecordingLanguage,
+                              context: RecordingLibraryActivity.Context) {
+        // The menu may outlive a library switch; never flip the status of a
+        // same-UUID row in the newly adopted library.
+        guard store.admitLibraryInput(context) else { return }
         // Gate before mutating the store: a busy (active/queued) recording must
         // not have its status/language flipped under an in-flight pass, because
         // `enqueue` would then no-op the re-run while the store mutation stuck.
@@ -240,13 +292,16 @@ private struct RecordingContextMenu: ViewModifier {
     /// Produce a `.milashare` for a colleague. When the recording's named
     /// speakers have voice profiles, an opt-in sheet comes first; otherwise
     /// the save panel opens directly.
-    private func shareRecording() {
+    private func shareRecording(context: RecordingLibraryActivity.Context) {
+        guard store.admitLibraryInput(context) else { return }
+        shareContext = context
         if let selection = RecordingShareExporter.exportSelection(
             for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
             shareSelection = selection
         } else {
             let recording = recording
             Task { @MainActor in
+                guard store.admitLibraryInput(context) else { return }
                 await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
             }
         }

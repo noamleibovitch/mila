@@ -7,7 +7,6 @@ import TranscriptionCore
 /// recordings directory, and returns a Recording stub ready for transcription.
 @MainActor
 enum FileTranscriber {
-
     static func importFile(at sourceURL: URL,
                            into store: RecordingStore,
                            language: RecordingLanguage = .hebrew,
@@ -17,6 +16,8 @@ enum FileTranscriber {
                            voiceMemoUniqueID: String? = nil,
                            voiceMemoFolderUUID: String? = nil,
                            folder: String? = nil) async throws -> Recording {
+        guard let ticket = store.beginLibraryWork() else { throw CancellationError() }
+        defer { store.finishLibraryWork(ticket) }
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 

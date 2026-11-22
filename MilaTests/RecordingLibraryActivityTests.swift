@@ -79,3 +79,33 @@ final class RecordingLibraryActivityTests: XCTestCase {
         }) { XCTAssertEqual($0 as? RecordingLibraryActivity.CommitError, .changed) }
     }
 }
+
+@MainActor
+extension RecordingLibraryActivityTests {
+    func test_work_ledger_counts_cancelled_or_replaced_work_until_settlement() {
+        let ledger = RecordingLibraryWorkLedger(owner: "Test", reason: "busy")
+        let first = ledger.begin()
+        XCTAssertFalse(ledger.state.isIdle)
+        // A canceled UI action does not finish the ticket; only the worker's
+        // actual settlement does.
+        XCTAssertFalse(ledger.state.isIdle)
+        ledger.finish(first)
+        XCTAssertTrue(ledger.state.isIdle)
+        let before = ledger.generation
+        let second = ledger.begin()
+        ledger.finish(second)
+        XCTAssertGreaterThan(ledger.generation, before,
+                             "A job that starts and finishes must still advance the generation")
+    }
+
+    func test_readiness_aggregate_reports_first_blocker_and_is_snapshot_stable() {
+        let first = RecordingLibraryWorkState.idle("A", generation: 4)
+        let second = RecordingLibraryWorkState.busy("B", "still running", generation: 9)
+        let readiness = RecordingLibraryReadiness(providers: [{ first }, { second }])
+        XCTAssertFalse(readiness.isIdle)
+        XCTAssertEqual(readiness.latest.firstBlocker?.owner, "B")
+        XCTAssertEqual(readiness.latest.firstBlocker?.generation, 9)
+        readiness.refresh()
+        XCTAssertEqual(readiness.latest.firstBlocker?.owner, "B")
+    }
+}

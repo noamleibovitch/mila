@@ -239,6 +239,66 @@ final class RecordingStorageSettings: ObservableObject {
         customDirectory = resolved
     }
 
+
+    // MARK: - Prepared selection
+
+    /// A bookmark minted before the final no-await commit. Nothing is
+    /// persisted until `commitSelection` runs; a failed or canceled flow
+    /// leaves the current preference untouched.
+    enum PreparedSelection: Equatable {
+        case defaultLocation
+        case custom(URL, Data)
+    }
+
+    /// Test seam for bookmark minting failures. Production uses the real
+    /// security-scoped bookmark API.
+    var bookmarkMinter: ((URL) throws -> Data)?
+
+    func prepareSelection(for url: URL?) throws -> PreparedSelection {
+        guard let url else { return .defaultLocation }
+        let data: Data
+        if let bookmarkMinter {
+            data = try bookmarkMinter(url)
+        } else {
+            data = try url.bookmarkData(options: [.withSecurityScope],
+                                        includingResourceValuesForKeys: nil,
+                                        relativeTo: nil)
+        }
+        return .custom(url, data)
+    }
+
+    /// Persist a prepared selection and resolve it back. Returns false if the
+    /// bookmark cannot be written/resolved or resolves somewhere else, in
+    /// which case the previous preference is left in place.
+    @discardableResult
+    func commitSelection(_ prepared: PreparedSelection) -> Bool {
+        switch prepared {
+        case .defaultLocation:
+            let previous = defaults.data(forKey: Self.bookmarkKey)
+            defaults.removeObject(forKey: Self.bookmarkKey)
+            resolveAndStartAccessing()
+            if customDirectory != nil {
+                if let previous { defaults.set(previous, forKey: Self.bookmarkKey) }
+                resolveAndStartAccessing()
+                return false
+            }
+            return true
+        case .custom(let url, let data):
+            let previous = defaults.data(forKey: Self.bookmarkKey)
+            defaults.set(data, forKey: Self.bookmarkKey)
+            resolveAndStartAccessing()
+            guard let resolved = customDirectory,
+                  resolved.standardizedFileURL.resolvingSymlinksInPath() ==
+                    url.standardizedFileURL.resolvingSymlinksInPath() else {
+                if let previous { defaults.set(previous, forKey: Self.bookmarkKey) }
+                else { defaults.removeObject(forKey: Self.bookmarkKey) }
+                resolveAndStartAccessing()
+                return false
+            }
+            return true
+        }
+    }
+
     /// Persist a freshly-picked folder. Mints a security-scoped bookmark
     /// against the URL (NSOpenPanel hands us one already, so the security
     /// scope is implicit). Returns true on success — false means the

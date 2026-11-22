@@ -205,6 +205,23 @@ final class RecordingSummarizer: ObservableObject {
     /// `LLMSettings.$tool` so a user who configures their CLI mid-session
     /// gets an automatic backfill sweep the moment the toggle flips.
     private var cancellables: Set<AnyCancellable> = []
+    private let libraryLedger = RecordingLibraryWorkLedger(
+        owner: "Summary", reason: "A summary or backfill run is still running.")
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        if !inFlight.isEmpty || !backfillQueue.isEmpty || !cancelledRuns.isEmpty
+            || !inFlightIDs.isEmpty || !libraryLedger.outstanding.isEmpty {
+            return .busy("Summary", "Finish summary processing before changing folders.",
+                         generation: libraryLedger.generation)
+        }
+        return .idle("Summary", generation: libraryLedger.generation)
+    }
+
+    func resetLibraryContext() {
+        guard libraryWorkState.isIdle else { return }
+        backfillQueue.removeAll()
+        inFlightIDs.removeAll()
+    }
 
     /// Timeout for the one-shot summary call. Reads from `LLMSettings.cliTimeout`
     /// so it follows the user's preference set in Settings → AI Provider.
@@ -593,6 +610,7 @@ final class RecordingSummarizer: ObservableObject {
 
         inFlightIDs.insert(id)
         let token = UUID()
+        let lifetime = libraryLedger.begin()
         // `language` is the resolved keyword ("Hebrew"/"English"), never user
         // text, so it is safe as a `.public` field — and it is what makes a
         // "why is this summary in the wrong language" report diagnosable.
@@ -603,6 +621,7 @@ final class RecordingSummarizer: ObservableObject {
             // `defer`.
             var followUp = false
             defer {
+                self?.libraryLedger.finish(lifetime)
                 // `return` cannot transfer control out of a defer body in
                 // Swift, so an `if let self` block is what we want here
                 // rather than an early-return guard. If the summarizer

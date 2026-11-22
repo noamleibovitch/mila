@@ -47,6 +47,10 @@ enum RecordingLibraryInspection {
         let files: [RecordingLibraryFileCopy.Entry]
         let directoryNames: Set<String>
         let emptyAudioFiles: Int
+        /// Rows whose audio is already gone. They are preserved exactly as
+        /// metadata (never fabricated, dropped or rewritten) so a user can
+        /// switch back to a library that has a historically missing file.
+        let missingAudioCount: Int
         var byteCount: UInt64 { files.reduce(0) { $0 + $1.size } }
     }
 
@@ -57,14 +61,16 @@ enum RecordingLibraryInspection {
 
     enum Problem: Error, Equatable {
         case unsafeLocation, unreadableList, unsettledRecordings, duplicateIdentity
-        case unsafeName, sharedFiles, missingAudio, unrelatedFiles, changed
+        case unsafeName, sharedFiles, unrelatedFiles, changed
         case incompleteCopy
     }
 
     private static let ignoredNames: Set<String> = [".DS_Store"]
     private static let maxMetadataBytes = 128 * 1024 * 1024
 
-    static func inspect(_ layout: Layout, cancellation: () throws -> Void = {}) throws -> Result {
+    static func inspect(_ layout: Layout,
+                        allowingOwnedStage: Bool = false,
+                        cancellation: () throws -> Void = {}) throws -> Result {
         try cancellation()
         let fm = FileManager.default
         guard layout.directory == layout.directory.resolvingSymlinksInPath(),
@@ -73,11 +79,32 @@ enum RecordingLibraryInspection {
         }
         let names = Set(try fm.contentsOfDirectory(atPath: layout.directory.path))
         guard names.count <= 100_000 else { throw Problem.unrelatedFiles }
-        if names.contains(where: { $0.hasPrefix(".mila-copy-") }) { throw Problem.incompleteCopy }
+        let stageNames = Set(names.filter { $0.hasPrefix(RecordingLibraryMigration.stagePrefix) })
         let hasIndex = fm.fileExists(atPath: layout.index.path)
+        // A published index means the copy is complete (index is published
+        // last); the hidden stage is only a leftover ownership marker. It is
+        // not an incomplete library we may delete. Without an index the
+        // destination is genuinely incomplete and must be cleaned explicitly.
+        if !stageNames.isEmpty, !allowingOwnedStage, !hasIndex { throw Problem.incompleteCopy }
+        let libraryNames = names.subtracting(stageNames)
         if !hasIndex {
-            guard names.subtracting(ignoredNames).isEmpty, !fm.fileExists(atPath: layout.folders.path) else {
+            let folderOnly = fm.fileExists(atPath: layout.folders.path)
+            guard libraryNames.subtracting(ignoredNames).subtracting(Set(folderOnly ? ["folders.json"] : [])).isEmpty else {
                 throw Problem.unreadableList
+            }
+            // A source can legitimately contain only its folder metadata:
+            // an empty but named folder list is still data worth preserving
+            // and is a meaningful copy case. It is not the same as a folder
+            // with no Mila data at all.
+            if fm.fileExists(atPath: layout.folders.path) {
+                let folderBytes = try metadata(layout.folders)
+                guard let decoded = try? JSONDecoder().decode([String].self, from: folderBytes),
+                      decoded.count <= 50_000 else { throw Problem.unreadableList }
+                let files = try RecordingLibraryFileCopy.inspect([layout.folders], cancellation: cancellation)
+                return .existing(Snapshot(layout: layout, indexBytes: Data(), foldersBytes: folderBytes,
+                                          recordings: [], folderNames: decoded.sorted(), files: files,
+                                          directoryNames: names, emptyAudioFiles: 0,
+                                          missingAudioCount: 0))
             }
             return .empty
         }
@@ -94,9 +121,10 @@ enum RecordingLibraryInspection {
         var capturedMetadata: [URL: Data] = [layout.index: indexBytes]
         var ownedNames: Set<String> = layout.isDefault ? [] : ["recordings.json"]
         var canonicalNames: Set<String> = []
+        var missingAudioCount = 0
         for offset in records.indices {
             try cancellation()
-            let record = records[offset]
+            var record = records[offset]
             let fileNames = [record.audioFileName, record.transcriptFileName,
                              record.summaryFileName, record.subtitleFileName]
             guard ["wav", "m4a"].contains((record.audioFileName as NSString).pathExtension.lowercased()) else {
@@ -110,16 +138,24 @@ enum RecordingLibraryInspection {
                 let url = layout.directory.appendingPathComponent(name)
                 if names.contains(name) { sources.append(url); ownedNames.insert(name) }
             }
-            guard names.contains(record.audioFileName) else { throw Problem.missingAudio }
+            // A recorded row keeps its raw metadata even when its audio was
+            // already lost (an older Mila, a manual Finder delete). The copy
+            // preserves the row and every sidecar byte; it never invents an
+            // audio file or drops the UUID, and the preview reports the count
+            // so the user can switch back honestly.
+            if !names.contains(record.audioFileName) {
+                missingAudioCount += 1
+            }
             let textURL = layout.directory.appendingPathComponent(record.transcriptFileName)
             if names.contains(record.transcriptFileName) {
                 let textBytes = try metadata(textURL)
                 capturedMetadata[textURL] = textBytes
                 guard let text = String(data: textBytes, encoding: .utf8) else { throw Problem.unreadableList }
-                records[offset].fullText = text
+                record.fullText = text
             } else if record.fullText.isEmpty && !record.segments.isEmpty {
-                records[offset].fullText = TranscriptFormatter.joinedFullText(segments: record.segments)
+                record.fullText = TranscriptFormatter.joinedFullText(segments: record.segments)
             }
+            records[offset] = record
         }
         let folderBytes: Data?
         var folderNames = Set(records.compactMap(\.folder).filter { !$0.isEmpty })
@@ -133,7 +169,7 @@ enum RecordingLibraryInspection {
             if !layout.isDefault { ownedNames.insert("folders.json") }
         } else { folderBytes = nil }
         var emptyCount = 0
-        for name in names.subtracting(ownedNames).subtracting(ignoredNames) {
+        for name in libraryNames.subtracting(ownedNames).subtracting(ignoredNames) {
             try cancellation()
             let url = layout.directory.appendingPathComponent(name)
             let attrs = try fm.attributesOfItem(atPath: url.path)
@@ -153,11 +189,13 @@ enum RecordingLibraryInspection {
         }
         return .existing(Snapshot(layout: layout, indexBytes: indexBytes, foldersBytes: folderBytes,
                                   recordings: records, folderNames: folderNames.sorted(), files: files,
-                                  directoryNames: names, emptyAudioFiles: emptyCount))
+                                  directoryNames: names, emptyAudioFiles: emptyCount,
+                                  missingAudioCount: missingAudioCount))
     }
 
     private static func validName(_ name: String) -> Bool {
-        !name.isEmpty && !name.hasPrefix(".") && !name.contains("/") && !name.contains("\\") && !name.contains("\0")
+        !name.isEmpty && !name.hasPrefix(".") && !name.contains("/")
+            && !name.contains("\\") && !name.contains(":") && !name.contains("\0")
     }
 
     private static func metadata(_ url: URL) throws -> Data {

@@ -18,6 +18,19 @@ private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", c
 @MainActor
 final class RecordingStore: ObservableObject {
     @Published private(set) var recordings: [Recording] = []
+    /// Full-lifetime accounting for admitted library writers plus the narrow
+    /// no-await commit guard. The migration coordinator reads this owner state
+    /// directly; it is not a lease over the other subsystems.
+    let libraryActivity = RecordingLibraryActivity()
+    /// True only while a folder change is inspecting/copying/committing. New
+    /// capture and dictation starts are refused before they allocate a URL.
+    @Published private(set) var isChangingRecordingsLocation = false
+    /// Last persistence attempt failed: memory is newer than disk. Never
+    /// treated as idle for a folder switch.
+    private var indexIsUnsaved = false
+    private var foldersAreUnsaved = false
+    var hasUnsavedLibraryState: Bool { indexIsUnsaved || foldersAreUnsaved }
+    private(set) var libraryMutationWasRefused = false
     /// Folder names the user has explicitly created. Kept separate from the
     /// set derived from `recordings[*].folder` so an empty folder still shows
     /// up in the sidebar and survives moving its last recording elsewhere.
@@ -106,10 +119,29 @@ final class RecordingStore: ObservableObject {
         // state. We honor it before touching the real path so a test run
         // never reads or writes the user's recordings.
         if CommandLine.arguments.contains("--ui-test-clean-store") {
-            let tmpRoot = FileManager.default.temporaryDirectory
-                .appendingPathComponent("Mila-UITest-\(UUID())", isDirectory: true)
+            let tmpRoot: URL
+            if let raw = ProcessInfo.processInfo.environment["MILA_UI_TEST_CLEAN_ROOT"] {
+                let candidate = URL(fileURLWithPath: raw).standardizedFileURL
+                let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
+                let suffix = String(candidate.lastPathComponent.dropFirst("Mila-UITest-".count))
+                if candidate == candidate.resolvingSymlinksInPath(),
+                   candidate.deletingLastPathComponent().standardizedFileURL == temporary,
+                   candidate.lastPathComponent.hasPrefix("Mila-UITest-"),
+                   UUID(uuidString: suffix) != nil {
+                    tmpRoot = candidate
+                    try? FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
+                } else {
+                    tmpRoot = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("Mila-UITest-\(UUID())", isDirectory: true)
+                }
+            } else {
+                tmpRoot = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("Mila-UITest-\(UUID())", isDirectory: true)
+            }
             self.init(rootDirectory: tmpRoot)
-            if CommandLine.arguments.contains("--ui-test-seed-recording") {
+            let reusingStorageFixture = CommandLine.arguments.contains { $0.hasPrefix("--ui-test-storage-suite=") }
+            if CommandLine.arguments.contains("--ui-test-seed-recording"),
+               !reusingStorageFixture || recordings.isEmpty {
                 let seed = Recording(
                     title: "Seed Recording",
                     duration: 1.5,
@@ -276,6 +308,12 @@ final class RecordingStore: ObservableObject {
     /// wants a callback rather than a value.
     var onStoreLocationDiscoverabilityChanged: (() -> Void)?
 
+    /// Late-bound by MilaApp after every owner exists. Called exactly once
+    /// after a prepared activation succeeds, so dormant UUID-keyed caches do
+    /// not leak from the previous library into one that may contain the same
+    /// UUIDs. It must only reset state, never start work.
+    var onLibraryActivated: (() -> Void)?
+
     /// Mirror the resolved store paths into `store-location.json` at the
     /// original root so external tools (mila-mcp) can find the store even
     /// when the user relocated the recordings directory — the relocation
@@ -324,6 +362,137 @@ final class RecordingStore: ObservableObject {
             storeLocationIsDiscoverable = discoverable
             onStoreLocationDiscoverabilityChanged?()
         }
+    }
+
+    // MARK: - Migration readiness and prepared activation
+
+    var libraryWorkState: RecordingLibraryWorkState {
+        let activity = libraryActivity.snapshot
+        if isChangingRecordingsLocation {
+            return .busy("Recordings location", "Mila is changing the recordings folder.", generation: activity.generation)
+        }
+        return libraryMigrationWorkState
+    }
+
+    /// Store readiness for the migration entry gate. The coordinator itself
+    /// owns `isChangingRecordingsLocation`, so it must not see that flag as a
+    /// foreign writer while it inspects and copies.
+    var libraryMigrationWorkState: RecordingLibraryWorkState {
+        let activity = libraryActivity.snapshot
+        if activity.outstandingCount != 0 || libraryActivity.isCommitting {
+            return .busy("Recording library", "Library work is still running.", generation: activity.generation)
+        }
+        if hasUnsavedLibraryState || !transcriptRewritesPending.isEmpty {
+            return .busy("Recording library", "Library changes are not saved yet.", generation: activity.generation)
+        }
+        return .idle("Recording library", generation: activity.generation)
+    }
+
+    func setChangingRecordingsLocation(_ changing: Bool) {
+        isChangingRecordingsLocation = changing
+    }
+
+    func beginLibraryWork() -> RecordingLibraryActivity.Ticket? {
+        libraryActivity.beginWork()
+    }
+
+    func finishLibraryWork(_ ticket: RecordingLibraryActivity.Ticket) {
+        libraryActivity.finishWork(ticket)
+    }
+
+    /// A UI input captured when a menu, sheet or drag began may act only while
+    /// that library is still current. MainActor serialises this check with the
+    /// synchronous store call that follows, so this is a pure fence, not a
+    /// reservation; admitted work already uses `beginLibraryWork`.
+    func admitLibraryInput(_ context: RecordingLibraryActivity.Context) -> Bool {
+        !libraryActivity.isCommitting && libraryActivity.isCurrent(context)
+    }
+
+    func admitLibraryInput(_ token: RecordingLibraryActivity.ContextToken) -> Bool {
+        !libraryActivity.isCommitting && libraryActivity.isCurrent(token)
+    }
+
+    /// Call before every attempted row/folder/audio mutation, including an
+    /// attempt whose persistence later fails or is reverted.
+    @discardableResult
+    func noteLibraryMutation(_ context: RecordingLibraryActivity.Context? = nil) -> Bool {
+        let admitted = libraryActivity.noteMutation(in: context ?? libraryActivity.context)
+        libraryMutationWasRefused = !admitted
+        return admitted
+    }
+
+    struct PreparedLibraryActivation {
+        let layout: RecordingLibraryInspection.Layout
+        let recordings: [Recording]
+        let folders: [String]
+    }
+
+    enum ActivationError: Error, Equatable {
+        case bookmark
+    }
+
+    /// Install already decoded rows using the destination layout. Never calls
+    /// `load()`, never mints recovery IDs and never enqueues transcription.
+    /// The selection write runs inside the same no-await main-actor turn.
+    func activatePrepared(_ prepared: PreparedLibraryActivation,
+                          expectedActivity: RecordingLibraryActivity.Snapshot,
+                          commitSelection: () throws -> Void) throws {
+        let previousDirectory = recordingsDirectory
+        let previousStoreURL = storeURL
+        let previousFoldersURL = foldersURL
+        let previousRecordings = recordings
+        let previousFolders = folders
+        let previousRecoveryIDs = pendingRecoveryIDs
+        let previousUnsavedIndex = indexIsUnsaved
+        let previousUnsavedFolders = foldersAreUnsaved
+        do {
+            try libraryActivity.performCommit(ifUnchanged: expectedActivity) { _ in
+                // Persist the single bookmark key first. If it cannot be
+                // written/read back, the live store is untouched: no partial
+                // selection was ever published to synchronous subscribers.
+                do {
+                    try commitSelection()
+                } catch {
+                    throw ActivationError.bookmark
+                }
+                recordingsDirectory = prepared.layout.directory
+                storeURL = prepared.layout.index
+                foldersURL = prepared.layout.folders
+                recordings = prepared.recordings
+                folders = prepared.folders
+                pendingRecoveryIDs = []
+                indexIsUnsaved = false
+                foldersAreUnsaved = false
+                // Per-library dormant caches must not follow the selection.
+                transcriptRewritesPending.removeAll()
+                audioRevisions.removeAll()
+                compressionDeferredByTrim.removeAll()
+                audioTrimPendingIDs.removeAll()
+                trimNotice = nil
+                writeStoreLocationPointer()
+            }
+        } catch let error as ActivationError {
+            recordingsDirectory = previousDirectory
+            storeURL = previousStoreURL
+            foldersURL = previousFoldersURL
+            recordings = previousRecordings
+            folders = previousFolders
+            pendingRecoveryIDs = previousRecoveryIDs
+            indexIsUnsaved = previousUnsavedIndex
+            foldersAreUnsaved = previousUnsavedFolders
+            throw error
+        } catch {
+            recordingsDirectory = previousDirectory
+            storeURL = previousStoreURL
+            foldersURL = previousFoldersURL
+            recordings = previousRecordings
+            folders = previousFolders
+            pendingRecoveryIDs = previousRecoveryIDs
+            indexIsUnsaved = previousUnsavedIndex
+            foldersAreUnsaved = previousUnsavedFolders
+            throw error
+        }
+        onLibraryActivated?()
     }
 
     func audioURL(for recording: Recording) -> URL {
@@ -380,6 +549,9 @@ final class RecordingStore: ObservableObject {
             return
         }
         guard !compressingIDs.contains(id) else { return }
+        guard let libraryTicket = libraryActivity.beginWork() else { return }
+        defer { libraryActivity.finishWork(libraryTicket) }
+        guard noteLibraryMutation() else { return }
         compressingIDs.insert(id)
         defer { compressingIDs.remove(id) }
         let dstName = (rec.audioFileName as NSString).deletingPathExtension + ".m4a"
@@ -412,6 +584,7 @@ final class RecordingStore: ObservableObject {
             try? FileManager.default.removeItem(at: dst)
             return
         }
+        guard noteLibraryMutation() else { return }
         recordings[idx].audioFileName = dstName
         persist()
         try? FileManager.default.removeItem(at: src)
@@ -430,6 +603,8 @@ final class RecordingStore: ObservableObject {
     /// fires on the main actor after each. Returns the count converted.
     @discardableResult
     func compressAllWAVRecordings(onProgress: (@MainActor (Int, Int) -> Void)? = nil) async -> Int {
+        guard let batchTicket = libraryActivity.beginWork() else { return 0 }
+        defer { libraryActivity.finishWork(batchTicket) }
         let wavIDs = recordings
             .filter { $0.status == .completed && $0.audioFileName.lowercased().hasSuffix(".wav") }
             .map(\.id)
@@ -472,8 +647,9 @@ final class RecordingStore: ObservableObject {
     }
 
     func add(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         recordings.insert(recording, at: 0)
-        writeTranscript(for: recording)
+        if !writeTranscript(for: recording) { transcriptRewritesPending.insert(recording.id) }
         writeSummary(for: recording)
         persist()
     }
@@ -497,6 +673,7 @@ final class RecordingStore: ObservableObject {
     /// rather than the source of truth.
     @discardableResult
     func update(_ recording: Recording) -> Bool {
+        guard noteLibraryMutation() else { return false }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
         // A calendar match can arrive while capture/transcription holds a
         // stop-time copy. A missing snapshot on that copy is not a request
@@ -505,6 +682,7 @@ final class RecordingStore: ObservableObject {
         if recording.calendarEvent == nil { recording.calendarEvent = recordings[idx].calendarEvent }
         recordings[idx] = recording
         let transcriptWritten = writeTranscript(for: recording)
+        if !transcriptWritten { transcriptRewritesPending.insert(recording.id) }
         writeSummary(for: recording)
         let persisted = persist()
         return transcriptWritten && persisted
@@ -545,6 +723,7 @@ final class RecordingStore: ObservableObject {
     /// outcome leaves no trace of the attempt.
     @discardableResult
     func upsertImported(_ recording: Recording) -> UpsertOutcome {
+        guard noteLibraryMutation() else { return .notSaved }
         let before = recordings
         if let idx = recordings.firstIndex(where: { $0.id == recording.id }) {
             recordings[idx] = recording
@@ -684,6 +863,7 @@ final class RecordingStore: ObservableObject {
     /// an on-demand embedding subprocess per row. A caller that ever needs to
     /// move `speakerNames` in bulk must use the single-row method instead.
     func updateAll(_ updated: [Recording]) {
+        guard noteLibraryMutation() else { return }
         var touched = false
         for recording in updated {
             guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { continue }
@@ -710,6 +890,7 @@ final class RecordingStore: ObservableObject {
     /// the store-owned `audioFileName` intact. Returns nil if the recording is
     /// gone.
     func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
+        guard noteLibraryMutation() else { return nil }
         // Not while "End Conversation Here" is still cutting this recording's
         // audio (#357): the trim would give up on a `.pending` row and the
         // pass would transcribe the FULL audio, writing the lines the user
@@ -752,6 +933,7 @@ final class RecordingStore: ObservableObject {
     /// Rename a recording's user-facing title. No-op if the trimmed title is
     /// empty (we never want a blank entry in the sidebar) or unchanged.
     func rename(_ recording: Recording, to newTitle: String) {
+        guard noteLibraryMutation() else { return }
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
@@ -777,6 +959,7 @@ final class RecordingStore: ObservableObject {
     /// both the write and the regenerate when it is not.
     @discardableResult
     func setSummaryLanguage(_ code: String?, recordingID: UUID) -> Recording? {
+        guard noteLibraryMutation() else { return nil }
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return nil }
         recordings[idx].summaryLanguage = code
         persist()
@@ -801,6 +984,7 @@ final class RecordingStore: ObservableObject {
     /// a deliberate user action: `mergeSpeakers`, reached from the speaker
     /// popover behind a confirmation (island-io/mila#237).
     func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmed, !trimmed.isEmpty {
@@ -846,6 +1030,7 @@ final class RecordingStore: ObservableObject {
     @discardableResult
     func mergeSpeakerNameSuggestions(_ suggestions: [SpeakerNameSuggestion],
                                      recordingID: UUID) -> Bool {
+        guard noteLibraryMutation() else { return false }
         guard !suggestions.isEmpty,
               let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return false }
         let row = recordings[idx]
@@ -868,6 +1053,7 @@ final class RecordingStore: ObservableObject {
     /// Drop the pending suggestion for `rawID` without naming anyone — the
     /// user's "no, that's not them". No-op when there is none.
     func dismissSpeakerNameSuggestion(forSpeaker rawID: String, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
         let before = recordings[idx].speakerNameSuggestions.count
         recordings[idx].speakerNameSuggestions.removeAll { $0.speaker == rawID }
@@ -942,6 +1128,7 @@ final class RecordingStore: ObservableObject {
     /// the contribution comes back out. Deliberately not used on the
     /// re-transcribe path: see that method's note and #260.
     func reattachSpeakerName(_ name: String, toSpeaker rawID: String, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -973,6 +1160,7 @@ final class RecordingStore: ObservableObject {
     /// the observation nowhere: the wrong profile lost it and the right one
     /// never gained it.
     func mergeSpeakers(from sourceRawID: String, into targetRawID: String, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
               sourceRawID != targetRawID else { return }
         for i in recordings[idx].segments.indices {
@@ -997,6 +1185,7 @@ final class RecordingStore: ObservableObject {
     /// the *last* segment of `SPEAKER_01` away retires that id, so its name
     /// and its embedding go with it.
     func reassignSegmentSpeaker(segmentID: UUID, toSpeaker targetRawID: String, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
               let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID })
         else { return }
@@ -1080,6 +1269,7 @@ final class RecordingStore: ObservableObject {
     /// which drops a retired id's observation rather than leaving it for a
     /// reused number to resolve against.
     func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
               let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID }),
               let current = recordings[recIdx].segments[segIdx].speaker
@@ -1142,7 +1332,8 @@ final class RecordingStore: ObservableObject {
     /// the confirmation in the detail view says so.
     @discardableResult
     func deleteSegments(_ segmentIDs: Set<UUID>, recordingID: UUID) -> Recording? {
-        applyTranscriptEdit(recordingID: recordingID) { $0.removingSegments(segmentIDs) }
+        guard noteLibraryMutation() else { return nil }
+        return applyTranscriptEdit(recordingID: recordingID) { $0.removingSegments(segmentIDs) }
     }
 
     /// What "End Conversation Here" did: the row after the transcript edit
@@ -1164,6 +1355,7 @@ final class RecordingStore: ObservableObject {
     /// recording or line, the last line, or an edit that is blocked now).
     @discardableResult
     func endConversation(afterSegment segmentID: UUID, recordingID: UUID) async -> EndConversationResult? {
+        guard noteLibraryMutation() else { return nil }
         guard let live = recordings.first(where: { $0.id == recordingID }),
               !audioTrimPendingIDs.contains(recordingID) else { return nil }
         // From the transcript edit until the audio is cut, no re-transcription
@@ -1362,9 +1554,19 @@ final class RecordingStore: ObservableObject {
     /// recording does not stay an uncompressed WAV until the next
     /// "Compress existing recordings".
     func trimAudio(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        guard let libraryTicket = libraryActivity.beginWork() else { return .abandoned }
+        defer { libraryActivity.finishWork(libraryTicket) }
+        guard noteLibraryMutation() else { return .abandoned }
         let outcome = await performAudioTrim(recordingID: recordingID, toSeconds: seconds)
         if compressionDeferredByTrim.remove(recordingID) != nil {
-            Task { [weak self] in await self?.compressRecordingAudio(id: recordingID) }
+            // Reserve the queued compression before the Task exists, then
+            // keep that ticket until the compressor's own body has settled.
+            if let deferredTicket = libraryActivity.beginWork() {
+                Task { [weak self] in
+                    await self?.compressRecordingAudio(id: recordingID)
+                    self?.libraryActivity.finishWork(deferredTicket)
+                }
+            }
         }
         return outcome
     }
@@ -1436,6 +1638,7 @@ final class RecordingStore: ObservableObject {
             logTrimFailure(recordingID, stage: "replace", error)
             return .failed
         }
+        guard noteLibraryMutation() else { return .abandoned }
         recordings[idx].duration = written
         persist()
         audioRevisions[recordingID, default: 0] += 1
@@ -1461,6 +1664,7 @@ final class RecordingStore: ObservableObject {
     /// the caller passes "work" but "Work" already exists, the recording is
     /// filed under the existing "Work" rather than spawning a duplicate.
     func assign(_ recording: Recording, toFolder folderName: String?) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         let normalized = folderName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = (normalized?.isEmpty ?? true) ? nil : normalized
@@ -1575,6 +1779,7 @@ final class RecordingStore: ObservableObject {
     /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
     /// abort flag so the in-flight whisper pass unwinds.
     func stopTranscription(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
         recordings[idx].status = .failed
@@ -1618,6 +1823,7 @@ final class RecordingStore: ObservableObject {
     /// `TranscriptionService.deferTranscription(of:)`, which is the only
     /// caller — it decides whether there is a run to stop at all.
     func markTranscriptionDeferred(_ id: UUID) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return }
         let row = recordings[idx]
         guard row.status == .pending || row.status == .running else { return }
@@ -1633,6 +1839,7 @@ final class RecordingStore: ObservableObject {
 
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
     func softDelete(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx].deletedAt = Date()
         persist()
@@ -1640,6 +1847,7 @@ final class RecordingStore: ObservableObject {
 
     /// Restore from "Recently Deleted".
     func restore(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx].deletedAt = nil
         persist()
@@ -1650,6 +1858,7 @@ final class RecordingStore: ObservableObject {
     /// subtitles). Missing files are ignored — each is best-effort so one
     /// absent sidecar doesn't strand the others.
     func permanentlyDelete(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         recordings.removeAll { $0.id == recording.id }
         try? fileManager.removeItem(at: audioURL(for: recording))
         try? fileManager.removeItem(at: transcriptURL(for: recording))
@@ -1670,6 +1879,7 @@ final class RecordingStore: ObservableObject {
 
     /// Backwards-compatible delete: soft-delete first, permanent if already trashed.
     func delete(_ recording: Recording) {
+        guard noteLibraryMutation() else { return }
         if recording.isTrashed {
             permanentlyDelete(recording)
         } else {
@@ -1686,6 +1896,7 @@ final class RecordingStore: ObservableObject {
     /// skips persisting when the trash is already empty.
     @discardableResult
     func emptyTrash() -> Int {
+        guard noteLibraryMutation() else { return 0 }
         let trashed = recordings.filter { $0.isTrashed }
         guard !trashed.isEmpty else { return 0 }
 
@@ -1750,6 +1961,7 @@ final class RecordingStore: ObservableObject {
     /// Voice Memos. Returns the number moved to the trash.
     @discardableResult
     func softDeleteVoiceMemos(fromFolderID folderID: String) -> Int {
+        guard noteLibraryMutation() else { return 0 }
         let now = Date()
         var count = 0
         for idx in recordings.indices where
@@ -1783,6 +1995,7 @@ final class RecordingStore: ObservableObject {
         if folders.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             return folders.first { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
         }
+        guard noteLibraryMutation() else { return nil }
         folders.append(trimmed)
         folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         persistFolders()
@@ -1804,6 +2017,7 @@ final class RecordingStore: ObservableObject {
         }) {
             return nil
         }
+        guard noteLibraryMutation() else { return nil }
         folders.removeAll { $0 == oldName }
         folders.append(trimmed)
         folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
@@ -1817,6 +2031,7 @@ final class RecordingStore: ObservableObject {
 
     /// Delete a folder. Recordings filed under it become unfiled (folder = nil).
     func deleteFolder(_ name: String) {
+        guard noteLibraryMutation() else { return }
         guard folders.contains(name) else { return }
         folders.removeAll { $0 == name }
         for i in recordings.indices where recordings[i].folder == name {
@@ -1958,6 +2173,7 @@ final class RecordingStore: ObservableObject {
         do {
             let data = try encoder.encode(recordings)
             try data.write(to: storeURL, options: .atomic)
+            indexIsUnsaved = false
             return true
         } catch {
             // `.private` on the description — and this one really did need it,
@@ -1982,6 +2198,7 @@ final class RecordingStore: ObservableObject {
                 (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
                 \(error.localizedDescription, privacy: .private)
                 """)
+            indexIsUnsaved = true
             return false
         }
     }
@@ -2045,7 +2262,9 @@ final class RecordingStore: ObservableObject {
         do {
             let data = try encoder.encode(folders)
             try data.write(to: foldersURL, options: .atomic)
+            foldersAreUnsaved = false
         } catch {
+            foldersAreUnsaved = true
             // Same treatment as `persist()` above, and for the same reason:
             // `foldersURL` follows the user's chosen storage directory (see
             // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
