@@ -730,8 +730,7 @@ final class MicrophoneRecorder: ObservableObject {
         // epoch too, so a rebuild already inside its bring-up abandons itself
         // even if a new recording starts before it returns.
         captureEpoch += 1
-        let stoppingWatchdog = watchdogTask
-        stoppingWatchdog?.cancel()
+        watchdogTask?.cancel()
         watchdogTask = nil
         if let observer = configChangeObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -762,15 +761,6 @@ final class MicrophoneRecorder: ObservableObject {
                 toTeardown.inputNode.removeTap(onBus: 0)
                 toTeardown.stop()
             }.value
-        }
-        // Cancelling the polling task does not join a rebuild already awaited
-        // by it. Join with a bound: even the old engine's teardown can wedge.
-        // Existing epoch checks still reject and tear down a late engine.
-        if let stoppingWatchdog {
-            try? await Self.withTimeout(
-                seconds: bringUpTimeout,
-                onTimeout: { micLog.error("mic watchdog did not settle before the stop deadline; late engine cleanup remains guarded by the session epoch") }
-            ) { await stoppingWatchdog.value }
         }
     }
 
@@ -953,7 +943,6 @@ final class MicrophoneRecorder: ObservableObject {
         seconds: TimeInterval,
         deviceName: @escaping @Sendable () -> String? = { nil },
         onAbandoned: @escaping @Sendable (T) -> Void = { _ in },
-        onTimeout: (@Sendable () -> Void)? = nil,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         let claimed = OSAllocatedUnfairLock(initialState: false)
@@ -980,10 +969,6 @@ final class MicrophoneRecorder: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 let device = deviceName()
                 if finish(.failure(MicrophoneError.bringUpTimedOut(device: device, timeout: seconds))) {
-                    if let onTimeout {
-                        onTimeout()
-                        return
-                    }
                     // Public on purpose: a diagnostic report should show which
                     // input stalled without needing the redacted description
                     // `RecordingSession` logs (#213 keeps that one private).
