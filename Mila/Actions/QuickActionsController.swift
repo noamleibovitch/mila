@@ -6,6 +6,7 @@ import ScreenCaptureKit
 import UniformTypeIdentifiers
 import AVFoundation
 import TranscriptionCore
+import os
 
 private let quickActionsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                      category: "QuickActionsController")
@@ -564,6 +565,49 @@ final class QuickActionsController: ObservableObject {
         // Phase A/Phase B split under test) is unchanged — only the START
         // is faked, exactly the part CI can't do for real.
         if CommandLine.arguments.contains("--ui-test-finalize-regression") {
+            #if DEBUG
+            let arguments = CommandLine.arguments
+            if arguments.contains("--ui-test-watchdog-stop"),
+               arguments.contains("--uitests"), arguments.contains("--ui-test-clean-store"),
+               let suite = arguments.first(where: { $0.hasPrefix("--ui-test-menu-bar-suite=") }),
+               let id = UUID(uuidString: String(suite.dropFirst("--ui-test-menu-bar-suite=".count))),
+               let directory = ProcessInfo.processInfo.environment["TMPDIR"] {
+                // Synthetic capture only. The native test releases a held
+                // rebuild after inspecting the real stopping UI. Never open
+                // AVAudioEngine or ask for microphone access on this path.
+                let root = URL(fileURLWithPath: directory, isDirectory: true)
+                let ready = root.appendingPathComponent("watchdog-ready-\(id.uuidString)")
+                let arm = root.appendingPathComponent("watchdog-arm-\(id.uuidString)")
+                let armed = root.appendingPathComponent("watchdog-armed-\(id.uuidString)")
+                let release = root.appendingPathComponent("watchdog-release-\(id.uuidString)")
+                let attempts = OSAllocatedUnfairLock(initialState: 0)
+                let mic = session.mic
+                let stopTimeout = mic.bringUpTimeout
+                // Give native automation time to open the menu, then restore
+                // the production deadline before the test can click Stop.
+                mic.bringUpTimeout = 30
+                session.mic.captureStallTimeout = 0.1
+                session.mic.watchdogInterval = 0.05
+                session.mic.bringUpOverride = {
+                    let attempt = attempts.withLock { count in count += 1; return count }
+                    guard attempt > 1 else { return }
+                    try Data().write(to: ready, options: .atomic)
+                    let deadline = Date().addingTimeInterval(30)
+                    var didArm = false
+                    while !FileManager.default.fileExists(atPath: release.path), Date() < deadline {
+                        if !didArm, FileManager.default.fileExists(atPath: arm.path) {
+                            await MainActor.run { mic.bringUpTimeout = stopTimeout }
+                            try Data().write(to: armed, options: .atomic)
+                            didArm = true
+                        }
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                    await MainActor.run { mic.bringUpTimeout = stopTimeout }
+                }
+                do { try await session.mic.start() }
+                catch { return } // A failed fixture must never fall back to real capture.
+            }
+            #endif
             let url = store.freshAudioURL(suggestedName: "Recording")
             await startFakeRecordingForTesting(outputURL: url)
             return

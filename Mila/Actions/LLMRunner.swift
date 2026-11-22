@@ -1477,7 +1477,7 @@ enum LLMRunner {
         // result the user no longer cares about. The handle also signals
         // `exited` on cancel, so the wait below wakes at the cancel rather
         // than at the deadline and can escalate a child that ignores SIGTERM.
-        handle.attach(process, group: childGroup, wake: exited)
+        handle.attach(process, wake: exited)
 
         // Read stdout/stderr eagerly on background threads so a chatty CLI
         // can't deadlock by filling the OS pipe buffer while we wait for exit.
@@ -1518,7 +1518,7 @@ enum LLMRunner {
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
         let timedOut = exited.wait(timeout: deadline) == .timedOut
         if timedOut {
-            sendSignal(SIGTERM, to: process, group: childGroup)
+            signalLeader(SIGTERM, process)
         }
         // Woken early by a cancel (`ProcessHandle.terminate` already sent
         // SIGTERM and signalled `exited`), or past the deadline: either way
@@ -1548,7 +1548,7 @@ enum LLMRunner {
             // possible, as it always was on the timeout path).
             if exited.wait(timeout: .now() + 1) == .timedOut || process.isRunning {
                 if process.isRunning {
-                    sendSignal(SIGKILL, to: process, group: childGroup)
+                    signalLeader(SIGKILL, process)
                 }
                 // BOUNDED: `waitUntilExit` has been observed never returning
                 // even after a SIGKILL (macOS 26, sampled live — likely a
@@ -1563,9 +1563,10 @@ enum LLMRunner {
                     llmRunnerLog.error("llm reap abandoned pid=\(process.processIdentifier, privacy: .public) — waitUntilExit didn't return after SIGKILL")
                 }
             }
-            // Sweep the group once the CLI is gone. A helper it spawned got
-            // the SIGTERM too but may ignore it, and the CLI exiting inside
-            // the grace (or being SIGKILLed above) does nothing to it.
+            // Stop the leader before its helpers. Killing a shell's foreground
+            // child first can wake the shell and let it run its next command.
+            // The leader has now exited or received SIGKILL; helpers get their
+            // own existing TERM/KILL grace and cannot revive that shell.
             if let childGroup {
                 terminateHelpers(of: childGroup)
             }
@@ -1695,21 +1696,19 @@ enum LLMRunner {
         }
     }
 
-    /// Send `signal` to the CLI's whole process group when it leads one
-    /// (`processGroup(ledBy:)`), otherwise to the CLI alone, and only while
+    /// Signal the leader first; `terminateHelpers(of:)` sweeps its group after
+    /// the bounded exit/escalation. Do not signal both together: a shell can
+    /// resume past a killed foreground child before handling its own signal.
+    /// Signal only while
     /// the CLI is still running: once Foundation has reaped it, its pid (and
     /// so, once its helpers are gone, its group id) can be reused by an
     /// unrelated process, and `Process.terminate()` on a finished process,
     /// which this replaces, was a no-op. A cancel can arrive in that window
     /// (after the reap, before `run` returns). The deliberate post-reap
     /// sweep, `terminateHelpers(of:)`, is the one exception, and says why.
-    static func sendSignal(_ signal: Int32, to process: Process, group: pid_t?) {
+    static func signalLeader(_ signal: Int32, _ process: Process) {
         guard process.isRunning else { return }
-        if let group {
-            killpg(group, signal)
-        } else {
-            kill(process.processIdentifier, signal)
-        }
+        kill(process.processIdentifier, signal)
     }
 
     /// The ONE working directory every LLM CLI invocation is chdir'd into.
@@ -2286,8 +2285,8 @@ enum LLMRunner {
 /// propagate a Task cancel into the child, so this small handle is the
 /// shared mutable state: the runner `attach`es the live Process; the
 /// `onCancel` arm of `withTaskCancellationHandler` calls `terminate()`,
-/// which SIGTERMs the child's process group (the CLI and the helpers it
-/// spawned; see `LLMRunner.processGroup(ledBy:)`). `wasTerminated` lets the wait-loop tell the
+/// which SIGTERMs the leader; `executeProcess` then sweeps its verified group
+/// after the leader exits or is killed. `wasTerminated` lets the wait-loop tell the
 /// difference between "exited on its own with a non-zero status" and "we
 /// killed it because the user cancelled".
 final class ProcessHandle: @unchecked Sendable {
@@ -2311,19 +2310,14 @@ final class ProcessHandle: @unchecked Sendable {
     /// (see `executeProcess`).
     private var wake: DispatchSemaphore?
 
-    /// The child's process group, when it leads one; signalled instead of
-    /// the bare pid so a cancel reaches the CLI's helpers too.
-    private var group: pid_t?
-
-    func attach(_ p: Process, group: pid_t?, wake: DispatchSemaphore) {
+    func attach(_ p: Process, wake: DispatchSemaphore) {
         lock.lock(); defer { lock.unlock() }
         self.wake = wake
-        self.group = group
         if _wasTerminated {
             // Cancel beat us to attach — the Task was already cancelled
             // before the Process even started. Reach out and SIGTERM right
             // now so the child doesn't even get a head start.
-            LLMRunner.sendSignal(SIGTERM, to: p, group: group)
+            LLMRunner.signalLeader(SIGTERM, p)
             wake.signal()
             return
         }
@@ -2334,7 +2328,7 @@ final class ProcessHandle: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         _wasTerminated = true
         if let process {
-            LLMRunner.sendSignal(SIGTERM, to: process, group: group)
+            LLMRunner.signalLeader(SIGTERM, process)
         }
         wake?.signal()
     }
