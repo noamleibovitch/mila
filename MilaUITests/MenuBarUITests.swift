@@ -205,6 +205,39 @@ final class MenuBarUITests: XCTestCase {
         relaunched.terminate()
     }
 
+    func test_stopping_remains_visible_while_a_watchdog_rebuild_settles() throws {
+        let application = launch(fakeRecording: true, watchdogStop: true)
+        defer { application.terminate() }
+        startFromMenu(application)
+        waitForStatusLabel(application, containing: "Recording")
+        let ready = tempRoot.appendingPathComponent("watchdog-ready-\(suiteID.uuidString)")
+        let release = tempRoot.appendingPathComponent("watchdog-release-\(suiteID.uuidString)")
+        let rebuilding = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            FileManager.default.fileExists(atPath: ready.path)
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [rebuilding], timeout: 10), .completed)
+
+        openMenu(application)
+        let stop = menuItem(application, identifier: "menuBar.record", title: "Stop Recording")
+        XCTAssertTrue(stop.isEnabled)
+        let stoppedAt = Date()
+        stop.click()
+        waitForStatusLabel(application, containing: "Stopping", timeout: 5)
+        openMenu(application)
+        let stopping = menuItem(application, identifier: "menuBar.record", title: "Stopping Recording")
+        XCTAssertTrue(stopping.waitForExistence(timeout: 5))
+        XCTAssertFalse(stopping.isEnabled, "another capture must not start while Stop is settling")
+        try Data().write(to: release, options: .atomic)
+        application.typeKey(.escape, modifierFlags: [])
+        waitForStatusLabel(application, containing: "Ready")
+        let latency = Date().timeIntervalSince(stoppedAt)
+        XCTAssertLessThan(latency, 20, "Stop must finish after the held rebuild is released")
+        let measurement = XCTAttachment(string: "Synthetic watchdog Stop latency: \(latency) seconds")
+        measurement.name = "Watchdog stop latency"
+        measurement.lifetime = .keepAlways
+        add(measurement)
+    }
+
     func test_paused_recording_survives_close_and_stays_stoppable() {
         let application = launch(fakeRecording: true)
         XCTAssertTrue(mainWindow(application).waitForExistence(timeout: 20))
@@ -304,7 +337,8 @@ final class MenuBarUITests: XCTestCase {
 
     private func launch(microphone: Bool = true,
                         appAudio: Bool = true,
-                        fakeRecording: Bool = false) -> XCUIApplication {
+                        fakeRecording: Bool = false,
+                        watchdogStop: Bool = false) -> XCUIApplication {
         let application = XCUIApplication()
         application.launchArguments = [
             "--uitests", "--ui-test-clean-store", "--ui-test-recording-lang-en",
@@ -330,6 +364,7 @@ final class MenuBarUITests: XCTestCase {
             // The existing fake-start seam: no AVAudioEngine, no microphone.
             application.launchArguments.append("--ui-test-finalize-regression")
         }
+        if watchdogStop { application.launchArguments.append("--ui-test-watchdog-stop") }
         application.launchEnvironment["TMPDIR"] = tempRoot.path + "/"
         app = application
         application.launch()
