@@ -449,7 +449,7 @@ final class PostRecordingCommandRunner: ObservableObject {
     /// requires: both pipes drained on threads of their own before the exit
     /// is read, the exit observed by `terminationHandler` with a
     /// `waitUntilExit` backstop, the timeout enforced by SIGTERM then SIGKILL
-    /// on the child's process group, every wait bounded. It blocks for the
+    /// on the leader before its helper group, every wait bounded. It blocks for the
     /// child's whole life, so it gets a dedicated thread (`BlockingWork`),
     /// and a cancelled Task reaches the child through `ProcessHandle`.
     nonisolated static func spawn(_ request: ProcessRequest) async -> ProcessResult {
