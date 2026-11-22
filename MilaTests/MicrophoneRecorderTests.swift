@@ -325,6 +325,25 @@ final class RebuildThrottleTests: XCTestCase {
 /// us whether it actually tried to repair capture.
 @MainActor
 final class MicrophoneWatchdogTests: XCTestCase {
+    private actor BringUpGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var released = false
+        private(set) var isWaiting = false
+
+        func wait() async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+                isWaiting = true
+            }
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
 
     /// Small helper: a recorder whose bring-ups are counted, tuned to a fast
     /// watchdog so the test doesn't wait 4 real seconds per rebuild.
@@ -405,6 +424,41 @@ final class MicrophoneWatchdogTests: XCTestCase {
         try await Task.sleep(nanoseconds: 600_000_000)
         XCTAssertEqual(bringUps(), afterStop,
                        "no bring-ups may happen after stop() — the watchdog must be cancelled")
+    }
+
+    func test_stop_waits_for_an_in_flight_watchdog_bring_up() async throws {
+        let (mic, bringUps) = makeRecorder()
+        let bringUp = try XCTUnwrap(mic.bringUpOverride)
+        let gate = BringUpGate()
+        mic.bringUpTimeout = 10 // The test releases this operation explicitly.
+        mic.bringUpOverride = {
+            try await bringUp()
+            if bringUps() > 1 { await gate.wait() }
+        }
+        try await mic.start()
+        let deadline = Date().addingTimeInterval(3)
+        var waiting = await gate.isWaiting
+        while !waiting, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            waiting = await gate.isWaiting
+        }
+        XCTAssertTrue(waiting, "the watchdog must enter the held rebuild")
+
+        var stopReturned = false
+        let stop = Task { @MainActor in
+            await mic.stop()
+            stopReturned = true
+        }
+        let stopDeadline = Date().addingTimeInterval(1)
+        while mic.isRunning, Date() < stopDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(mic.isRunning)
+        XCTAssertFalse(stopReturned, "Stop must join the rebuild it cancelled")
+        await gate.release()
+        await stop.value
+        XCTAssertTrue(stopReturned)
+        XCTAssertNil(mic.configurationChangeSource, "a stopped rebuild must not reinstall its observer")
     }
 }
 

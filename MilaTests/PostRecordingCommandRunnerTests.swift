@@ -598,6 +598,30 @@ final class PostRecordingCommandRunnerTests: XCTestCase {
         XCTAssertFalse(result.timedOut)
     }
 
+    func test_timeout_does_not_resume_a_shell_past_its_foreground_child() async throws {
+        let survived = tempRoot.appendingPathComponent("survived")
+        let ready = tempRoot.appendingPathComponent("ready")
+        // A harmless TERM trap makes the ordering deterministic: signalling
+        // the group kills sleep, wakes the shell, and it runs the next line.
+        // Stopping the leader first must prevent that continuation.
+        script = try writeScript("foreground.sh", body: """
+            trap ':' TERM
+            touch '\(ready.path)'
+            sleep 30
+            touch '\(survived.path)'
+            """)
+        let request = PostRecordingCommandRunner.ProcessRequest(
+            executable: script, arguments: [], environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: tempRoot, timeout: 1)
+        let started = Date()
+        let result = await PostRecordingCommandRunner.spawn(request)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path), "fixture must install its trap before timeout")
+        XCTAssertTrue(result.timedOut)
+        XCTAssertFalse(result.cancelled)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 20)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: survived.path))
+    }
+
     /// Delete while the command is running: it is killed, its handoff goes,
     /// and there is no banner — the cancellation was the user's.
     func test_deleting_the_recording_mid_run_kills_the_command() async throws {
