@@ -242,8 +242,7 @@ struct RecordingLocationChangeSheet: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("storage.changeSheet.copyProgress")
-        .accessibilityLabel("Copying recordings")
-        .accessibilityValue("\(progress.doneFiles) of \(progress.totalFiles) files, \(byteString(progress.copiedBytes)) of \(byteString(progress.totalBytes))")
+        .accessibilityLabel("Copying recordings. \(progress.doneFiles) of \(progress.totalFiles) files, \(byteString(progress.copiedBytes)) of \(byteString(progress.totalBytes))")
     }
 
     private func incomplete(_ message: String) -> some View {
