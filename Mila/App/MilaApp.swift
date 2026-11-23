@@ -443,6 +443,28 @@ struct MilaApp: App {
         return defaults
     }
 
+#if DEBUG
+    /// Deterministic, UI-test-only folder scenarios. Each requires the normal
+    /// `--uitests` clean-store isolation plus a validated UUID-owned storage
+    /// suite; a production launch, or any missing flag, takes the unchanged
+    /// default path with no extra suspension or injected capacity.
+    enum FolderUITestScenario: String {
+        case insufficientSpace = "insufficient-space"
+        case busy = "busy"
+        case slowCheck = "slow-check"
+    }
+
+    static func folderUITestScenario(arguments: [String] = CommandLine.arguments) -> FolderUITestScenario? {
+        guard arguments.contains("--uitests"),
+              arguments.contains("--ui-test-clean-store"),
+              storageUITestDefaults(arguments: arguments) != nil,
+              let arg = arguments.first(where: { $0.hasPrefix("--ui-test-folder-scenario=") }) else {
+            return nil
+        }
+        return FolderUITestScenario(rawValue: String(arg.dropFirst("--ui-test-folder-scenario=".count)))
+    }
+#endif
+
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
@@ -1160,7 +1182,22 @@ struct MilaApp: App {
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
 
+#if DEBUG
+        let folderScenario = Self.folderUITestScenario()
+        let readiness: RecordingLibraryReadiness
+        if case .some(.busy) = folderScenario {
+            readiness = RecordingLibraryReadiness(providers: [{
+                RecordingLibraryWorkState.busy(
+                    "Synthetic UI busy fixture",
+                    "Synthetic busy state for native verification.",
+                    generation: 1)
+            }])
+        } else {
+            readiness = RecordingLibraryReadiness()
+        }
+#else
         let readiness = RecordingLibraryReadiness()
+#endif
         readiness.add { store.libraryMigrationWorkState }
         readiness.add { actions.libraryWorkState }
         readiness.add { dictationController.libraryWorkState }
@@ -1173,9 +1210,33 @@ struct MilaApp: App {
         readiness.add { shareImporter.libraryWorkState }
         readiness.add { offlineEmbedder.libraryWorkState }
         readiness.add { startupWork.libraryWorkState }
-        let location = RecordingLocationCoordinator(store: store,
-                                                      storage: storage,
-                                                      readiness: readiness)
+        let location: RecordingLocationCoordinator
+#if DEBUG
+        switch folderScenario {
+        case .some(.insufficientSpace):
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness,
+                                                    capacity: { _ in 1 })
+        case .some(.slowCheck):
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness,
+                                                    beforeInspection: { Thread.sleep(forTimeInterval: 12) })
+        case .some(.busy):
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness)
+        case .none:
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness)
+        }
+#else
+        location = RecordingLocationCoordinator(store: store,
+                                                storage: storage,
+                                                readiness: readiness)
+#endif
         _libraryReadiness = StateObject(wrappedValue: readiness)
         _recordingLocation = StateObject(wrappedValue: location)
         _startupRecoveryWork = StateObject(wrappedValue: startupWork)

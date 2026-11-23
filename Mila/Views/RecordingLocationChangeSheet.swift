@@ -33,7 +33,9 @@ struct RecordingLocationChangeSheet: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityElement(children: .combine)
                     }
-                    pathCard
+                    if coordinator.preview != nil {
+                        pathCard
+                    }
                     switch coordinator.phase {
                     case .presenting:
                         choices

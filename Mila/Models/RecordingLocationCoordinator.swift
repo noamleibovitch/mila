@@ -90,6 +90,10 @@ final class RecordingLocationCoordinator: ObservableObject {
     private let storage: RecordingStorageSettings
     private let readiness: RecordingLibraryReadiness
     private let capacity: (URL) -> UInt64?
+    /// Optional deterministic slow-inspection seam for native verification.
+    /// It runs only inside the detached inspection task. Production leaves it
+    /// nil, so the existing inspection path is unchanged.
+    private let beforeInspection: (@Sendable () -> Void)?
     /// Optional deterministic verification boundary for held-worker tests.
     /// Production leaves it nil; no suspension is added to the commit turn.
     private let beforeFinalVerification: (@MainActor () async -> Void)?
@@ -127,9 +131,11 @@ final class RecordingLocationCoordinator: ObservableObject {
          storage: RecordingStorageSettings,
          readiness: RecordingLibraryReadiness,
          capacity: @escaping (URL) -> UInt64? = RecordingLibraryMigration.availableCapacity,
+         beforeInspection: (@Sendable () -> Void)? = nil,
          commitSelection: ((RecordingStorageSettings.PreparedSelection) -> Bool)? = nil,
          beforeFinalVerification: (@MainActor () async -> Void)? = nil,
          chunkWrite: (@Sendable (FileHandle, Data) throws -> Void)? = nil) {
+        self.beforeInspection = beforeInspection
         self.beforeFinalVerification = beforeFinalVerification
         self.chunkWrite = chunkWrite
         self.capacity = capacity
@@ -299,8 +305,10 @@ final class RecordingLocationCoordinator: ObservableObject {
     }
 
     private func inspectDestination(_ destination: RecordingLibraryInspection.Layout) async throws {
+        let beforeInspection = self.beforeInspection
         let result = try await Task.detached(priority: .userInitiated) {
-            try RecordingLibraryInspection.inspect(destination)
+            beforeInspection?()
+            return try RecordingLibraryInspection.inspect(destination)
         }.value
         try Self.checkCancellation(cancellation)
         if let blocker = capturedReadiness?.firstBlocker, !blocker.isIdle {

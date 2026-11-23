@@ -66,7 +66,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         try await super.tearDown()
     }
 
-    private func launch() -> XCUIApplication {
+    private func launch(extraArguments: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["MILA_UI_TEST_CLEAN_ROOT"] = root.path
         app.launchArguments = [
@@ -74,7 +74,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
             "--ui-test-clean-store",
             "--ui-test-seed-recording",
             "--ui-test-storage-suite=\(suiteID.uuidString)"
-        ]
+        ] + extraArguments
         app.launch()
         return app
     }
@@ -181,6 +181,37 @@ final class RecordingLocationChangeUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    /// Never capture the desktop: only the explicit app window that owns the
+    /// visible Storage section (falling back to another app window).
+    private func settingsWindowScreenshot(_ app: XCUIApplication, named name: String) {
+        let settingsWindow = app.windows
+            .containing(.any, identifier: "settings.section.storage").firstMatch
+        let target = settingsWindow.exists ? settingsWindow : app.windows.firstMatch
+        let attachment = XCTAttachment(screenshot: target.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    /// Match a rendered label regardless of the SwiftUI element type: combined
+    /// accessibility groups surface their text as a label, not a static text.
+    private func renderedElement(_ app: XCUIApplication, labelContains fragment: String) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", fragment))
+            .firstMatch
+    }
+
+    /// The Settings affordances refuse while any real writer is busy. Wait for
+    /// the app's own readiness to settle before driving the chooser in a
+    /// scenario that does not itself simulate busy.
+    private func waitUntilEnabled(_ element: XCUIElement, timeout: TimeInterval,
+                                  _ message: String) {
+        let settled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in element.exists && element.isEnabled },
+            object: element)
+        XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: timeout), .completed, message)
     }
 
     func test_radio_selection_continue_copy_reopen() throws {
@@ -467,5 +498,133 @@ final class RecordingLocationChangeUITests: XCTestCase {
                       "A repeated reset must stay a no-op")
         XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].exists)
         XCTAssertEqual(try indexRows(at: root.appendingPathComponent("recordings.json")).count, 1)
+    }
+
+    // MARK: - Insufficient space, synthetic busy, and slow-check cancellation
+
+    func test_insufficient_space_disables_copy_and_cancel_keeps_originals() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+
+        // The DEBUG-only capacity fixture reports one byte free, so the
+        // preview must show an honest required/available warning.
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=insufficient-space"])
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalAudio = try Data(contentsOf: sourceAudio)
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        chooseDestination(app)
+
+        XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10))
+        let warning = renderedElement(app, labelContains: "Not enough space")
+        XCTAssertTrue(warning.waitForExistence(timeout: 5),
+                      "Insufficient space must render its required/available reason")
+        XCTAssertTrue(visibleText(warning).contains("needed"),
+                      "The reason must state how much space the copy needs")
+        XCTAssertTrue(visibleText(warning).contains("available"),
+                      "The reason must state how much space is available")
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertFalse(copy.exists,
+                       "A copy the volume cannot hold must not be selectable")
+        let fresh = app.radioButtons["Start fresh"]
+        XCTAssertTrue(fresh.waitForExistence(timeout: 5),
+                      "A safe alternative must remain available")
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertFalse(continueButton.isEnabled,
+                       "Continue must stay disabled until a deliberate selection")
+        settingsWindowScreenshot(app, named: "Insufficient space refuses the copy")
+
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 2),
+                       "Escape must cancel before any copy or switch")
+
+        let path = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(path.waitForExistence(timeout: 5))
+        XCTAssertEqual(path.value as? String, sourceRecordings.path,
+                       "Cancel must keep the original folder selected")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+                       "No copy may be started for an unaffordable destination")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "Cancel must not touch the original audio")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "Cancel must not touch the original index")
+    }
+
+    func test_synthetic_busy_settings_shows_visible_feedback_and_refuses_location_actions() throws {
+        // This is a SYNTHETIC readiness fixture (labelled as such in its
+        // reason): it proves the busy rendering and refusal only, not that a
+        // real recording or processing job holds the library. Exercising the
+        // real capture/hotkey stack is deliberately out of scope here.
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=busy"])
+        _ = openStorage(app)
+
+        let choose = app.buttons["storage.chooseFolder.button"]
+        XCTAssertTrue(choose.exists)
+        XCTAssertFalse(choose.isEnabled, "A busy library must refuse the folder chooser")
+        let useDefault = app.buttons["storage.resetDefault.button"]
+        XCTAssertTrue(useDefault.exists)
+        XCTAssertFalse(useDefault.isEnabled, "A busy library must refuse the default-folder check")
+        XCTAssertTrue(renderedElement(app, labelContains: "Synthetic busy state for native verification.")
+                        .waitForExistence(timeout: 10),
+                      "The busy refusal must be visible, not silent")
+
+        // Keyboard and VoiceOver users receive the refusal through the
+        // disabled controls' accessible value.
+        let value = (choose.value as? String) ?? ""
+        XCTAssertTrue(value.contains("Finish recording or processing before changing folders."),
+                      "The disabled control must expose why it refuses")
+        XCTAssertTrue(value.contains("Synthetic busy state for native verification."))
+        settingsWindowScreenshot(app, named: "Synthetic busy state refuses folder actions")
+    }
+
+    func test_slow_check_cancel_settles_and_keeps_originals() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+
+        // The DEBUG-only inspection seam holds the detached check for a
+        // bounded twelve seconds so the checking state and its Cancel are
+        // reachable without any real cloud/large-folder condition.
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-check"])
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalAudio = try Data(contentsOf: sourceAudio)
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        chooseDestination(app)
+
+        XCTAssertTrue(renderedElement(app, labelContains: "Checking folder").waitForExistence(timeout: 8),
+                      "The bounded inspection hold must expose the checking state")
+        let cancel = app.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        XCTAssertTrue(cancel.isEnabled)
+        settingsWindowScreenshot(app, named: "Slow folder check in progress")
+
+        cancel.click()
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 20),
+                      "Cancel during checking must settle")
+        XCTAssertTrue(visibleText(outcome).contains("Folder check canceled"))
+        XCTAssertTrue(visibleText(outcome).contains("still using the current folder"))
+        app.buttons["Close"].click()
+        XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 2))
+
+        let path = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(path.waitForExistence(timeout: 5))
+        XCTAssertEqual(path.value as? String, sourceRecordings.path,
+                       "A canceled folder check must keep the original folder selected")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+                       "A canceled folder check must not write the destination")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "A canceled folder check must not touch the original audio")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "A canceled folder check must not touch the original index")
     }
 }
