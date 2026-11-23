@@ -87,7 +87,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         [element.label, element.value as? String ?? ""].joined(separator: "\n")
     }
 
-    private func openStorage(_ app: XCUIApplication) -> XCUIElement {
+    private func openStorage(_ app: XCUIApplication, expectedDirectory: URL? = nil) -> XCUIElement {
         let settingsLink = app.buttons["sidebar.settings.link"]
         XCTAssertTrue(settingsLink.waitForExistence(timeout: 15), "Settings link missing")
         settingsLink.click()
@@ -95,9 +95,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(storage.waitForExistence(timeout: 10), "Storage section missing")
         storage.click()
         XCTAssertTrue(app.buttons["storage.chooseFolder.button"].waitForExistence(timeout: 10))
+        let expected = expectedDirectory ?? root.appendingPathComponent("Recordings")
         XCTAssertTrue(app.staticTexts.matching(NSPredicate(
-            format: "label CONTAINS %@ OR value CONTAINS %@", root.path, root.path)).firstMatch
-            .waitForExistence(timeout: 5), "App must open the exact seeded test root")
+            format: "label CONTAINS %@ OR value CONTAINS %@", expected.path, expected.path)).firstMatch
+            .waitForExistence(timeout: 5), "App must open the exact expected test library")
         return app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
     }
 
@@ -181,7 +182,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["Close"].click()
         app.terminate()
         let reopened = launch()
-        _ = openStorage(reopened)
+        _ = openStorage(reopened, expectedDirectory: destination)
         XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", destination.path, destination.path)).firstMatch
             .waitForExistence(timeout: 10), "The committed custom folder must persist across reopen")
     }
