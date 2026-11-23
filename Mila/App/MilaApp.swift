@@ -452,16 +452,27 @@ struct MilaApp: App {
         case insufficientSpace = "insufficient-space"
         case busy = "busy"
         case slowCheck = "slow-check"
+        case slowCopy = "slow-copy"
     }
 
     static func folderUITestScenario(arguments: [String] = CommandLine.arguments) -> FolderUITestScenario? {
         guard arguments.contains("--uitests"),
               arguments.contains("--ui-test-clean-store"),
               storageUITestDefaults(arguments: arguments) != nil,
-              let arg = arguments.first(where: { $0.hasPrefix("--ui-test-folder-scenario=") }) else {
+              let arg = arguments.first(where: { $0.hasPrefix("--ui-test-folder-scenario=") }),
+              let scenario = FolderUITestScenario(rawValue: String(arg.dropFirst("--ui-test-folder-scenario=".count))) else {
             return nil
         }
-        return FolderUITestScenario(rawValue: String(arg.dropFirst("--ui-test-folder-scenario=".count)))
+        if scenario == .slowCopy {
+            // The interrupted-copy fixture writes into a test-owned stage and
+            // must never activate outside a seeded, validated clean root.
+            guard arguments.contains("--ui-test-seed-recording"),
+                  let raw = ProcessInfo.processInfo.environment["MILA_UI_TEST_CLEAN_ROOT"],
+                  RecordingStore.isValidUITestRoot(URL(fileURLWithPath: raw).standardizedFileURL) else {
+                return nil
+            }
+        }
+        return scenario
     }
 #endif
 
@@ -1223,6 +1234,15 @@ struct MilaApp: App {
                                                     storage: storage,
                                                     readiness: readiness,
                                                     beforeInspection: { Thread.sleep(forTimeInterval: 12) })
+        case .some(.slowCopy):
+            // Debug-only held-worker seam: real bytes plus a bounded pause on
+            // the detached copy worker so a native test can observe progress
+            // and cancel/quit mid-copy. Production passes no chunkWrite.
+            let harness = RecordingLocationUITestHarness()
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness,
+                                                    chunkWrite: harness.chunkWrite)
         case .some(.busy):
             location = RecordingLocationCoordinator(store: store,
                                                     storage: storage,

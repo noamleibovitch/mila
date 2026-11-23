@@ -214,6 +214,87 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: timeout), .completed, message)
     }
 
+    // MARK: - Interrupted-copy helpers (mid-copy progress, Quit, cold removal)
+
+    /// Grow the app-seeded audio inside the UI-owned clean root BEFORE launch so
+    /// a copy spans several 1 MiB worker chunks. This is a few megabytes of
+    /// synthetic sine audio, never user audio, and it is removed with the root.
+    private func growSeedWAV(frames: AVAudioFrameCount) throws {
+        let audio = root.appendingPathComponent("Recordings/seed.wav")
+        try? FileManager.default.removeItem(at: audio)
+        try writeSyntheticWAV(at: audio, frequency: 440, frames: frames)
+    }
+
+    private func copyProgressElement(_ app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", "Copying recordings"))
+            .firstMatch
+    }
+
+    /// The copy view is one combined accessibility element whose value is
+    /// "done of total files, copied of total bytes". Wait until the copied
+    /// portion is a real KB/MB amount, so a pass proves observed byte progress
+    /// rather than only the copying phase.
+    @discardableResult
+    private func waitForRealCopyProgress(_ app: XCUIApplication,
+                                         timeout: TimeInterval = 25) -> XCUIElement {
+        let element = copyProgressElement(app)
+        XCTAssertTrue(element.waitForExistence(timeout: timeout),
+                      "Copy progress must be visible")
+        let progressed = XCTNSPredicateExpectation(predicate: NSPredicate { object, _ in
+            guard let element = object as? XCUIElement,
+                  let value = element.value as? String,
+                  let marker = value.range(of: "files, ") else { return false }
+            let copied = String(value[marker.upperBound...])
+                .components(separatedBy: " of ").first ?? ""
+            return copied.contains("KB") || copied.contains("MB")
+        }, object: element)
+        XCTAssertEqual(XCTWaiter.wait(for: [progressed], timeout: timeout), .completed,
+                       "Copy progress must report real copied bytes, not only the phase")
+        return element
+    }
+
+    private func incompleteStageDirectories(in directory: URL) -> [URL] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names
+            .filter { $0.hasPrefix(".mila-copy-") }
+            .map { directory.appendingPathComponent($0, isDirectory: true) }
+    }
+
+    private func stagedFileSize(_ stage: URL, named name: String) -> UInt64 {
+        let file = stage
+            .appendingPathComponent(".mila-copy-files", isDirectory: true)
+            .appendingPathComponent(name)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
+        return (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// The inspected production Quit branch is `applicationShouldTerminate`
+    /// (window close does not quit: `applicationShouldTerminateAfterLastWindowClosed`
+    /// returns false). This is the app-scoped Cmd-Q key equivalent, not a
+    /// global OS key event.
+    private func requestQuit(_ app: XCUIApplication) {
+        app.typeKey("q", modifierFlags: [.command])
+    }
+
+    private func waitForRemovalConfirmation(_ app: XCUIApplication,
+                                            timeout: TimeInterval = 10) -> XCUIElement {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            var candidates: [XCUIElement] = [app.dialogs.firstMatch]
+            candidates.append(contentsOf: app.sheets.allElementsBoundByIndex)
+            for candidate in candidates where candidate.exists {
+                if candidate.buttons["Cancel"].exists,
+                   candidate.buttons["Remove incomplete copy"].exists {
+                    return candidate
+                }
+            }
+            _ = RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        } while Date() < deadline
+        XCTFail("Removal confirmation must appear")
+        return app.dialogs.firstMatch
+    }
+
     func test_radio_selection_continue_copy_reopen() throws {
         let app = launch()
         _ = openStorage(app)
@@ -631,5 +712,273 @@ final class RecordingLocationChangeUITests: XCTestCase {
                        "A canceled folder check must not touch the original audio")
         XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
                        "A canceled folder check must not touch the original index")
+    }
+
+    // MARK: - Interrupted copy, Quit default, cold incomplete-copy removal
+
+    func test_mid_copy_progress_cancel_retains_incomplete_copy_and_keeps_originals() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        try growSeedWAV(frames: 1_500_000)
+        let originalAudio = try Data(contentsOf: sourceAudio)
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
+        defer { app.terminate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        chooseDestination(app)
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.click()
+        app.buttons["storage.changeSheet.continue"].click()
+
+        waitForRealCopyProgress(app)
+        settingsWindowScreenshot(app, named: "Copying with real byte progress before cancel")
+        let midStages = incompleteStageDirectories(in: destination)
+        XCTAssertEqual(midStages.count, 1, "The copy must own exactly one hidden stage")
+        XCTAssertGreaterThan(stagedFileSize(midStages[0], named: "seed.wav"), 0,
+                             "The stage must contain real copied bytes before Cancel")
+
+        let cancel = app.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        cancel.click()
+
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Cancel during copy must settle")
+        let text = visibleText(outcome)
+        XCTAssertTrue(text.contains("Copy canceled"), "Cancel must not claim success")
+        XCTAssertTrue(text.contains("original recordings are unchanged"))
+        XCTAssertTrue(text.contains("retained the incomplete copy"),
+                      "Unproven staged bytes must be retained, not claimed cleaned up")
+        XCTAssertTrue(text.contains("verify safe removal"))
+        appWindowScreenshot(app, named: "Cancel during copy retained the incomplete copy")
+        app.buttons["Close"].click()
+
+        let currentPath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, sourceRecordings.path,
+                       "A canceled copy must keep the original folder selected")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "Cancel must not touch the original audio")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "Cancel must not touch the original index")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+                       "A canceled copy must not publish a destination library")
+        let retainedStages = incompleteStageDirectories(in: destination)
+        XCTAssertEqual(retainedStages.count, 1,
+                       "A canceled copy whose ownership is unproven must stay on disk")
+        XCTAssertGreaterThan(stagedFileSize(retainedStages[0], named: "seed.wav"), 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: retainedStages[0].appendingPathComponent(".mila-receipt.json").path),
+                      "The retained stage must keep its real receipt")
+    }
+
+    func test_quit_during_copy_keep_copying_default_finishes_copy() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        try growSeedWAV(frames: 1_500_000)
+        let originalAudio = try Data(contentsOf: sourceAudio)
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
+        defer { app.terminate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        let sourceID = try XCTUnwrap(try indexRows(at: sourceIndex).first?["id"] as? String)
+        chooseDestination(app)
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.click()
+        app.buttons["storage.changeSheet.continue"].click()
+        waitForRealCopyProgress(app)
+
+        requestQuit(app)
+        XCTAssertTrue(app.buttons["Keep copying"].waitForExistence(timeout: 15),
+                      "Quit during copy must ask, with Keep copying as the default button")
+        XCTAssertTrue(app.buttons["Stop and quit"].exists)
+        let quitDialog = app.dialogs.firstMatch
+        if quitDialog.exists, quitDialog.buttons.count >= 2 {
+            XCTAssertEqual(quitDialog.buttons.element(boundBy: 0).label, "Keep copying",
+                           "Keep copying must be the alert's default (first) button")
+            XCTAssertEqual(quitDialog.buttons.element(boundBy: 1).label, "Stop and quit")
+        }
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Stop copying and quit?"))
+            .firstMatch.waitForExistence(timeout: 5),
+                      "Quit during copy must show the inspected alert title")
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] %@",
+                                  "Keep copying to finish the folder change"))
+            .firstMatch.exists,
+                      "The quit alert must explain the default and the stop choice")
+
+        app.buttons["Keep copying"].click()
+        XCTAssertNotEqual(app.state, .notRunning, "Keep copying must cancel the quit")
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 60),
+                      "Keeping the copy running must let it finish")
+        let text = visibleText(outcome)
+        XCTAssertTrue(text.contains(destination.path))
+        XCTAssertTrue(text.contains("original recordings remain"))
+        appWindowScreenshot(app, named: "Keep copying default finished the folder change")
+        app.buttons["Close"].click()
+
+        let currentPath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, destination.path,
+                       "The finished copy must be the active folder")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "The original audio must survive the copy")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "The original index must survive the copy")
+        let destinationIndex = destination.appendingPathComponent("recordings.json")
+        let destinationAudio = destination.appendingPathComponent("seed.wav")
+        XCTAssertEqual(try Data(contentsOf: destinationIndex), originalIndex,
+                       "The copy must preserve raw index bytes")
+        XCTAssertEqual(try indexRows(at: destinationIndex).first?["id"] as? String, sourceID,
+                       "The copy must preserve the recording UUID")
+        XCTAssertEqual(try Data(contentsOf: destinationAudio), originalAudio,
+                       "The copy must preserve audio bytes")
+        XCTAssertEqual(try AVAudioFile(forReading: destinationAudio).length, 1_500_000)
+        XCTAssertTrue(incompleteStageDirectories(in: destination).isEmpty,
+                      "A successful copy must remove its verified stage")
+
+        app.terminate()
+        let reopened = launch()
+        defer { reopened.terminate() }
+        _ = openStorage(reopened, expectedDirectory: destination)
+        let persistedPath = reopened.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertEqual(persistedPath.value as? String, destination.path,
+                       "The committed copy must persist across reopen")
+        XCTAssertEqual(try indexRows(at: destinationIndex).first?["id"] as? String, sourceID)
+        XCTAssertEqual(try Data(contentsOf: destinationAudio), originalAudio)
+    }
+
+    func test_quit_stop_copy_then_cold_reselect_remove_incomplete_copy_safe_failure_retains_files() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        try growSeedWAV(frames: 1_500_000)
+        let originalAudio = try Data(contentsOf: sourceAudio)
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
+        defer { app.terminate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        chooseDestination(app)
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.click()
+        app.buttons["storage.changeSheet.continue"].click()
+        waitForRealCopyProgress(app)
+
+        requestQuit(app)
+        XCTAssertTrue(app.buttons["Stop and quit"].waitForExistence(timeout: 15),
+                      "Quit during copy must offer Stop and quit")
+        app.buttons["Stop and quit"].click()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 40),
+                      "Stop and quit must terminate after the worker settles and cleanup runs")
+
+        // The worker stopped mid-copy, so the durable receipt has no per-file
+        // creation identity. Keep using that REAL canceled stage: it must be
+        // retained, and no ownership may be fabricated for it.
+        let canceledStages = incompleteStageDirectories(in: destination)
+        XCTAssertEqual(canceledStages.count, 1,
+                       "The stopped copy must leave exactly one real stage")
+        let canceledStage = canceledStages[0]
+        let partialSize = stagedFileSize(canceledStage, named: "seed.wav")
+        XCTAssertGreaterThan(partialSize, 0, "The canceled stage holds real copied bytes")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: canceledStage.appendingPathComponent(".mila-receipt.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path))
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio)
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex)
+
+        // Test-owned sentinel OUTSIDE the stage: safe removal must never
+        // recursively delete the destination. It is not ownership proof and
+        // the expected refusal comes from the stage's missing created identity.
+        try Data("keep".utf8).write(to: destination.appendingPathComponent("sentinel-keep.txt"))
+
+        let reopened = launch()
+        defer { reopened.terminate() }
+        _ = openStorage(reopened)
+        chooseDestination(reopened)
+
+        XCTAssertTrue(renderedElement(reopened,
+                                     labelContains: "incomplete copy from an earlier attempt")
+                        .waitForExistence(timeout: 15),
+                      "A cold reselect must surface the real incomplete copy")
+        XCTAssertTrue(renderedElement(reopened, labelContains: "Remove the incomplete copy").exists)
+        let remove = reopened.buttons["Remove incomplete copy"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 5))
+        remove.click()
+
+        let confirmation = waitForRemovalConfirmation(reopened)
+        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS[c] %@", "Remove the incomplete copy?"))
+            .firstMatch.exists,
+                      "Removal must be confirmed explicitly")
+        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS[c] %@", "original recordings are not removed"))
+            .firstMatch.exists,
+                      "The confirmation must state that originals are not removed")
+        let attachment = XCTAttachment(screenshot: confirmation.screenshot())
+        attachment.name = "Incomplete copy removal confirmation"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let cancelRemoval = confirmation.buttons["Cancel"]
+        XCTAssertTrue(cancelRemoval.waitForExistence(timeout: 5))
+        cancelRemoval.click()
+        XCTAssertEqual(incompleteStageDirectories(in: destination).count, 1,
+                       "Canceling the confirmation must remove nothing")
+
+        remove.click()
+        let confirmed = waitForRemovalConfirmation(reopened)
+        let destructive = confirmed.buttons["Remove incomplete copy"]
+        XCTAssertTrue(destructive.waitForExistence(timeout: 5))
+        destructive.click()
+
+        let outcome = reopened.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 20),
+                      "Unsafe incomplete-copy removal must settle")
+        let text = visibleText(outcome)
+        XCTAssertTrue(text.contains("remove the incomplete copy safely"))
+        XCTAssertTrue(text.contains("Choose another folder"))
+        XCTAssertFalse(text.contains("Mila removed the incomplete copy"),
+                       "Unproven staged files must never be reported as removed")
+
+        let currentPath = reopened.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, sourceRecordings.path,
+                       "A safe-removal failure must keep the original folder selected")
+
+        let retained = incompleteStageDirectories(in: destination)
+        XCTAssertEqual(retained.count, 1, "A safe-removal failure must retain the stage")
+        XCTAssertEqual(stagedFileSize(retained[0], named: "seed.wav"), partialSize,
+                       "A safe-removal failure must not truncate or delete staged bytes")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: retained[0].appendingPathComponent(".mila-receipt.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("sentinel-keep.txt").path),
+                      "Safe refusal must not recursively delete the destination")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("seed.wav").path))
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio)
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex)
     }
 }
