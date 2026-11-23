@@ -651,8 +651,7 @@ final class RecordingLocationCoordinator: ObservableObject {
             let sourceAgain = try await Task.detached(priority: .userInitiated) {
                 try RecordingLibraryInspection.inspect(source.layout, allowingOwnedStage: true)
             }.value
-            guard case .existing(let sourceFinal) = sourceAgain,
-                  sameLibrary(source, sourceFinal) else { throw Problem.sourceChanged }
+            guard case .existing = sourceAgain else { throw Problem.sourceChanged }
             let finalDestination = sourcePreparedFrom(source, layout: destination)
             try await activate(snapshot: finalDestination, isDefault: destination.isDefault,
                                url: url, sourceWasCopied: true,
