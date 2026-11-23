@@ -56,11 +56,11 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let settingsLink = app.buttons["sidebar.settings.link"]
         XCTAssertTrue(settingsLink.waitForExistence(timeout: 15), "Settings link missing")
         settingsLink.click()
-        let storage = app.buttons["settings.section.storage"]
+        let storage = app.descendants(matching: .any).matching(identifier: "settings.section.storage").firstMatch
         XCTAssertTrue(storage.waitForExistence(timeout: 10), "Storage section missing")
         storage.click()
         XCTAssertTrue(app.buttons["storage.chooseFolder.button"].waitForExistence(timeout: 10))
-        return app.windows["com_apple_SwiftUI_Settings_window"]
+        return app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
     }
 
     private func chooseDestination(_ app: XCUIApplication) {
