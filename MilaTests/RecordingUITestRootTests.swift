@@ -23,6 +23,25 @@ final class RecordingUITestRootTests: XCTestCase {
         XCTAssertTrue(RecordingStore.isValidUITestRoot(try makeRoot()))
     }
 
+    func test_only_the_named_runner_container_private_uuid_root_is_accepted() throws {
+        let home = try makeRoot()
+        let parent = home.appendingPathComponent(
+            "Library/Containers/io.island.whisper.IslandWhisperUITests.xctrunner/Data/tmp", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let candidate = parent.appendingPathComponent("Mila-UITest-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        XCTAssertTrue(RecordingStore.isValidUITestRoot(candidate, runnerHome: home))
+        let other = home.appendingPathComponent("Library/Containers/Other.xctrunner/Data/tmp")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let foreign = other.appendingPathComponent("Mila-UITest-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: foreign, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        XCTAssertFalse(RecordingStore.isValidUITestRoot(foreign, runnerHome: home))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: candidate.path)
+        XCTAssertFalse(RecordingStore.isValidUITestRoot(candidate, runnerHome: home))
+    }
+
     func test_public_or_non_uuid_root_is_refused() throws {
         let publicRoot = try makeRoot()
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: publicRoot.path)

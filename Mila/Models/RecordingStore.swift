@@ -117,13 +117,19 @@ final class RecordingStore: ObservableObject {
     /// Shared fixtures may live outside XCTest's sandbox-specific tmpdir.
     /// Accept only a canonical UUID direct child of a known temporary root,
     /// owned by this user and inaccessible to other users. Never a user library.
-    static func isValidUITestRoot(_ candidate: URL) -> Bool {
+    static func isValidUITestRoot(_ candidate: URL,
+                                  runnerHome: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)) -> Bool {
         let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
         let shared = URL(fileURLWithPath: "/tmp", isDirectory: true).resolvingSymlinksInPath()
+        // XCTest's sandbox owns its own tmp directory. Name the one exact
+        // test-runner container, never arbitrary containers or a caller path.
+        let runnerTemporary = runnerHome.appendingPathComponent(
+            "Library/Containers/io.island.whisper.IslandWhisperUITests.xctrunner/Data/tmp",
+            isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
         let prefix = "Mila-UITest-"
         guard candidate.isFileURL, candidate == candidate.standardizedFileURL,
               candidate == candidate.resolvingSymlinksInPath(),
-              [temporary, shared].contains(candidate.deletingLastPathComponent().standardizedFileURL),
+              [temporary, shared, runnerTemporary].contains(candidate.deletingLastPathComponent().standardizedFileURL),
               candidate.lastPathComponent.hasPrefix(prefix),
               UUID(uuidString: String(candidate.lastPathComponent.dropFirst(prefix.count))) != nil,
               let attrs = try? FileManager.default.attributesOfItem(atPath: candidate.path),

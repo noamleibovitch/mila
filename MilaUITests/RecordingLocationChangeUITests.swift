@@ -69,10 +69,6 @@ final class RecordingLocationChangeUITests: XCTestCase {
     private func launch() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["MILA_UI_TEST_CLEAN_ROOT"] = root.path
-        // The runner is sandboxed and owns a different temporary directory
-        // from the unsandboxed app host. Align only this test process, keeping
-        // the exact private UUID root and the app's validation unchanged.
-        app.launchEnvironment["TMPDIR"] = root.deletingLastPathComponent().path
         app.launchArguments = [
             "--uitests",
             "--ui-test-clean-store",
