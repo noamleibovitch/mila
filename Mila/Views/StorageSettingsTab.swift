@@ -23,6 +23,12 @@ struct StorageSettingsTab: View {
     @EnvironmentObject private var coordinator: RecordingLocationCoordinator
     @EnvironmentObject private var readiness: RecordingLibraryReadiness
 
+    private enum LocationControl: Hashable { case choose, useDefault }
+    @State private var locationInvoker: LocationControl = .choose
+    @State private var pendingLocationFocusRestore = false
+    @FocusState private var locationFocus: LocationControl?
+    @AccessibilityFocusState private var accessibleLocationFocus: LocationControl?
+
     @State private var isCompressing = false
     @State private var compressStatus: String?
 
@@ -81,9 +87,30 @@ struct StorageSettingsTab: View {
             }
         }
         .sheet(isPresented: Binding(get: { coordinator.isSheetPresented },
-                                    set: { if !$0 { coordinator.dismiss() } })) {
+                                    set: { if !$0 { coordinator.dismiss() } }), onDismiss: {
+            pendingLocationFocusRestore = true
+            restoreLocationFocusIfPossible()
+        }) {
             RecordingLocationChangeSheet(coordinator: coordinator)
         }
+        .onChange(of: isLocationBusy) { _, busy in
+            if !busy { restoreLocationFocusIfPossible() }
+        }
+    }
+
+    private func prepareLocationFocus(_ control: LocationControl) {
+        locationInvoker = control
+        pendingLocationFocusRestore = false
+        locationFocus = nil
+        accessibleLocationFocus = nil
+    }
+
+    private func restoreLocationFocusIfPossible() {
+        guard pendingLocationFocusRestore, !coordinator.isSheetPresented,
+              !isLocationBusy else { return }
+        pendingLocationFocusRestore = false
+        locationFocus = locationInvoker
+        accessibleLocationFocus = locationInvoker
     }
 
     private var header: some View {
@@ -119,14 +146,24 @@ struct StorageSettingsTab: View {
                 Spacer()
             }
             HStack(spacing: 8) {
-                Button("Choose…") { coordinator.chooseFolder() }
+                Button("Choose…") {
+                    prepareLocationFocus(.choose)
+                    coordinator.chooseFolder()
+                }
+                .focused($locationFocus, equals: .choose)
+                .accessibilityFocused($accessibleLocationFocus, equals: .choose)
                 .disabled(isLocationBusy)
                 .help(isLocationBusy ? busyText : "Check a recordings folder before switching.")
                 .accessibilityValue(isLocationBusy ? busyText : "Ready")
                 .accessibilityIdentifier("storage.chooseFolder.button")
                 Button("Reveal in Finder") { revealInFinder() }
                 Spacer()
-                Button("Use default location…") { coordinator.useDefaultLocation() }
+                Button("Use default location…") {
+                    prepareLocationFocus(.useDefault)
+                    coordinator.useDefaultLocation()
+                }
+                .focused($locationFocus, equals: .useDefault)
+                .accessibilityFocused($accessibleLocationFocus, equals: .useDefault)
                 .disabled(isLocationBusy)
                 .help(isLocationBusy ? busyText : "Check the default recordings folder before switching.")
                 .accessibilityValue(isLocationBusy ? busyText : "Ready")

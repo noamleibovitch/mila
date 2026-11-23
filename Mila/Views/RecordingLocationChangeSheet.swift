@@ -98,7 +98,12 @@ struct RecordingLocationChangeSheet: View {
         }
         .onAppear {
             cancelFocused = true
-            announce("\(coordinator.title). Choose an option, then Continue.")
+            if case .incompleteCopy(let message) = coordinator.phase {
+                resultFocus = .error
+                announce(message)
+            } else {
+                announce("\(coordinator.title). Choose an option, then Continue.")
+            }
         }
         .task(id: coordinator.phase == .checking) {
             guard case .checking = coordinator.phase else { checkingSlow = false; return }
@@ -111,7 +116,7 @@ struct RecordingLocationChangeSheet: View {
                 resultFocus = .heading
                 announce(coordinator.previewSummaryAnnouncement)
             case .failure(let message), .canceled(let message),
-                 .success(let message), .noOp(let message):
+                 .success(let message), .noOp(let message), .incompleteCopy(let message):
                 resultFocus = .error
                 announce(message)
             case .copying, .publishing, .finishing, .stopping:
@@ -252,6 +257,7 @@ struct RecordingLocationChangeSheet: View {
             notice(message, systemImage: "exclamationmark.triangle.fill", tint: .orange)
                 .accessibilityIdentifier("storage.changeSheet.incompleteWarning")
                 .accessibilityLabel(message)
+                .accessibilityFocused($resultFocus, equals: .error)
             HStack(spacing: 10) {
                 Button("Remove incomplete copy") { confirmingRemoval = true }
                     .accessibilityHint("Removes only the unchanged files Mila copied earlier. Your original recordings are not removed.")

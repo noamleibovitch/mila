@@ -482,6 +482,30 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Recordings/seed.wav").path))
     }
 
+    func test_sheet_cancel_restores_keyboard_focus_to_choose_folder() throws {
+        let app = launch()
+        defer { app.terminate() }
+        _ = openStorage(app)
+        chooseDestination(app)
+        let title = app.staticTexts["storage.changeSheet.title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        app.typeKey(.escape, modifierFlags: [])
+        let dismissed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"), object: title)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed)
+        // Space activates the focused button without clicking or manually
+        // refocusing it. The real panel proves focus returned to Choose.
+        app.typeKey(" ", modifierFlags: [])
+        let panel = app.windows["open-panel"]
+        XCTAssertTrue(panel.waitForExistence(timeout: 10),
+                      "Dismissal must return keyboard focus to the invoking Choose button")
+        panel.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Recordings/seed.wav").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path))
+    }
+
     func test_use_default_location_same_folder_is_no_op() throws {
         let app = launch()
         _ = openStorage(app)
