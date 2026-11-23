@@ -85,7 +85,7 @@ enum RecordingLibraryInspection {
         // last); the hidden stage is only a leftover ownership marker. It is
         // not an incomplete library we may delete. Without an index the
         // destination is genuinely incomplete and must be cleaned explicitly.
-        if !stageNames.isEmpty, !allowingOwnedStage, !hasIndex { throw Problem.incompleteCopy }
+        if !stageNames.isEmpty, !allowingOwnedStage { throw Problem.incompleteCopy }
         let libraryNames = names.subtracting(stageNames)
         if !hasIndex {
             let folderOnly = fm.fileExists(atPath: layout.folders.path)
