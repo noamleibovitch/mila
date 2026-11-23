@@ -52,7 +52,7 @@ final class RecordingLibraryActivity {
     /// nil means admission was refused. Callers must surface a busy outcome;
     /// they must not start work and later drop its completion.
     func beginWork() -> Ticket? {
-        guard !committing, advanceGeneration() else { return nil }
+        guard !committing else { return nil }
         let ticket = Ticket(context: context, id: UUID())
         outstanding.insert(ticket)
         return ticket
