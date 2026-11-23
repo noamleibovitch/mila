@@ -264,6 +264,7 @@ final class SpeakerNameSuggester {
         suggesterLog.log("started \(Self.shortID(id), privacy: .public) unnamed=\(unnamed.count, privacy: .public)")
 
         let lifetime = libraryLedger.begin()
+        libraryLedger.finish(lifetime) // adverse control: retire before worker unwind
         let task = Task { @MainActor [weak self] in
             defer {
                 self?.libraryLedger.finish(lifetime)
