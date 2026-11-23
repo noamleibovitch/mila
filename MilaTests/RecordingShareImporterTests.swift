@@ -401,7 +401,7 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertEqual(importer.pending?.id, abandonedPending.id, "the queued bundle must not replace the preview")
 
         let abandonedImport = Task { @MainActor in await importer.confirm() }
-        guard await waitUntil { firstCopied.opened } else {
+        guard await waitUntil({ firstCopied.opened }) else {
             await releaseFirst.open()
             await abandonedImport.value
             return XCTFail("confirm() never reached the abandoned audio copy")
@@ -509,7 +509,7 @@ final class RecordingShareImporterTests: XCTestCase {
             return XCTFail("the abandoned bundle never staged")
         }
         let abandonedImport = Task { @MainActor in await importer.confirm() }
-        guard await waitUntil { firstCopied.opened } else {
+        guard await waitUntil({ firstCopied.opened }) else {
             await releaseFirst.open()
             await abandonedImport.value
             return XCTFail("confirm() never reached the abandoned audio copy")
@@ -528,7 +528,7 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertFalse(stagedReplacement.isIdle)
 
         let replacementImport = Task { @MainActor in await importer.confirm() }
-        guard await waitUntil { secondCopied.opened } else {
+        guard await waitUntil({ secondCopied.opened }) else {
             await releaseFirst.open()
             await releaseSecond.open()
             await abandonedImport.value
