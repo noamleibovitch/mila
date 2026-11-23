@@ -292,9 +292,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         use.click()
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
         XCTAssertTrue(continueButton.isEnabled)
-        let combine = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
-        XCTAssertTrue(combine.waitForExistence(timeout: 5),
+        let combine = app.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.consequence").firstMatch
+        XCTAssertTrue(combine.waitForExistence(timeout: 5))
+        XCTAssertTrue(visibleText(combine).contains("combine the two folders"),
                       "Adoption warning must state the folders are not merged")
 
         continueButton.click()
@@ -422,13 +423,15 @@ final class RecordingLocationChangeUITests: XCTestCase {
         use.click()
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
         XCTAssertTrue(continueButton.isEnabled)
-        let count = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "already has 1 recording")).firstMatch
-        XCTAssertTrue(count.waitForExistence(timeout: 5),
+        let count = app.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.consequence").firstMatch
+        XCTAssertTrue(count.waitForExistence(timeout: 5))
+        XCTAssertTrue(visibleText(count).contains("already has 1 recording"),
                       "Warning must report the populated default count")
-        let combine = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
-        XCTAssertTrue(combine.waitForExistence(timeout: 5),
+        let combine = app.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.consequence").firstMatch
+        XCTAssertTrue(combine.waitForExistence(timeout: 5))
+        XCTAssertTrue(visibleText(combine).contains("combine the two folders"),
                       "Warning must state the folders are not merged")
         appWindowScreenshot(app, named: "Return to populated default warns count and no merge")
 

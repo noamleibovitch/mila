@@ -196,6 +196,8 @@ struct RecordingLocationChangeSheet: View {
                 .accessibilityIdentifier("storage.changeSheet.choice")
                 if let choice = coordinator.selectedChoice {
                     Text(consequence(for: choice, preview: preview))
+                        .accessibilityIdentifier("storage.changeSheet.consequence")
+                        .accessibilityLabel(consequence(for: choice, preview: preview))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
