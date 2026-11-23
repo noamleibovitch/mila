@@ -2961,7 +2961,6 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         #endif
         // Quit (Cmd+Q or the menu item) must never show the background
         // explanation or hide a window on the way out.
-        menuBarWindow.beginTermination()
         if didShutDown { return .terminateNow }
         if let recordingLocation, recordingLocation.isSettlingCopy {
             let alert = NSAlert()
@@ -2978,6 +2977,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             #endif
             switch response {
             case .alertSecondButtonReturn:
+                menuBarWindow.beginTermination()
                 didShutDown = true
                 recordingLocation.cancel()
                 Task { @MainActor [weak self] in
@@ -2992,6 +2992,7 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
                 return .terminateCancel
             }
         }
+        menuBarWindow.beginTermination()
         didShutDown = true
         Task { @MainActor [weak self] in
             await self?.gracefulShutdown()

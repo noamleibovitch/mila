@@ -80,6 +80,8 @@ struct RecordingLocationChangeSheet: View {
                 .frame(maxWidth: 480)
         }
         .frame(minWidth: 420, maxWidth: 520, minHeight: 300)
+        .background(RecordingLocationTerminationBridge(
+            allowsTerminationRequest: coordinator.isSettlingCopy))
         .interactiveDismissDisabled(!coordinator.canDismissSheet)
         .onExitCommand {
             if coordinator.canDismissSheet {

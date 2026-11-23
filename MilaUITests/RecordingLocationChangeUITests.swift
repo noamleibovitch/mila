@@ -323,7 +323,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
     /// (window close does not quit: `applicationShouldTerminateAfterLastWindowClosed`
     /// returns false). Use the app's observed native terminate: menu item.
     /// Cmd-Q produced no handler entry in the confirmed file-trace diagnostic;
-    /// shortcut delivery remains a separate, unresolved proof obligation.
+    /// the Stop-and-quit case also exercises Cmd-Q after the sheet policy fix.
     @discardableResult
     private func captureFolderQuitTrace(_ phase: String) -> String {
         let url = root.appendingPathComponent("Mila-UITest-quit-trace.txt")
@@ -341,7 +341,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         return text
     }
 
-    private func requestQuit(_ app: XCUIApplication) throws {
+    private func requestQuit(_ app: XCUIApplication, viaKeyboard: Bool = false) throws {
         let bootTrace = captureFolderQuitTrace("before Quit menu")
         guard bootTrace.split(separator: "\n").contains("wired") else {
             XCTFail("The app-side Quit trace must be live before clicking Quit")
@@ -360,6 +360,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
                 window.lifetime = .keepAlways
                 add(window)
             }
+        }
+        if viaKeyboard {
+            snapshot("before Cmd-Q")
+            app.typeKey("q", modifierFlags: [.command])
+            snapshot("after Cmd-Q")
+            captureFolderQuitTrace("after Cmd-Q")
+            return
         }
         snapshot("before Quit menu")
         // These titles/identifier are present in the captured native app menu,
@@ -1003,7 +1010,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["storage.changeSheet.continue"].click()
         try waitForRealCopyProgress(app)
 
-        try requestQuit(app)
+        try requestQuit(app, viaKeyboard: true)
         XCTAssertTrue(app.buttons["Stop and quit"].waitForExistence(timeout: 15),
                       "Quit during copy must offer Stop and quit")
         captureFolderQuitTrace("after Stop choice wait")
