@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 import Combine
 @testable import Mila
 
