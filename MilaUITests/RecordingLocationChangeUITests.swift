@@ -292,7 +292,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         use.click()
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
         XCTAssertTrue(continueButton.isEnabled)
-        let combine = app.staticTexts.containing(
+        let combine = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
         XCTAssertTrue(combine.waitForExistence(timeout: 5),
                       "Adoption warning must state the folders are not merged")
@@ -422,11 +422,11 @@ final class RecordingLocationChangeUITests: XCTestCase {
         use.click()
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
         XCTAssertTrue(continueButton.isEnabled)
-        let count = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS %@", "already has 1 recordings")).firstMatch
+        let count = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "already has 1 recording")).firstMatch
         XCTAssertTrue(count.waitForExistence(timeout: 5),
                       "Warning must report the populated default count")
-        let combine = app.staticTexts.containing(
+        let combine = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
         XCTAssertTrue(combine.waitForExistence(timeout: 5),
                       "Warning must state the folders are not merged")

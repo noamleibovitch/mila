@@ -367,9 +367,9 @@ struct RecordingLocationChangeSheet: View {
                     return "This folder has an empty Mila recordings list. Mila will show that empty list. Your current recordings stay in \(source). To see them again, choose \(source) in Settings > Storage."
                 }
                 if preview.isDefaultDestination {
-                    return "The default folder already has \(count) recordings. Mila will show those instead of the recordings you’re using now. It won’t combine the two folders. Your current recordings stay in \(source). To see them again, choose \(source) in Settings > Storage."
+                    return "The default folder already has \(count) recording\(count == 1 ? "" : "s"). Mila will show those instead of the recordings you’re using now. It won’t combine the two folders. Your current recordings stay in \(source). To see them again, choose \(source) in Settings > Storage."
                 }
-                return "Mila will show the \(count) recordings here instead of the ones you’re using now. It won’t combine the two folders. Your current recordings stay in \(source). To see them again, choose \(source) in Settings > Storage."
+                return "Mila will show the \(count) recording\(count == 1 ? "" : "s") here instead of the ones you’re using now. It won’t combine the two folders. Your current recordings stay in \(source). To see them again, choose \(source) in Settings > Storage."
             case .incompleteCopy:
                 return ""
             }
