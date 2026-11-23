@@ -8,6 +8,11 @@ import Foundation
 struct RecordingLocationChangeSheet: View {
     @ObservedObject var coordinator: RecordingLocationCoordinator
     @ObservedObject var progressModel: RecordingLocationProgressModel
+    /// DEBUG-only, scenario-gated preview of this sheet at its narrowest
+    /// width with an accessibility text size. It is `false` in Release and in
+    /// every launch that lacks the fully gated scenario flags, so the normal
+    /// layout is untouched.
+    private let forcesNarrowLargeTypePreview: Bool
     @FocusState private var cancelFocused: Bool
     @AccessibilityFocusState private var resultFocus: ResultFocus?
     @State private var confirmingRemoval = false
@@ -19,9 +24,19 @@ struct RecordingLocationChangeSheet: View {
     init(coordinator: RecordingLocationCoordinator) {
         self.coordinator = coordinator
         self.progressModel = coordinator.progressModel
+#if DEBUG
+        self.forcesNarrowLargeTypePreview = MilaApp.folderUITestScenario() == .largeType
+#else
+        self.forcesNarrowLargeTypePreview = false
+#endif
     }
 
     var body: some View {
+        sheetContent
+            .modifier(FolderSheetTestTypeSizeModifier(enabled: forcesNarrowLargeTypePreview))
+    }
+
+    private var sheetContent: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -81,7 +96,9 @@ struct RecordingLocationChangeSheet: View {
                 .padding(.vertical, 12)
                 .frame(maxWidth: 480)
         }
-        .frame(minWidth: 420, maxWidth: 520, minHeight: 300)
+        .frame(minWidth: 420,
+               maxWidth: forcesNarrowLargeTypePreview ? 420 : 520,
+               minHeight: 300)
         .background(RecordingLocationTerminationBridge(
             allowsTerminationRequest: coordinator.isSettlingCopy))
         .interactiveDismissDisabled(!coordinator.canDismissSheet)
@@ -446,6 +463,22 @@ struct RecordingLocationChangeSheet: View {
     private func announce(_ text: String) {
         guard !text.isEmpty else { return }
         AccessibilityNotification.Announcement(text).post()
+    }
+}
+
+/// Applies the accessibility text size only for the DEBUG, fully gated
+/// narrow/large-type native scenario. Every other launch returns the content
+/// unchanged, so there is no production layout change.
+private struct FolderSheetTestTypeSizeModifier: ViewModifier {
+    let enabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.environment(\.dynamicTypeSize, .accessibility3)
+        } else {
+            content
+        }
     }
 }
 

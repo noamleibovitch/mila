@@ -195,6 +195,22 @@ final class RecordingLocationChangeUITests: XCTestCase {
         add(attachment)
     }
 
+    /// Never capture the desktop: only the app window that currently hosts the
+    /// change sheet, then the Storage window, then another app window. Used for
+    /// states without an outcome element (choices, path cards).
+    private func changeSheetScreenshot(_ app: XCUIApplication, named name: String) {
+        let sheetWindow = app.windows
+            .containing(.staticText, identifier: "storage.changeSheet.title").firstMatch
+        let settingsWindow = app.windows
+            .containing(.any, identifier: "settings.section.storage").firstMatch
+        let target = sheetWindow.exists ? sheetWindow
+            : (settingsWindow.exists ? settingsWindow : app.windows.firstMatch)
+        let attachment = XCTAttachment(screenshot: target.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     /// Match a rendered label regardless of the SwiftUI element type: combined
     /// accessibility groups surface their text as a label, not a static text.
     private func renderedElement(_ app: XCUIApplication, labelContains fragment: String) -> XCUIElement {
@@ -255,6 +271,73 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let url = copyGateReleaseURL
         if FileManager.default.fileExists(atPath: url.path) { return }
         _ = FileManager.default.createFile(atPath: url.path, contents: Data())
+    }
+
+    /// Must match `RecordingLocationInspectionUITestGate` markers (DEBUG-only
+    /// app target, not linked here), mirrored with the same literals.
+    private static let inspectionGateEnteredMarkerName = "Mila-UITest-inspection-gate-entered"
+    private static let inspectionGateReleaseMarkerName = "Mila-UITest-inspection-gate-release"
+
+    /// The gate's "I am holding" marker, inside this test's validated root.
+    private var inspectionGateEnteredURL: URL {
+        root.appendingPathComponent(Self.inspectionGateEnteredMarkerName, isDirectory: false)
+    }
+
+    /// The single release marker the DEBUG inspection gate polls, inside this
+    /// test's already-validated UUID clean root. The test is the sole writer.
+    private var inspectionGateReleaseURL: URL {
+        root.appendingPathComponent(Self.inspectionGateReleaseMarkerName, isDirectory: false)
+    }
+
+    private func waitForInspectionGateEntered(timeout: TimeInterval = 10) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: inspectionGateEnteredURL.path) {
+                return true
+            }
+            _ = RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        return false
+    }
+
+    /// Release the held inspection worker. Unconditional and idempotent, so it
+    /// is safe in a `defer` on a failed assertion; it never writes outside the
+    /// validated root.
+    private func releaseInspectionGate() {
+        let url = inspectionGateReleaseURL
+        if FileManager.default.fileExists(atPath: url.path) { return }
+        _ = FileManager.default.createFile(atPath: url.path, contents: Data())
+    }
+
+    /// The DEBUG scenario's gate is bounded to 30 s; a failed test must never
+    /// depend on that cap to make progress, so every path releases it.
+    private func restorePosixPermissions(_ url: URL) {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                               ofItemAtPath: url.path)
+    }
+
+    /// Read a native command's enabled state without activating it. Opening the
+    /// menu bar title is required to expose its items; Escape only closes the
+    /// menu and never selects a command.
+    private func assertNativeCommandDisabled(_ app: XCUIApplication,
+                                             menuTitle: String,
+                                             itemLabelPrefix: String) {
+        let barItem = app.menuBars.menuBarItems[menuTitle]
+        XCTAssertTrue(barItem.waitForExistence(timeout: 5),
+                      "The native \(menuTitle) menu must exist")
+        barItem.click()
+        let item = barItem.menuItems
+            .matching(NSPredicate(format: "label BEGINSWITH %@", itemLabelPrefix))
+            .firstMatch
+        XCTAssertTrue(item.waitForExistence(timeout: 5),
+                      "The native \(itemLabelPrefix) command must be present")
+        XCTAssertFalse(item.isEnabled,
+                       "\(itemLabelPrefix) must be disabled while the recordings folder is changing")
+        app.typeKey(.escape, modifierFlags: [])
+        let closed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "isHittable == false"), object: item)
+        XCTAssertEqual(XCTWaiter.wait(for: [closed], timeout: 5), .completed,
+                       "The \(menuTitle) menu must close after reading the command state")
     }
 
     private func boundedDiagnostic(_ text: String, limit: Int = 200) -> String {
@@ -977,6 +1060,160 @@ final class RecordingLocationChangeUITests: XCTestCase {
                        "A canceled folder check must not touch the original index")
     }
 
+    // MARK: - Unreadable destination and narrow/large-type BiDi evidence
+
+    /// A destination that becomes unreadable AFTER the real panel choice must
+    /// render the failure and its Choose another folder retry must work. The
+    /// DEBUG inspection gate holds the detached check until this test has
+    /// chmod-denied its own UUID-owned destination, so the failure is a real
+    /// inspection permission error. Nothing outside the test roots is touched.
+    func test_unreadable_destination_fails_then_choose_another_retry_succeeds() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        let retry = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: retry, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        addTeardownBlock { try? FileManager.default.removeItem(at: retry) }
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=permission-denied"])
+        defer { app.terminate() }
+        // Fail-safe: release the bounded gate and restore the test folder even
+        // if an assertion throws.
+        defer { releaseInspectionGate() }
+        defer { restorePosixPermissions(destination) }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalAudio = try Data(contentsOf: sourceAudio)
+        let originalIndex = try Data(contentsOf: sourceIndex)
+
+        chooseDestination(app)
+        XCTAssertTrue(renderedElement(app, labelContains: "Checking folder").waitForExistence(timeout: 8),
+                      "The gated inspection must expose its checking state")
+        XCTAssertTrue(waitForInspectionGateEntered(),
+                      "The inspection gate must be holding before the destination is denied; otherwise the earlier writability probe could win the race")
+        let deniedDestinationPath = destination.path
+        try FileManager.default.setAttributes([.posixPermissions: 0o000],
+                                              ofItemAtPath: deniedDestinationPath)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                                   ofItemAtPath: deniedDestinationPath)
+        }
+        releaseInspectionGate()
+
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 20),
+                      "An unreadable destination must render a failure")
+        let failureText = visibleText(outcome)
+        XCTAssertTrue(failureText.contains("can’t check that folder right now"),
+                      "The failure must name the denied inspection; observed: \(boundedDiagnostic(failureText))")
+        XCTAssertTrue(failureText.contains("Choose another folder"),
+                      "The failure must offer the retry route")
+        XCTAssertTrue(app.buttons["Choose another folder…"].waitForExistence(timeout: 5),
+                      "A denied destination must expose Choose another folder")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+                       "A denied destination must not receive a library")
+        appWindowScreenshot(app, named: "Unreadable destination refused with Choose another")
+
+        restorePosixPermissions(destination)
+        app.buttons["Choose another folder…"].click()
+        completeFolderPanel(app, path: retry)
+        let fresh = app.radioButtons["Start fresh"]
+        XCTAssertTrue(fresh.waitForExistence(timeout: 10),
+                      "The retry destination must be inspected normally")
+        fresh.click()
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(continueButton.isEnabled)
+        continueButton.click()
+
+        let success = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(success.waitForExistence(timeout: 20), "The retry did not settle")
+        XCTAssertTrue(visibleText(success).contains(retry.path))
+        XCTAssertTrue(visibleText(success).contains("empty recordings list"))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: retry.appendingPathComponent("recordings.json").path),
+                      "The retry must publish the chosen folder")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path))
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "The denied attempt and retry must not touch the originals")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "The denied attempt and retry must not touch the original index")
+        appWindowScreenshot(app, named: "Choose another retry after unreadable destination succeeded")
+    }
+
+    /// Narrow sheet at an accessibility text size with a long Hebrew/Arabic
+    /// destination name. The DEBUG scenario only changes this sheet's width and
+    /// text size; the full paths and their labels are asserted explicitly and
+    /// the images are app-window captures only.
+    func test_bidi_long_path_narrow_large_type_shows_full_paths() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let longName = "הקלטות-ומסרים-בערבית-ومحادثات-صوتية-طويلة-للغاية-בדיקה-נוספת-ومزيد-من-الكلمات"
+        let bidiDestination = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            .appendingPathComponent("Mila-UITest-\(UUID().uuidString)-\(longName)", isDirectory: true)
+        try FileManager.default.createDirectory(at: bidiDestination, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        addTeardownBlock { try? FileManager.default.removeItem(at: bidiDestination) }
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=large-type"])
+        defer { app.terminate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalAudio = try Data(contentsOf: sourceAudio)
+
+        chooseDestination(app, path: bidiDestination)
+        let title = app.staticTexts["storage.changeSheet.title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        XCTAssertTrue(visibleText(title).contains("Change recordings folder"))
+        let fresh = app.radioButtons["Start fresh"]
+        XCTAssertTrue(fresh.waitForExistence(timeout: 10),
+                      "The BiDi destination must be inspected and present its choices")
+
+        let expectedCurrent = "Current folder: \(sourceRecordings.path)"
+        let currentPath = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", expectedCurrent)).firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5),
+                      "The full current-folder path must be exposed as one label")
+        let expectedNew = "New folder: \(bidiDestination.path)"
+        let newPath = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@", expectedNew)).firstMatch
+        XCTAssertTrue(newPath.waitForExistence(timeout: 5),
+                      "The full Hebrew/Arabic destination path must be exposed as one label")
+        XCTAssertTrue(newPath.label.contains(longName),
+                      "The destination label must retain the complete mixed-direction name")
+        XCTAssertTrue(visibleText(fresh).contains("Start fresh"),
+                      "The full action label must not be abbreviated")
+        XCTAssertTrue(app.radioButtons["Copy recordings and switch"].exists,
+                      "The full copy action label must remain available in the narrow sheet")
+        changeSheetScreenshot(app, named: "Narrow large-text BiDi full destination paths")
+
+        fresh.click()
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(continueButton.isEnabled)
+        continueButton.click()
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 20), "The BiDi switch did not settle")
+        XCTAssertTrue(visibleText(outcome).contains(bidiDestination.path),
+                      "The outcome must show the full mixed-direction destination path")
+        appWindowScreenshot(app, named: "Narrow large-text BiDi success full path")
+        app.buttons["Close"].click()
+        let activePath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(activePath.waitForExistence(timeout: 5))
+        XCTAssertEqual(activePath.value as? String, bidiDestination.path)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: bidiDestination.appendingPathComponent("recordings.json").path))
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "The switch must not touch the original audio")
+    }
+
     // MARK: - Interrupted copy, Quit default, cold incomplete-copy removal
 
     func test_mid_copy_progress_cancel_retains_incomplete_copy_and_keeps_originals() throws {
@@ -1009,6 +1246,17 @@ final class RecordingLocationChangeUITests: XCTestCase {
         }
         XCTAssertGreaterThan(stagedFileSize(midStage, named: "seed.wav"), 0,
                              "The stage must contain real copied bytes before Cancel")
+
+        // A REAL copy worker is running, so the native Record and Dictation
+        // commands must already be disabled. Only the enabled state is read:
+        // no recording, dictation, hotkey or microphone action is started.
+        assertNativeCommandDisabled(app, menuTitle: "File",
+                                    itemLabelPrefix: "New Voice Memo")
+        assertNativeCommandDisabled(app, menuTitle: "Dictation",
+                                    itemLabelPrefix: "English Dictation (")
+        assertNativeCommandDisabled(app, menuTitle: "Dictation",
+                                    itemLabelPrefix: "Hebrew Dictation (")
+        settingsWindowScreenshot(app, named: "Record and Dictation commands disabled during copy")
 
         let cancel = app.buttons["Cancel"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))

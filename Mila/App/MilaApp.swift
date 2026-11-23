@@ -453,6 +453,8 @@ struct MilaApp: App {
         case busy = "busy"
         case slowCheck = "slow-check"
         case slowCopy = "slow-copy"
+        case permissionDenied = "permission-denied"
+        case largeType = "large-type"
         case mcpPointerFailureEnabled = "mcp-pointer-failure-enabled"
         case mcpPointerFailureDisabled = "mcp-pointer-failure-disabled"
     }
@@ -475,6 +477,8 @@ struct MilaApp: App {
             return nil
         }
         let requiresValidatedRoot: Bool = scenario == .slowCopy
+            || scenario == .permissionDenied
+            || scenario == .largeType
             || scenario == .mcpPointerFailureEnabled
             || scenario == .mcpPointerFailureDisabled
         if requiresValidatedRoot {
@@ -1290,6 +1294,29 @@ struct MilaApp: App {
                                                         storage: storage,
                                                         readiness: readiness)
             }
+        case .some(.permissionDenied):
+            // Holds the detached inspection until the UI test has made its own
+            // UUID-owned destination unreadable, so the failure is a REAL
+            // inspection permission error, not a synthetic verdict. The gate
+            // names its release marker inside the already-validated clean root
+            // and is bounded to 30 s.
+            if let cleanRoot = Self.validatedUITestCleanRoot() {
+                location = RecordingLocationCoordinator(
+                    store: store,
+                    storage: storage,
+                    readiness: readiness,
+                    beforeInspection: {
+                        RecordingLocationInspectionUITestGate.waitForRelease(root: cleanRoot)
+                    })
+            } else {
+                location = RecordingLocationCoordinator(store: store,
+                                                        storage: storage,
+                                                        readiness: readiness)
+            }
+        case .some(.largeType):
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness)
         case .some(.busy):
             location = RecordingLocationCoordinator(store: store,
                                                     storage: storage,

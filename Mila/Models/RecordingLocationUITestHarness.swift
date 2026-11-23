@@ -97,4 +97,45 @@ final class RecordingLocationUITestHarness: @unchecked Sendable {
         }
     }
 }
+
+/// Bounded, deterministic release gate for the DEBUG-only unreadable-
+/// destination native scenario.
+///
+/// `MilaApp` hands `waitForRelease` to the coordinator's existing
+/// `beforeInspection` seam only when `--ui-test-folder-scenario=permission-denied`
+/// is combined with every isolation flag (clean store, UUID-owned storage
+/// suite, seeded recording and a validated `Mila-UITest-<UUID>` 0700 root).
+/// It runs on the detached inspection worker only.
+///
+/// The UI test chooses the destination through the real panel, then makes its
+/// own UUID-owned destination unreadable with `chmod 000` and finally creates
+/// ONE marker file inside the validated root. `waitForRelease` polls for that
+/// marker so the subsequent `RecordingLibraryInspection.inspect` runs against
+/// the denied directory and produces the actual permission failure. It never
+/// waits longer than `timeout` (30 s default), so a missed marker degrades to a
+/// bounded delay instead of a hang. Production and Release never construct this
+/// gate.
+enum RecordingLocationInspectionUITestGate {
+    /// The marker the gate writes once it is actually holding, so the UI test
+    /// can deny its destination only after the earlier writability probe has
+    /// passed. It lives inside the same validated root.
+    static let enteredMarkerName = "Mila-UITest-inspection-gate-entered"
+    /// The single fixed release marker name the UI test creates inside its
+    /// validated clean root. It is never read from or written to any other
+    /// location.
+    static let releaseMarkerName = "Mila-UITest-inspection-gate-release"
+
+    static func waitForRelease(root: URL, timeout: TimeInterval = 30) {
+        let entered = root.appendingPathComponent(enteredMarkerName, isDirectory: false)
+        if !FileManager.default.fileExists(atPath: entered.path) {
+            _ = FileManager.default.createFile(atPath: entered.path, contents: Data())
+        }
+        let marker = root.appendingPathComponent(releaseMarkerName, isDirectory: false)
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while !FileManager.default.fileExists(atPath: marker.path) {
+            if Date() >= deadline { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+}
 #endif
