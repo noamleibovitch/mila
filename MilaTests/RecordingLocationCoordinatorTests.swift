@@ -472,6 +472,22 @@ final class RecordingLocationCoordinatorTests: XCTestCase {
                       "Switching must not mint recovery IDs or enqueue transcription")
     }
 
+    func test_start_fresh_refuses_a_destination_index_created_after_preview() async throws {
+        store.add(row("Original"))
+        let previous = store.recordingsDirectory
+        let destination = try makeCustom("ChangedFreshDestination")
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.startFresh)
+        let external = Data("external index sentinel".utf8)
+        let index = destination.appendingPathComponent("recordings.json")
+        try external.write(to: index)
+        await coordinator.continueSelection()
+        guard case .failure = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertEqual(try Data(contentsOf: index), external)
+        XCTAssertEqual(store.recordingsDirectory, previous)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+    }
+
     func test_start_fresh_does_not_copy_and_source_remains() async throws {
         let sourceRow = row()
         try writeLibrary([sourceRow], at: root.appendingPathComponent("Recordings"), layout: false, files: ["meeting.wav": "audio"])

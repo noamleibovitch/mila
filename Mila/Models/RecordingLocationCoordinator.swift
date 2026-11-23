@@ -541,7 +541,11 @@ final class RecordingLocationCoordinator: ObservableObject {
             }
             let parent = destination.index.deletingLastPathComponent()
             try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-            try empty.write(to: destination.index, options: [.atomic, .withoutOverwriting])
+            // Foundation traps when atomic and withoutOverwriting are combined.
+            // This is a new destination only: exclusive creation preserves a
+            // racing index, and inspection must decode the complete list
+            // before the bookmark or live library can switch.
+            try empty.write(to: destination.index, options: .withoutOverwriting)
             wroteIndex = true
             let final = try await recheckDestination(destination)
             try await activate(snapshot: final, isDefault: destination.isDefault,
