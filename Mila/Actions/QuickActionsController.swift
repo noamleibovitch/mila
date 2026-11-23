@@ -2117,7 +2117,7 @@ final class QuickActionsController: ObservableObject {
         // collide in practice.
         finalizeTasks[id]?.cancel()
         let lifetimeToken = UUID()
-        finalizeLifetimeTokens.insert(lifetimeToken)
+        // adverse control: omit finalization lifetime admission
         noteLibraryWorkAdmission()
         finalizeTasks[id] = Task { @MainActor [weak self] in
             defer {
