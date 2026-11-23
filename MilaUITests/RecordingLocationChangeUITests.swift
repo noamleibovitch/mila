@@ -92,10 +92,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
         storage.click()
         XCTAssertTrue(app.buttons["storage.chooseFolder.button"].waitForExistence(timeout: 10))
         let expected = expectedDirectory ?? root.appendingPathComponent("Recordings")
-        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+        let settingsWindow = app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
+        // Selectable SwiftUI Text is exposed as a text view rather than
+        // StaticText. Keep the exact path assertion, scoped to Settings.
+        XCTAssertTrue(settingsWindow.descendants(matching: .any).matching(NSPredicate(
             format: "label CONTAINS %@ OR value CONTAINS %@", expected.path, expected.path)).firstMatch
             .waitForExistence(timeout: 5), "App must open the exact expected test library")
-        return app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
+        return settingsWindow
     }
 
     private func chooseDestination(_ app: XCUIApplication) {
@@ -104,25 +107,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
         // a sheet attached to Settings. Go to Folder is a sheet of that panel.
         let panel = app.windows["open-panel"]
         XCTAssertTrue(panel.waitForExistence(timeout: 10), "Native folder panel did not appear")
-        let input = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-        var layout = "other"
-        if let raw = TISGetInputSourceProperty(input, kTISPropertyInputSourceID) {
-            let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-            if value == "com.apple.keylayout.ABC" { layout = "ABC" }
-            else if value == "com.apple.keylayout.US" { layout = "US" }
-            else if value == "com.apple.keylayout.Hebrew" { layout = "Hebrew" }
-        }
-        print("Picker diagnostic input:", layout)
-        observePicker(app, panel: panel, phase: "before arrows")
-        panel.typeKey(.downArrow, modifierFlags: [])
-        observePicker(app, panel: panel, phase: "after down")
-        panel.typeKey(.upArrow, modifierFlags: [])
-        observePicker(app, panel: panel, phase: "after up")
         panel.typeKey("g", modifierFlags: [.command, .shift])
-        observePicker(app, panel: panel, phase: "after shortcut")
         let goTo = panel.sheets.firstMatch
         XCTAssertTrue(goTo.waitForExistence(timeout: 5), "Go to Folder did not appear")
-        observePicker(app, panel: panel, phase: "after sheet wait")
         let field = goTo.comboBoxes.firstMatch.exists
             ? goTo.comboBoxes.firstMatch : goTo.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
@@ -133,18 +120,6 @@ final class RecordingLocationChangeUITests: XCTestCase {
         choose.click()
         XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10),
                       "Choice sheet did not appear")
-    }
-
-    private func observePicker(_ app: XCUIApplication, panel: XCUIElement, phase: String) {
-        let list = panel.descendants(matching: .any).matching(identifier: "ListView").firstMatch
-        let selected = list.descendants(matching: .outlineRow).allElementsBoundByIndex
-            .enumerated().filter { $0.element.isSelected }.map { $0.offset }
-        let focused = panel.descendants(matching: .any)
-            .matching(NSPredicate(format: "hasKeyboardFocus == true")).count
-        print("Picker diagnostic", phase, "windows", app.windows.count,
-              "appSheets", app.sheets.count, "panelSheets", panel.sheets.count,
-              "combos", panel.comboBoxes.count, "focusCount", focused,
-              "listExists", list.exists, "selectedRowIndices", selected)
     }
 
     func test_radio_selection_continue_copy_reopen() throws {
@@ -179,7 +154,8 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.terminate()
         let reopened = launch()
         _ = openStorage(reopened, expectedDirectory: destination)
-        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", destination.path, destination.path)).firstMatch
+        let settingsWindow = reopened.windows.containing(.any, identifier: "settings.section.storage").firstMatch
+        XCTAssertTrue(settingsWindow.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", destination.path, destination.path)).firstMatch
             .waitForExistence(timeout: 10), "The committed custom folder must persist across reopen")
     }
 
