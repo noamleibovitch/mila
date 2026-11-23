@@ -54,7 +54,6 @@ final class RecordingLibraryActivity {
     func beginWork() -> Ticket? {
         guard !committing, advanceGeneration() else { return nil }
         let ticket = Ticket(context: context, id: UUID())
-        outstanding.insert(ticket)
         return ticket
     }
 
