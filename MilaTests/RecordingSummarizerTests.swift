@@ -2224,6 +2224,13 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         let gateA = TestGate(), gateB = TestGate(), gateC = TestGate()
         var started: [String] = []
+        // The first two admitted jobs run concurrently and can reach the
+        // runner in either order. Only subsequent slot handoffs are ordered.
+        // Sorting that pair retains its exact membership and total count;
+        // c and d must still appear in their original sequence.
+        func observedSlotOrder() -> [String] {
+            Array(started.prefix(2)).sorted() + Array(started.dropFirst(2))
+        }
         useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
             started.append(transcript)
             switch transcript {
@@ -2247,23 +2254,23 @@ final class RecordingSummarizerTests: XCTestCase {
         }
         summarizer.backfillIfNeeded()
         await waitUntil { started.count == 2 }
-        XCTAssertEqual(started, ["a", "b"])
+        XCTAssertEqual(observedSlotOrder(), ["a", "b"])
 
         store.permanentlyDelete(try XCTUnwrap(rows["a"]))
         gateB.open()
         await waitUntil { started.count == 3 }
-        XCTAssertEqual(started, ["a", "b", "c"],
+        XCTAssertEqual(observedSlotOrder(), ["a", "b", "c"],
                        "b's slot goes to c")
         // b has finished and c is running; a is still unwinding, so it
         // still counts and d must wait. b's `defer` ran the pump in the job
         // that started c, so a wrongly started d would already be in flight.
         XCTAssertFalse(summarizer.isSummarizing(try XCTUnwrap(rows["d"]).id),
                        "a cancelled run that has not unwound must still hold its slot")
-        XCTAssertEqual(started, ["a", "b", "c"])
+        XCTAssertEqual(observedSlotOrder(), ["a", "b", "c"])
 
         gateA.open()
         await waitUntil { started.count == 4 }
-        XCTAssertEqual(started, ["a", "b", "c", "d"],
+        XCTAssertEqual(observedSlotOrder(), ["a", "b", "c", "d"],
                        "the slot is handed on once the cancelled run unwinds")
         gateC.open()
         await summarizer.awaitInFlight(try XCTUnwrap(rows["c"]).id)
