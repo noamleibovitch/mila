@@ -2,6 +2,7 @@ import XCTest
 import Darwin
 @testable import Mila
 
+@MainActor
 final class RecordingLibraryMigrationTests: XCTestCase {
     private func fixture(_ body: (URL) throws -> Void) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
