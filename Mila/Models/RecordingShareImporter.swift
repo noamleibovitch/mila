@@ -171,7 +171,7 @@ final class RecordingShareImporter: ObservableObject {
     }
 
     var libraryWorkState: RecordingLibraryWorkState {
-        if !queue.isEmpty || isStaging || isImporting || pending != nil || stageTicket != nil || !libraryLedger.outstanding.isEmpty {
+        if !queue.isEmpty || isStaging || isImporting || pending != nil || stageTicket != nil {
             return .busy("Shared recording import", "Finish the shared recording import before changing folders.",
                          generation: libraryLedger.generation)
         }
