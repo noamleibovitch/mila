@@ -618,11 +618,6 @@ final class RecordingShareImporter: ObservableObject {
             log.log("import of \(manifest.recording.id, privacy: .public) cancelled during the audio copy")
             return
         }
-        guard store.admitLibraryInput(pending.libraryContext) else {
-            try? fileManager.removeItem(at: partial)
-            finish(pending, error: ImportError.libraryChanged)
-            return
-        }
         // The copy took as long as the audio is big, and the store can move
         // under it: the local copy deleted, trashed — or handed to the
         // transcriber, which is the case the busy check exists for. Resolve
