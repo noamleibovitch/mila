@@ -93,11 +93,12 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(app.buttons["storage.chooseFolder.button"].waitForExistence(timeout: 10))
         let expected = expectedDirectory ?? root.appendingPathComponent("Recordings")
         let settingsWindow = app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
-        // Selectable SwiftUI Text is exposed as a text view rather than
-        // StaticText. Keep the exact path assertion, scoped to Settings.
-        XCTAssertTrue(settingsWindow.descendants(matching: .any).matching(NSPredicate(
-            format: "label CONTAINS %@ OR value CONTAINS %@", expected.path, expected.path)).firstMatch
-            .waitForExistence(timeout: 5), "App must open the exact expected test library")
+        // The visible path abbreviates the home directory to ~. Its stable
+        // accessibility value carries the full selected directory instead.
+        let path = app.descendants(matching: .any).matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(path.waitForExistence(timeout: 5), "Current folder path missing")
+        XCTAssertEqual(path.value as? String, expected.path,
+                       "App must open the exact expected test library")
         return settingsWindow
     }
 
@@ -154,9 +155,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.terminate()
         let reopened = launch()
         _ = openStorage(reopened, expectedDirectory: destination)
-        let settingsWindow = reopened.windows.containing(.any, identifier: "settings.section.storage").firstMatch
-        XCTAssertTrue(settingsWindow.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", destination.path, destination.path)).firstMatch
-            .waitForExistence(timeout: 10), "The committed custom folder must persist across reopen")
+        let persistedPath = reopened.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertEqual(persistedPath.value as? String, destination.path,
+                       "The committed custom folder must persist across reopen")
     }
 
     func test_start_fresh_and_escape_before_commit() throws {

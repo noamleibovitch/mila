@@ -106,6 +106,8 @@ struct StorageSettingsTab: View {
                     Text(verbatim: displayPath(store.recordingsDirectory))
                         .font(.callout.monospaced())
                         .textSelection(.enabled)
+                        .accessibilityIdentifier("storage.currentFolder.path")
+                        .accessibilityValue(store.recordingsDirectory.path)
                         .lineLimit(nil)
                         .fixedSize(horizontal: false, vertical: true)
                         .multilineTextAlignment(.leading)
