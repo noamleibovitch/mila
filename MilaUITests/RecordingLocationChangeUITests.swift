@@ -102,8 +102,14 @@ final class RecordingLocationChangeUITests: XCTestCase {
         return settingsWindow
     }
 
-    private func chooseDestination(_ app: XCUIApplication) {
+    private func chooseDestination(_ app: XCUIApplication, path: URL? = nil) {
         app.buttons["storage.chooseFolder.button"].click()
+        completeFolderPanel(app, path: path)
+    }
+
+    /// Drive the already-presented native panel. `Choose another folder…`
+    /// opens it itself, so retries must not click Settings' Choose again.
+    private func completeFolderPanel(_ app: XCUIApplication, path: URL? = nil) {
         // NSOpenPanel.begin presents a standalone open-panel window, not
         // a sheet attached to Settings. Go to Folder is a sheet of that panel.
         let panel = app.windows["open-panel"]
@@ -114,13 +120,67 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let field = goTo.comboBoxes.firstMatch.exists
             ? goTo.comboBoxes.firstMatch : goTo.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
-        field.typeText(destination.path)
+        field.typeText((path ?? destination).path)
         panel.typeKey(.return, modifierFlags: [])
         let choose = panel.buttons["OKButton"]
         XCTAssertTrue(choose.waitForExistence(timeout: 5))
         choose.click()
         XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10),
                       "Choice sheet did not appear")
+    }
+
+    /// The app seeds its synthetic library from production Codable types, so
+    /// the UI runner writes a populated destination by hand from the same
+    /// on-disk schema: a UUID row, ISO-8601 date, completed status, and an
+    /// audio file the row names. No Mila model is linked into this target.
+    private func seedPopulatedDestination(recordingID: UUID,
+                                          audioName: String,
+                                          title: String) throws -> (index: Data, audio: Data) {
+        let row: [String: Any] = [
+            "id": recordingID.uuidString,
+            "title": title,
+            "createdAt": ISO8601DateFormatter().string(from: Date()),
+            "duration": 2.0,
+            "source": "microphone",
+            "audioFileName": audioName,
+            "status": "completed",
+            "language": "en",
+            "segments": []
+        ]
+        let index = try JSONSerialization.data(withJSONObject: [row],
+                                               options: [.prettyPrinted, .sortedKeys])
+        try index.write(to: destination.appendingPathComponent("recordings.json"), options: .atomic)
+        try writeSyntheticWAV(at: destination.appendingPathComponent(audioName),
+                              frequency: 220, frames: 8_000)
+        return (index, try Data(contentsOf: destination.appendingPathComponent(audioName)))
+    }
+
+    private func writeSyntheticWAV(at url: URL, frequency: Double, frames: AVAudioFrameCount) throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        for frame in 0..<Int(frames) {
+            buffer.floatChannelData![0][frame] = Float(sin(Double(frame) * 2 * .pi * frequency / 16_000)) * 0.05
+        }
+        try file.write(from: buffer)
+    }
+
+    private func indexRows(at url: URL) throws -> [[String: Any]] {
+        let data = try Data(contentsOf: url)
+        return (try JSONSerialization.jsonObject(with: data) as? [[String: Any]]) ?? []
+    }
+
+    /// Never capture the desktop: only the app window that currently owns the
+    /// rendered outcome (falling back to another app window).
+    private func appWindowScreenshot(_ app: XCUIApplication, named name: String) {
+        let outcomeWindow = app.windows
+            .containing(.staticText, identifier: "storage.changeSheet.outcome").firstMatch
+        let target = outcomeWindow.exists ? outcomeWindow : app.windows.firstMatch
+        let attachment = XCTAttachment(screenshot: target.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     func test_radio_selection_continue_copy_reopen() throws {
@@ -204,5 +264,205 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let message = app.staticTexts["Mila is already using this folder."]
         XCTAssertTrue(message.waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].exists)
+    }
+
+    func test_populated_destination_adoption_preserves_destination_uuid_index_audio_and_source() throws {
+        let adoptedID = UUID()
+        let adoptedAudioName = "adopted.wav"
+        let seeded = try seedPopulatedDestination(recordingID: adoptedID,
+                                                  audioName: adoptedAudioName,
+                                                  title: "Adopted Recording")
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+
+        let app = launch()
+        _ = openStorage(app)
+        chooseDestination(app)
+
+        let title = app.staticTexts["storage.changeSheet.title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        XCTAssertTrue(visibleText(title).contains("Change recordings folder"),
+                      "A populated non-default destination must render the change-folder title")
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertFalse(continueButton.isEnabled,
+                       "Continue must stay disabled until the user deliberately chooses")
+        let use = app.radioButtons["Use this folder"]
+        XCTAssertTrue(use.waitForExistence(timeout: 5))
+        use.click()
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(continueButton.isEnabled)
+        let combine = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
+        XCTAssertTrue(combine.waitForExistence(timeout: 5),
+                      "Adoption warning must state the folders are not merged")
+
+        continueButton.click()
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Adoption did not settle")
+        let outcomeText = visibleText(outcome)
+        XCTAssertTrue(outcomeText.contains(destination.path))
+        XCTAssertTrue(outcomeText.contains("with 1 recording"))
+        XCTAssertTrue(outcomeText.contains("combine the two folders"))
+        XCTAssertTrue(outcomeText.contains(sourceRecordings.path),
+                      "Outcome must point back at the preserved original source")
+
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("recordings.json")),
+                       seeded.index, "Adopted index bytes must be preserved exactly")
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent(adoptedAudioName)),
+                       seeded.audio, "Adopted audio bytes must be preserved exactly")
+        let adoptedRows = try indexRows(at: destination.appendingPathComponent("recordings.json"))
+        XCTAssertEqual(adoptedRows.count, 1)
+        XCTAssertEqual(adoptedRows.first?["id"] as? String, adoptedID.uuidString,
+                       "Adopted destination UUID must survive the switch")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceAudio.path),
+                      "Originals must remain")
+        XCTAssertEqual(try indexRows(at: root.appendingPathComponent("recordings.json")).count, 1,
+                       "The original source library must be untouched")
+        appWindowScreenshot(app, named: "Populated destination adopted without merge")
+        app.buttons["Close"].click()
+        app.terminate()
+
+        let reopened = launch()
+        _ = openStorage(reopened, expectedDirectory: destination)
+        XCTAssertEqual(try indexRows(at: destination.appendingPathComponent("recordings.json"))
+                        .first?["id"] as? String, adoptedID.uuidString,
+                       "The adopted UUID must persist across reopen")
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent(adoptedAudioName)),
+                       seeded.audio, "Adopted audio bytes must survive reopen")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceAudio.path),
+                      "Originals must survive reopen")
+    }
+
+    func test_unsafe_nested_and_unrelated_destinations_fail_then_safe_retry_succeeds() throws {
+        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let nested = root.appendingPathComponent("NestedUnsafe", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        let unrelated = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
+        let retry = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: retry, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: unrelated)
+            try? FileManager.default.removeItem(at: retry)
+        }
+        try Data("[]".utf8).write(to: unrelated.appendingPathComponent("recordings.json"))
+        try Data("not a Mila library".utf8).write(to: unrelated.appendingPathComponent("notes.txt"))
+
+        let app = launch()
+        _ = openStorage(app)
+
+        chooseDestination(app, path: nested)
+        let nestedOutcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(nestedOutcome.waitForExistence(timeout: 20),
+                      "An unsafe nested folder must render a failure")
+        XCTAssertTrue(visibleText(nestedOutcome).contains("outside your current recordings folder"))
+        appWindowScreenshot(app, named: "Unsafe nested destination refused")
+        let chooseAnotherAfterNested = app.buttons["Choose another folder…"]
+        XCTAssertTrue(chooseAnotherAfterNested.waitForExistence(timeout: 5),
+                      "A refused folder must offer Choose another folder")
+        chooseAnotherAfterNested.click()
+        completeFolderPanel(app, path: unrelated)
+        let unrelatedOutcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(unrelatedOutcome.waitForExistence(timeout: 20),
+                      "A folder with unrelated files must render a failure")
+        XCTAssertTrue(visibleText(unrelatedOutcome).contains("already contains other files"))
+        appWindowScreenshot(app, named: "Unrelated destination refused")
+        let chooseAnotherAfterUnrelated = app.buttons["Choose another folder…"]
+        XCTAssertTrue(chooseAnotherAfterUnrelated.waitForExistence(timeout: 5))
+        chooseAnotherAfterUnrelated.click()
+        completeFolderPanel(app, path: retry)
+        let fresh = app.radioButtons["Start fresh"]
+        XCTAssertTrue(fresh.waitForExistence(timeout: 5))
+        fresh.click()
+        app.buttons["storage.changeSheet.continue"].click()
+        let success = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(success.waitForExistence(timeout: 20), "Safe retry did not settle")
+        XCTAssertTrue(visibleText(success).contains(retry.path))
+        XCTAssertTrue(visibleText(success).contains("empty recordings list"))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: retry.appendingPathComponent("recordings.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Recordings/seed.wav").path),
+                      "Originals must remain after the refused attempts and the safe retry")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: unrelated.appendingPathComponent("notes.txt").path),
+                      "A refused destination's files must not be touched")
+        appWindowScreenshot(app, named: "Safe retry after refused destinations succeeded")
+    }
+
+    func test_return_to_populated_default_from_custom_reports_count_and_repeated_reset_is_no_op() throws {
+        let defaultRecordings = root.appendingPathComponent("Recordings")
+        let app = launch()
+        _ = openStorage(app)
+
+        chooseDestination(app)
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.click()
+        app.buttons["storage.changeSheet.continue"].click()
+        let copyOutcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(copyOutcome.waitForExistence(timeout: 30), "Copy to the custom folder did not settle")
+        XCTAssertTrue(visibleText(copyOutcome).contains(destination.path))
+        app.buttons["Close"].click()
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path))
+
+        app.buttons["storage.resetDefault.button"].click()
+        let title = app.staticTexts["storage.changeSheet.title"]
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
+        XCTAssertTrue(visibleText(title).contains("Use the default recordings folder"),
+                      "A populated default must render the default-folder title")
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertFalse(continueButton.isEnabled,
+                       "Adopting the populated default must require a deliberate choice")
+        let use = app.radioButtons["Use this folder"]
+        XCTAssertTrue(use.waitForExistence(timeout: 5))
+        use.click()
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(continueButton.isEnabled)
+        let count = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "already has 1 recordings")).firstMatch
+        XCTAssertTrue(count.waitForExistence(timeout: 5),
+                      "Warning must report the populated default count")
+        let combine = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", "combine the two folders")).firstMatch
+        XCTAssertTrue(combine.waitForExistence(timeout: 5),
+                      "Warning must state the folders are not merged")
+        appWindowScreenshot(app, named: "Return to populated default warns count and no merge")
+
+        continueButton.click()
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Return to the default did not settle")
+        let outcomeText = visibleText(outcome)
+        XCTAssertTrue(outcomeText.contains(defaultRecordings.path))
+        XCTAssertTrue(outcomeText.contains("with 1 recording"))
+        XCTAssertTrue(outcomeText.contains("combine the two folders"))
+        XCTAssertEqual(try indexRows(at: root.appendingPathComponent("recordings.json")).count, 1,
+                       "Returning to the default must not merge the custom library into it")
+        XCTAssertEqual(try indexRows(at: destination.appendingPathComponent("recordings.json")).count, 1,
+                       "The custom library must remain intact after returning to the default")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("seed.wav").path),
+                      "The custom copy must not be deleted on return")
+        appWindowScreenshot(app, named: "Returned to populated default without merge")
+        app.buttons["Close"].click()
+
+        let currentPath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, defaultRecordings.path)
+
+        app.buttons["storage.resetDefault.button"].click()
+        let noOp = app.staticTexts["Mila is already using this folder."]
+        XCTAssertTrue(noOp.waitForExistence(timeout: 10),
+                      "Reset while already on the default must report a no-op")
+        XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].exists)
+        app.buttons["storage.resetDefault.button"].click()
+        XCTAssertTrue(noOp.waitForExistence(timeout: 10),
+                      "A repeated reset must stay a no-op")
+        XCTAssertFalse(app.staticTexts["storage.changeSheet.title"].exists)
+        XCTAssertEqual(try indexRows(at: root.appendingPathComponent("recordings.json")).count, 1)
     }
 }
