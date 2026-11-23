@@ -136,7 +136,10 @@ enum RecordingLibraryInspection {
                                                                          locale: Locale(identifier: "en_US_POSIX"))
                 guard canonicalNames.insert(key).inserted else { throw Problem.sharedFiles }
                 let url = layout.directory.appendingPathComponent(name)
-                if names.contains(name) { sources.append(url); ownedNames.insert(name) }
+                if names.contains(name) {
+                    ownedNames.insert(name)
+                    if name == record.audioFileName { sources.append(url) }
+                }
             }
             // A recorded row keeps its raw metadata even when its audio was
             // already lost (an older Mila, a manual Finder delete). The copy
