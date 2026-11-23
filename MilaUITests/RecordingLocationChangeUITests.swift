@@ -225,7 +225,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         try writeSyntheticWAV(at: audio, frequency: 440, frames: frames)
     }
 
-    private enum InterruptedCopyFixtureError: Error, CustomStringConvertible {
+    private struct InterruptedCopyFixtureError: Error, CustomStringConvertible {
         let description: String
         init(_ description: String) { self.description = description }
     }
