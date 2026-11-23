@@ -199,7 +199,8 @@ final class RecordingLocationChangeUITests: XCTestCase {
     /// accessibility groups surface their text as a label, not a static text.
     private func renderedElement(_ app: XCUIApplication, labelContains fragment: String) -> XCUIElement {
         app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS[c] %@", fragment))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                  fragment, fragment))
             .firstMatch
     }
 
@@ -394,9 +395,11 @@ final class RecordingLocationChangeUITests: XCTestCase {
         repeat {
             var candidates: [XCUIElement] = [app.dialogs.firstMatch]
             candidates.append(contentsOf: app.sheets.allElementsBoundByIndex)
-            for candidate in candidates where candidate.exists {
+            // Select the inner native alert, not the enclosing folder sheet
+            // whose own Remove button has the same title.
+            for candidate in candidates where candidate.exists && candidate.label == "alert" {
                 if candidate.buttons["Cancel"].exists,
-                   candidate.buttons["Remove incomplete copy"].exists {
+                   candidate.buttons["action-button-1"].exists {
                     return candidate
                 }
             }
@@ -1064,15 +1067,17 @@ final class RecordingLocationChangeUITests: XCTestCase {
         remove.click()
 
         let confirmation = waitForRemovalConfirmation(reopened)
-        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(
-            format: "label CONTAINS[c] %@", "Remove the incomplete copy?"))
+        XCTAssertTrue(confirmation.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+            "Remove the incomplete copy?", "Remove the incomplete copy?"))
             .firstMatch.exists,
                       "Removal must be confirmed explicitly")
-        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(
-            format: "label CONTAINS[c] %@", "original recordings are not removed"))
+        XCTAssertTrue(confirmation.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+            "original recordings are not removed", "original recordings are not removed"))
             .firstMatch.exists,
                       "The confirmation must state that originals are not removed")
-        let attachment = XCTAttachment(screenshot: confirmation.screenshot())
+        let attachment = XCTAttachment(screenshot: reopened.windows.firstMatch.screenshot())
         attachment.name = "Incomplete copy removal confirmation"
         attachment.lifetime = .keepAlways
         add(attachment)
@@ -1084,8 +1089,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
         remove.click()
         let confirmed = waitForRemovalConfirmation(reopened)
-        let destructive = confirmed.buttons["Remove incomplete copy"]
+        let destructive = confirmed.buttons["action-button-1"]
         XCTAssertTrue(destructive.waitForExistence(timeout: 5))
+        XCTAssertEqual(destructive.title, "Remove incomplete copy")
         destructive.click()
 
         let outcome = reopened.staticTexts["storage.changeSheet.outcome"]
