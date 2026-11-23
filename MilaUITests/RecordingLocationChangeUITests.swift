@@ -497,8 +497,14 @@ final class RecordingLocationChangeUITests: XCTestCase {
         // refocusing it. The real panel proves focus returned to Choose.
         app.typeKey(" ", modifierFlags: [])
         let panel = app.windows["open-panel"]
-        XCTAssertTrue(panel.waitForExistence(timeout: 10),
-                      "Dismissal must return keyboard focus to the invoking Choose button")
+        guard panel.waitForExistence(timeout: 10) else {
+            appWindowScreenshot(app, named: "Choose focus after sheet dismissal")
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "Choose focus after sheet dismissal hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            return XCTFail("Dismissal must return keyboard focus to the invoking Choose button")
+        }
         panel.typeKey(.escape, modifierFlags: [])
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: root.appendingPathComponent("Recordings/seed.wav").path))

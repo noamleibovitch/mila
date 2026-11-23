@@ -150,6 +150,7 @@ struct StorageSettingsTab: View {
                     prepareLocationFocus(.choose)
                     coordinator.chooseFolder()
                 }
+                .focusable()
                 .focused($locationFocus, equals: .choose)
                 .accessibilityFocused($accessibleLocationFocus, equals: .choose)
                 .disabled(isLocationBusy)
@@ -162,6 +163,7 @@ struct StorageSettingsTab: View {
                     prepareLocationFocus(.useDefault)
                     coordinator.useDefaultLocation()
                 }
+                .focusable()
                 .focused($locationFocus, equals: .useDefault)
                 .accessibilityFocused($accessibleLocationFocus, equals: .useDefault)
                 .disabled(isLocationBusy)
