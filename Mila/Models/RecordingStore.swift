@@ -403,7 +403,7 @@ final class RecordingStore: ObservableObject {
         if activity.outstandingCount != 0 || libraryActivity.isCommitting {
             return .busy("Recording library", "Library work is still running.", generation: activity.generation)
         }
-        if hasUnsavedLibraryState || !transcriptRewritesPending.isEmpty {
+        if hasUnsavedLibraryState {
             return .busy("Recording library", "Library changes are not saved yet.", generation: activity.generation)
         }
         return .idle("Recording library", generation: activity.generation)
