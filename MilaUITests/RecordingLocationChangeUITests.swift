@@ -14,12 +14,14 @@ final class RecordingLocationChangeUITests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         try selectLiteralKeyboardLayout()
-        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let base = URL(fileURLWithPath: "/tmp", isDirectory: true).resolvingSymlinksInPath()
         root = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         destination = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         suiteID = UUID()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
         try FileManager.default.createDirectory(at: root.appendingPathComponent("Recordings"),
-                                                withIntermediateDirectories: true)
+                                                withIntermediateDirectories: false)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         // Synthetic bytes only: never the user's recordings, never a real
         // audio capture. The row is seeded by the app's clean-store fixture.
@@ -77,6 +79,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         return app
     }
 
+    private func visibleText(_ element: XCUIElement) -> String {
+        [element.label, element.value as? String ?? ""].joined(separator: "\n")
+    }
+
     private func openStorage(_ app: XCUIApplication) -> XCUIElement {
         let settingsLink = app.buttons["sidebar.settings.link"]
         XCTAssertTrue(settingsLink.waitForExistence(timeout: 15), "Settings link missing")
@@ -85,6 +91,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(storage.waitForExistence(timeout: 10), "Storage section missing")
         storage.click()
         XCTAssertTrue(app.buttons["storage.chooseFolder.button"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@ OR value CONTAINS %@", root.path, root.path)).firstMatch
+            .waitForExistence(timeout: 5), "App must open the exact seeded test root")
         return app.windows.containing(.any, identifier: "settings.section.storage").firstMatch
     }
 
@@ -152,7 +161,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         continueButton.click()
         let outcome = app.staticTexts["storage.changeSheet.outcome"]
         XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Copy did not settle")
-        XCTAssertTrue(outcome.label.contains(destination.path))
+        XCTAssertTrue(visibleText(outcome).contains(destination.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("recordings.json").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Recordings/seed.wav").path),
                       "Originals must remain")
@@ -169,7 +178,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.terminate()
         let reopened = launch()
         _ = openStorage(reopened)
-        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", destination.path)).firstMatch
+        XCTAssertTrue(reopened.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", destination.path, destination.path)).firstMatch
             .waitForExistence(timeout: 10), "The committed custom folder must persist across reopen")
     }
 
@@ -188,7 +197,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["storage.changeSheet.continue"].click()
         let outcome = app.staticTexts["storage.changeSheet.outcome"]
         XCTAssertTrue(outcome.waitForExistence(timeout: 20))
-        XCTAssertTrue(outcome.label.contains("empty recordings list"))
+        XCTAssertTrue(visibleText(outcome).contains("empty recordings list"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("recordings.json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("seed.wav").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Recordings/seed.wav").path))
@@ -205,7 +214,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["storage.changeSheet.continue"].click()
         let outcome = app.staticTexts["storage.changeSheet.outcome"]
         XCTAssertTrue(outcome.waitForExistence(timeout: 20))
-        XCTAssertTrue(outcome.label.contains("empty recordings list"))
+        XCTAssertTrue(visibleText(outcome).contains("empty recordings list"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Recordings/seed.wav").path))
     }
 

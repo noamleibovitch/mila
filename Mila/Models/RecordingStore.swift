@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Combine
 import OSLog
 import MilaKit
@@ -113,6 +114,25 @@ final class RecordingStore: ObservableObject {
     /// effect.
     let defaultRecordingsDirectory: URL
 
+    /// Shared fixtures may live outside XCTest's sandbox-specific tmpdir.
+    /// Accept only a canonical UUID direct child of a known temporary root,
+    /// owned by this user and inaccessible to other users. Never a user library.
+    static func isValidUITestRoot(_ candidate: URL) -> Bool {
+        let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let shared = URL(fileURLWithPath: "/tmp", isDirectory: true).resolvingSymlinksInPath()
+        let prefix = "Mila-UITest-"
+        guard candidate.isFileURL, candidate == candidate.standardizedFileURL,
+              candidate == candidate.resolvingSymlinksInPath(),
+              [temporary, shared].contains(candidate.deletingLastPathComponent().standardizedFileURL),
+              candidate.lastPathComponent.hasPrefix(prefix),
+              UUID(uuidString: String(candidate.lastPathComponent.dropFirst(prefix.count))) != nil,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+              attrs[.type] as? FileAttributeType == .typeDirectory,
+              (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              let permissions = attrs[.posixPermissions] as? NSNumber else { return false }
+        return permissions.uint16Value & 0o777 == 0o700
+    }
+
     convenience init() {
         // UI tests pass --ui-test-clean-store to bypass the user's real
         // Application Support directory and start from a fresh, deterministic
@@ -122,12 +142,7 @@ final class RecordingStore: ObservableObject {
             let tmpRoot: URL
             if let raw = ProcessInfo.processInfo.environment["MILA_UI_TEST_CLEAN_ROOT"] {
                 let candidate = URL(fileURLWithPath: raw).standardizedFileURL
-                let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
-                let suffix = String(candidate.lastPathComponent.dropFirst("Mila-UITest-".count))
-                if candidate == candidate.resolvingSymlinksInPath(),
-                   candidate.deletingLastPathComponent().standardizedFileURL == temporary,
-                   candidate.lastPathComponent.hasPrefix("Mila-UITest-"),
-                   UUID(uuidString: suffix) != nil {
+                if Self.isValidUITestRoot(candidate) {
                     tmpRoot = candidate
                     try? FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
                 } else {
