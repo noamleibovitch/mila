@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import Carbon
 
 /// Native copy/start-fresh/adopt flow. Every test launches with a clean
 /// UUID-owned store root and UUID-owned preferences suite, seeds a synthetic
@@ -69,9 +70,25 @@ final class RecordingLocationChangeUITests: XCTestCase {
         // a sheet attached to Settings. Go to Folder is a sheet of that panel.
         let panel = app.windows["open-panel"]
         XCTAssertTrue(panel.waitForExistence(timeout: 10), "Native folder panel did not appear")
+        let input = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        var layout = "other"
+        if let raw = TISGetInputSourceProperty(input, kTISPropertyInputSourceID) {
+            let value = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+            if value == "com.apple.keylayout.ABC" { layout = "ABC" }
+            else if value == "com.apple.keylayout.US" { layout = "US" }
+            else if value == "com.apple.keylayout.Hebrew" { layout = "Hebrew" }
+        }
+        print("Picker diagnostic input:", layout)
+        observePicker(app, panel: panel, phase: "before arrows")
+        panel.typeKey(.downArrow, modifierFlags: [])
+        observePicker(app, panel: panel, phase: "after down")
+        panel.typeKey(.upArrow, modifierFlags: [])
+        observePicker(app, panel: panel, phase: "after up")
         panel.typeKey("g", modifierFlags: [.command, .shift])
+        observePicker(app, panel: panel, phase: "after shortcut")
         let goTo = panel.sheets.firstMatch
         XCTAssertTrue(goTo.waitForExistence(timeout: 5), "Go to Folder did not appear")
+        observePicker(app, panel: panel, phase: "after sheet wait")
         let field = goTo.comboBoxes.firstMatch.exists
             ? goTo.comboBoxes.firstMatch : goTo.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
@@ -82,6 +99,18 @@ final class RecordingLocationChangeUITests: XCTestCase {
         choose.click()
         XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10),
                       "Choice sheet did not appear")
+    }
+
+    private func observePicker(_ app: XCUIApplication, panel: XCUIElement, phase: String) {
+        let list = panel.descendants(matching: .any).matching(identifier: "ListView").firstMatch
+        let selected = list.descendants(matching: .outlineRow).allElementsBoundByIndex
+            .enumerated().filter { $0.element.isSelected }.map { $0.offset }
+        let focused = panel.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasKeyboardFocus == true")).count
+        print("Picker diagnostic", phase, "windows", app.windows.count,
+              "appSheets", app.sheets.count, "panelSheets", panel.sheets.count,
+              "combos", panel.comboBoxes.count, "focusCount", focused,
+              "listExists", list.exists, "selectedRowIndices", selected)
     }
 
     func test_radio_selection_continue_copy_reopen() throws {
