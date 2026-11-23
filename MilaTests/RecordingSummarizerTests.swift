@@ -2356,6 +2356,173 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(callCount, 3)
     }
 
+    // MARK: - Library-work lifetime (queued/cancelled same-UUID)
+
+    /// The backfill queue admits its work synchronously: the full-lifetime
+    /// ledger ticket, the visible in-flight set and the generation step all
+    /// happen in the caller's main-actor turn, before the runner `Task` can
+    /// start. Readiness only goes idle after the real store write lands.
+    func test_backfill_admits_before_the_runner_starts_and_settles_after_the_store_write() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            await gate.wait()
+            return "SUMMARY"
+        }
+        defer { gate.open() }
+        summarizer.maxConcurrent = 1
+
+        var rec = try addRecording(named: "Queued", text: "queued transcript")
+        rec.status = .completed
+        store.update(rec)
+
+        var observedCompletion = false
+        summarizer.onSummaryFinished = { [self] row in
+            guard row.id == rec.id, row.summary == "SUMMARY" else { return }
+            observedCompletion = true
+            XCTAssertFalse(summarizer.libraryWorkState.isIdle,
+                           "Summary completion must still own readiness after its real store write")
+        }
+        defer { summarizer.onSummaryFinished = nil }
+        let before = summarizer.libraryWorkState
+        XCTAssertTrue(before.isIdle)
+        summarizer.backfillIfNeeded()
+
+        // Still in the same turn: admitted, but the runner has not run.
+        XCTAssertEqual(calls, 0)
+        let admitted = summarizer.libraryWorkState
+        XCTAssertFalse(admitted.isIdle)
+        XCTAssertEqual(admitted.owner, "Summary")
+        XCTAssertEqual(admitted.generation, before.generation &+ 1)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+        XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary)
+
+        await waitUntil { calls == 1 }
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(summarizer.libraryWorkState.isIdle)
+        XCTAssertEqual(summarizer.libraryWorkState.generation, admitted.generation)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY",
+                       "readiness must not go idle before the real store write")
+        XCTAssertTrue(observedCompletion, "The real post-write completion callback must fire")
+        let settled = summarizer.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, admitted.generation &+ 1)
+    }
+
+    /// A cancelled run keeps its full-lifetime ticket until it actually
+    /// unwinds, even after a replacement run for the SAME recording id has
+    /// taken the `inFlight` map slot. The replacement's admission must neither
+    /// clear nor be cleared by the cancelled run's ticket.
+    func test_cancelled_run_stays_busy_until_unwind_even_when_a_replacement_takes_the_same_id() async throws {
+        llm.tool = .claude
+        let oldGate = TestGate()
+        let newGate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            let call = calls + 1
+            calls = call
+            if call == 1 { await oldGate.wait() } else { await newGate.wait() }
+            return call == 1 ? "OLD" : "NEW"
+        }
+        defer {
+            oldGate.open()
+            newGate.open()
+        }
+
+        var rec = try addRecording(named: "Same", text: "same transcript")
+        rec.status = .completed
+        store.update(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await waitUntil { calls == 1 }
+        let running = summarizer.libraryWorkState
+        XCTAssertFalse(running.isIdle)
+
+        summarizer.cancel(recordingID: rec.id)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        let cancelled = summarizer.libraryWorkState
+        XCTAssertFalse(cancelled.isIdle,
+                       "a cancelled run still owns readiness until its child unwinds")
+        XCTAssertEqual(cancelled.generation, running.generation)
+
+        // The replacement takes the same id's map slot while the cancelled
+        // run is still parked.
+        summarizer.summarizeIfNeeded(rec)
+        await waitUntil { calls == 2 }
+        let replaced = summarizer.libraryWorkState
+        XCTAssertFalse(replaced.isIdle)
+        XCTAssertGreaterThan(replaced.generation, cancelled.generation)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+
+        // Release only the cancelled run: its own retirement is one step, and
+        // the replacement keeps the owner busy.
+        oldGate.open()
+        await waitUntil { summarizer.libraryWorkState.generation > replaced.generation }
+        XCTAssertFalse(summarizer.libraryWorkState.isIdle,
+                       "the replacement still owns readiness after the cancelled run retires")
+
+        newGate.open()
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "NEW")
+        let settled = summarizer.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, replaced.generation &+ 2)
+    }
+
+    /// A cancelled run's late completion must not touch a same-UUID row that a
+    /// direct library activation has installed. It owns no `inFlight` slot any
+    /// more, so its output is abandoned instead of being stored against the
+    /// destination library's row.
+    func test_cancelled_completion_cannot_alter_a_same_uuid_row_in_a_new_library() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            await gate.wait()
+            return "OLD SUMMARY"
+        }
+        defer { gate.open() }
+
+        var rec = try addRecording(named: "Same UUID", text: "old transcript")
+        rec.status = .completed
+        store.update(rec)
+
+        summarizer.maxConcurrent = 1
+        summarizer.backfillIfNeeded()
+        let admitted = summarizer.libraryWorkState
+        await waitUntil { calls == 1 }
+        summarizer.cancel(recordingID: rec.id)
+        XCTAssertFalse(summarizer.libraryWorkState.isIdle)
+
+        let destination = tempRoot.appendingPathComponent("NewLibrary-\(UUID().uuidString)",
+                                                          isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var newer = rec
+        newer.title = "Destination owns this UUID"
+        let layout = try RecordingLibraryInspection.Layout(directory: destination,
+                                                           defaultRoot: store.originalRootDirectory)
+        try store.activatePrepared(.init(layout: layout, recordings: [newer], folders: []),
+                                   expectedActivity: store.libraryActivity.snapshot,
+                                   commitSelection: {})
+
+        gate.open()
+        await summarizer.awaitInFlight(newer.id)
+
+        XCTAssertEqual(store.recordings.map(\.title), ["Destination owns this UUID"])
+        XCTAssertNil(store.recordings.first?.summary,
+                     "the cancelled run's output must not be stored in the new library")
+        let settled = summarizer.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, admitted.generation &+ 1)
+    }
+
     // MARK: - Helpers
 
     /// Add a completed-looking recording with `text` as its transcript (the

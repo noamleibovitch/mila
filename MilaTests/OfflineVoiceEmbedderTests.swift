@@ -254,6 +254,18 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
         w.store.recordings.first { $0.id == w.recordingID }!
     }
 
+    /// Bounded polling for a held extraction hand-off. Callers assert the
+    /// state they waited for; this is never treated as settlement proof.
+    private func waitUntil(timeout: TimeInterval = 5,
+                           _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+
     // MARK: - On-demand learning
 
     func test_naming_a_speaker_with_no_snapshot_learns_that_speakers_voice() async throws {
@@ -852,5 +864,160 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
         assertCentroid(alice.embedding, beforePass,
                        "…and her centroid returns to where the pass found it, rather than drifting "
                        + "by a vector she never received")
+    }
+
+    // MARK: - Library-work lifetime (pending and old observation)
+
+    /// The embedder reserves its ledger ticket and `pending` entry in the
+    /// caller's turn, before the detached extraction starts, and reports idle
+    /// only after the real snapshot/profile write. The injected embedding is
+    /// held so the assertion is about lifetime, not timing.
+    func test_learning_admits_before_the_detached_extraction_and_settles_after_the_real_write() async throws {
+        let w = try makeWorld(speakerNames: ["SPEAKER_00": "Alice"])
+        let latch = EmbedLatch()
+        defer { latch.release() }
+        let embedder = OfflineVoiceEmbedder(store: w.store,
+                                            snapshots: w.snapshots,
+                                            profiles: w.profiles,
+                                            settings: w.settings,
+                                            matchThreshold: { 0.55 },
+                                            embed: { _, _ in
+                                                latch.enter()
+                                                await latch.wait()
+                                                return ["SPEAKER_00": [1, 0, 0, 0]]
+                                            })
+
+        let before = embedder.libraryWorkState
+        XCTAssertTrue(before.isIdle)
+        embedder.learnNamedSpeaker(recordingID: w.recordingID,
+                                   rawID: "SPEAKER_00",
+                                   name: "Alice")
+
+        // Same turn: the ledger began and the pending entry exists; the
+        // detached extraction has written nothing.
+        let admitted = embedder.libraryWorkState
+        XCTAssertFalse(admitted.isIdle)
+        XCTAssertEqual(admitted.owner, "Voice profiles")
+        XCTAssertEqual(admitted.generation, before.generation &+ 1)
+        XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID))
+        XCTAssertFalse(w.profiles.profileExists(name: "Alice"))
+
+        let entered = await waitUntil { latch.entryCount == 1 }
+        guard entered else {
+            latch.release()
+            return XCTFail("the held extraction never started")
+        }
+        XCTAssertFalse(embedder.libraryWorkState.isIdle)
+        XCTAssertEqual(embedder.libraryWorkState.generation, admitted.generation)
+
+        latch.release()
+        await embedder.awaitPending()
+
+        XCTAssertNotNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID),
+                        "readiness must not go idle before the snapshot write")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 1)
+        let settled = embedder.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, admitted.generation &+ 1)
+    }
+
+    /// An idle reset clears the dormant per-recording snapshots. A same-UUID
+    /// row installed by a direct library activation must not be able to use the
+    /// old library's observation through a later speaker callback.
+    func test_reset_when_idle_clears_dormant_observations_so_a_same_uuid_library_is_not_altered() async throws {
+        let w = try makeWorld(speakerNames: ["SPEAKER_00": "Alice"])
+        w.probe.returns(["SPEAKER_00": [1, 0, 0, 0]])
+
+        w.embedder.learnNamedSpeaker(recordingID: w.recordingID,
+                                     rawID: "SPEAKER_00",
+                                     name: "Alice")
+        await w.embedder.awaitPending()
+
+        XCTAssertNotNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID),
+                        "precondition: the old library's observation is held")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 1)
+        XCTAssertTrue(w.embedder.libraryWorkState.isIdle)
+
+        w.embedder.resetLibraryContext()
+        XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID),
+                     "an idle activation reset must clear the dormant observation")
+        XCTAssertTrue(w.embedder.libraryWorkState.isIdle)
+
+        let destination = tempRoot.appendingPathComponent("NewLibrary-\(UUID().uuidString)",
+                                                          isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var newer = row(w)
+        newer.title = "Destination owns this UUID"
+        newer.speakerNameSuggestions = []
+        let layout = try RecordingLibraryInspection.Layout(directory: destination,
+                                                           defaultRoot: w.store.originalRootDirectory)
+        try w.store.activatePrepared(.init(layout: layout, recordings: [newer], folders: []),
+                                     expectedActivity: w.store.libraryActivity.snapshot,
+                                     commitSelection: {})
+
+        // The store's un-name callback is what reads a held observation. With
+        // the old library's observation cleared, the same-UUID row's name can
+        // still be removed, but the old observation must not subtract from the
+        // profile.
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: newer.id)
+
+        XCTAssertNil(w.store.recordings.first?.speakerNames["SPEAKER_00"],
+                     "the new library's own un-name still works")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 1,
+                       "the old library's observation must not reach the new library's profile")
+        XCTAssertTrue(w.profiles.profileExists(name: "Alice"))
+    }
+}
+
+/// A thread-safe one-shot latch for holding the injected embedding closure.
+/// `release()` is synchronous so a `defer` can always unblock the worker.
+private final class EmbedLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = false
+    private var entries = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var entryCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+    var isOpen: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return open
+    }
+
+    func enter() {
+        lock.lock()
+        entries += 1
+        lock.unlock()
+    }
+
+    func release() {
+        lock.lock()
+        guard !open else {
+            lock.unlock()
+            return
+        }
+        open = true
+        let pending = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for continuation in pending { continuation.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if open {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
     }
 }

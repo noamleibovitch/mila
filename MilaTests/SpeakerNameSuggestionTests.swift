@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import TranscriptionCore
 @testable import Mila
 
@@ -681,6 +682,32 @@ final class SpeakerNameSuggestionTests: XCTestCase {
                              })
     }
 
+    /// Like `makeSuggester`, but the injected runner parks on a gate so a test
+    /// can inspect the owner's admission/retirement lifetime around the real
+    /// store write. `gates` are consumed in call order; the last one is reused.
+    private func makeHeldSuggester(answer: String,
+                                   log: CallLog,
+                                   gates: [SuggestionGate]) -> SpeakerNameSuggester {
+        var next = 0
+        return SpeakerNameSuggester(store: store, llmSettings: llm, liveAISettings: liveAI,
+                                    identity: identity,
+                                    runLLM: { call in
+                                        log.calls.append(call)
+                                        let gate = gates[min(next, gates.count - 1)]
+                                        next += 1
+                                        await gate.wait()
+                                        return answer
+                                    })
+    }
+
+    /// Bounded polling for a held-runner hand-off. Every caller asserts the
+    /// state it waited for; this is never treated as settlement proof.
+    private func waitUntil(_ condition: @MainActor () -> Bool) async {
+        for _ in 0..<500 where !condition() {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
     private let danaAnswer = """
         {"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "my name is Dana"}]}
         """
@@ -866,5 +893,174 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         suggester.suggest(recordingID: rec.id)
         await suggester.awaitIdle()
         XCTAssertNil(store.recordings.first { $0.id == rec.id })
+    }
+
+    // MARK: - Library-work lifetime (queued/cancelled same-UUID)
+
+    /// A queued suggestion is admitted synchronously: the ledger ticket and
+    /// the in-flight slot are taken in the caller's turn, before the runner
+    /// task starts, and readiness goes idle only after the real store write.
+    func test_queued_suggestion_admits_before_the_runner_starts_and_settles_after_the_store_write() async throws {
+        llm.tool = .claude
+        let rec = meeting()
+        store.add(rec)
+        let log = CallLog()
+        let gate = SuggestionGate()
+        let suggester = makeHeldSuggester(answer: danaAnswer, log: log, gates: [gate])
+        defer { gate.open() }
+
+        var observedWrite = false
+        let observation = store.$recordings.dropFirst().sink { rows in
+            guard let row = rows.first(where: { $0.id == rec.id }),
+                  !row.speakerNameSuggestions.isEmpty else { return }
+            observedWrite = true
+            XCTAssertFalse(suggester.libraryWorkState.isIdle,
+                           "Suggestion publication must still own readiness")
+        }
+        defer { observation.cancel() }
+        let before = suggester.libraryWorkState
+        XCTAssertTrue(before.isIdle)
+        suggester.suggest(recordingID: rec.id)
+
+        // Still in the same turn: admitted, but the runner has not run.
+        XCTAssertEqual(log.calls.count, 0)
+        let admitted = suggester.libraryWorkState
+        XCTAssertFalse(admitted.isIdle)
+        XCTAssertEqual(admitted.owner, "Speaker names")
+        XCTAssertEqual(admitted.generation, before.generation &+ 1)
+        XCTAssertTrue(store.recordings.first { $0.id == rec.id }?.speakerNameSuggestions.isEmpty == true)
+
+        await waitUntil { log.calls.count == 1 }
+        XCTAssertEqual(log.calls.count, 1)
+        XCTAssertFalse(suggester.libraryWorkState.isIdle)
+        XCTAssertEqual(suggester.libraryWorkState.generation, admitted.generation)
+
+        gate.open()
+        await suggester.awaitIdle()
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(row.speakerNameSuggestions.map(\.name), ["Dana"],
+                       "readiness must not go idle before the real suggestion write")
+        XCTAssertTrue(observedWrite, "The actual suggestion store publication must be observed")
+        let settled = suggester.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, admitted.generation &+ 1)
+    }
+
+    /// A cancelled suggestion keeps its full-lifetime ticket until it unwinds,
+    /// even after a replacement run for the same UUID takes the `inFlight`
+    /// map slot.
+    func test_cancelled_suggestion_stays_busy_until_unwind_even_when_a_replacement_takes_the_same_id() async throws {
+        llm.tool = .claude
+        let rec = meeting()
+        store.add(rec)
+        let log = CallLog()
+        let oldGate = SuggestionGate()
+        let newGate = SuggestionGate()
+        let suggester = makeHeldSuggester(answer: danaAnswer, log: log, gates: [oldGate, newGate])
+        defer {
+            oldGate.open()
+            newGate.open()
+        }
+        suggester.maxConcurrent = 2
+
+        suggester.suggest(recordingID: rec.id)
+        await waitUntil { log.calls.count == 1 }
+        let running = suggester.libraryWorkState
+        XCTAssertFalse(running.isIdle)
+
+        suggester.cancel(recordingID: rec.id)
+        let cancelled = suggester.libraryWorkState
+        XCTAssertFalse(cancelled.isIdle,
+                       "a cancelled call still owns readiness until it unwinds")
+        XCTAssertEqual(cancelled.generation, running.generation)
+
+        suggester.suggest(recordingID: rec.id)
+        await waitUntil { log.calls.count == 2 }
+        let replaced = suggester.libraryWorkState
+        XCTAssertFalse(replaced.isIdle)
+        XCTAssertGreaterThan(replaced.generation, cancelled.generation)
+
+        oldGate.open()
+        await waitUntil { suggester.libraryWorkState.generation > replaced.generation }
+        XCTAssertFalse(suggester.libraryWorkState.isIdle,
+                       "the replacement still owns readiness after the cancelled call retires")
+
+        XCTAssertTrue(store.recordings.first { $0.id == rec.id }?.speakerNameSuggestions.isEmpty == true,
+                      "The canceled call must not write through the replacement's slot")
+        newGate.open()
+        await suggester.awaitIdle()
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.speakerNameSuggestions.map(\.name),
+                       ["Dana"])
+        let settled = suggester.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, replaced.generation &+ 2)
+    }
+
+    /// A cancelled suggestion's late completion must not touch a same-UUID row
+    /// installed by a direct library activation: its slot is gone from
+    /// `inFlight`, so its answer is dropped rather than written to the
+    /// destination library's row.
+    func test_cancelled_suggestion_cannot_alter_a_same_uuid_row_in_a_new_library() async throws {
+        llm.tool = .claude
+        let rec = meeting()
+        store.add(rec)
+        let log = CallLog()
+        let gate = SuggestionGate()
+        let suggester = makeHeldSuggester(answer: danaAnswer, log: log, gates: [gate])
+        defer { gate.open() }
+
+        // The old library's fresh-completion mark is the queued/pending work
+        // this test starts from; `suggestIfPending` consumes it and queues the
+        // call, which is held before it can write anything.
+        suggester.markPending(rec.id)
+        suggester.suggestIfPending(rec)
+        let admitted = suggester.libraryWorkState
+        await waitUntil { log.calls.count == 1 }
+        suggester.cancel(recordingID: rec.id)
+        XCTAssertFalse(suggester.libraryWorkState.isIdle)
+
+        let destination = tempRoot.appendingPathComponent("NewLibrary-\(UUID().uuidString)",
+                                                          isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var newer = rec
+        newer.title = "Destination owns this UUID"
+        let layout = try RecordingLibraryInspection.Layout(directory: destination,
+                                                           defaultRoot: store.originalRootDirectory)
+        try store.activatePrepared(.init(layout: layout, recordings: [newer], folders: []),
+                                   expectedActivity: store.libraryActivity.snapshot,
+                                   commitSelection: {})
+
+        gate.open()
+        await suggester.awaitIdle()
+
+        XCTAssertEqual(store.recordings.map(\.title), ["Destination owns this UUID"])
+        XCTAssertTrue(store.recordings.first?.speakerNameSuggestions.isEmpty == true,
+                      "the cancelled answer must not be written into the new library")
+        XCTAssertNil(store.recordings.first?.speakerNames["SPEAKER_00"])
+        let settled = suggester.libraryWorkState
+        XCTAssertTrue(settled.isIdle)
+        XCTAssertEqual(settled.generation, admitted.generation &+ 1)
+    }
+}
+
+/// A one-shot main-actor gate for the held suggestion runner. `open()` is
+/// synchronous so a `defer` can always unblock the parked call.
+@MainActor
+private final class SuggestionGate {
+    private var open = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        guard !open else { return }
+        open = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending { continuation.resume() }
+    }
+
+    func wait() async {
+        if open { return }
+        await withCheckedContinuation { waiters.append($0) }
     }
 }
