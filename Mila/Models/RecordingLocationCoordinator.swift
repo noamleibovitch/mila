@@ -632,6 +632,12 @@ final class RecordingLocationCoordinator: ObservableObject {
             }.value
             publishProgress(copied: source.byteCount, total: source.byteCount,
                             done: total.count, files: total.count)
+            guard let prepared = preparedSelection ??
+                    (try? storage.prepareSelection(
+                        for: destination.isDefault ? nil : destination.directory)),
+                  commitFolderSelection(prepared) else {
+                throw Problem.bookmark
+            }
             try Self.checkCancellation(flag)
             phase = .publishing
             try await Task.detached(priority: .userInitiated) {
