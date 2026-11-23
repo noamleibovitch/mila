@@ -323,7 +323,29 @@ final class RecordingLocationChangeUITests: XCTestCase {
     /// (window close does not quit: `applicationShouldTerminateAfterLastWindowClosed`
     /// returns false). This is the app-scoped Cmd-Q key equivalent, not a
     /// global OS key event.
-    private func requestQuit(_ app: XCUIApplication) {
+    @discardableResult
+    private func captureFolderQuitTrace(_ phase: String) -> String {
+        let url = root.appendingPathComponent("Mila-UITest-quit-trace.txt")
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size <= 8_192,
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
+            print("FolderQuitDiagnostic file: \(phase) unavailable")
+            return ""
+        }
+        print("FolderQuitDiagnostic file: \(phase) \(text)")
+        let attachment = XCTAttachment(string: text)
+        attachment.name = "Folder Quit \(phase) app trace"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        return text
+    }
+
+    private func requestQuit(_ app: XCUIApplication) throws {
+        let bootTrace = captureFolderQuitTrace("before Cmd-Q")
+        guard bootTrace.split(separator: "\n").contains("wired") else {
+            XCTFail("The app-side Quit trace must be live before sending Cmd-Q")
+            throw InterruptedCopyFixtureError("app-side Quit trace unavailable")
+        }
         func snapshot(_ phase: String) {
             print("FolderQuitDiagnostic UI: \(phase) state=\(app.state.rawValue)")
             guard app.state != .notRunning, app.state != .unknown else { return }
@@ -341,6 +363,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         snapshot("before Cmd-Q")
         app.typeKey("q", modifierFlags: [.command])
         snapshot("after Cmd-Q")
+        captureFolderQuitTrace("after Cmd-Q")
     }
 
     private func waitForRemovalConfirmation(_ app: XCUIApplication,
@@ -875,9 +898,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["storage.changeSheet.continue"].click()
         try waitForRealCopyProgress(app)
 
-        requestQuit(app)
+        try requestQuit(app)
         XCTAssertTrue(app.buttons["Keep copying"].waitForExistence(timeout: 15),
                       "Quit during copy must ask, with Keep copying as the default button")
+        captureFolderQuitTrace("after Keep choice wait")
         XCTAssertTrue(app.buttons["Stop and quit"].exists)
         let quitDialog = app.dialogs.firstMatch
         if quitDialog.exists, quitDialog.buttons.count >= 2 {
@@ -964,9 +988,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         app.buttons["storage.changeSheet.continue"].click()
         try waitForRealCopyProgress(app)
 
-        requestQuit(app)
+        try requestQuit(app)
         XCTAssertTrue(app.buttons["Stop and quit"].waitForExistence(timeout: 15),
                       "Quit during copy must offer Stop and quit")
+        captureFolderQuitTrace("after Stop choice wait")
         app.buttons["Stop and quit"].click()
         // Stop and quit has registered cancellation; release the held worker
         // so settlement and termination can complete.

@@ -1628,6 +1628,9 @@ struct MilaApp: App {
         appDelegate.configImporter = configImporter
         appDelegate.shareImporter = shareImporter
         appDelegate.recordingLocation = recordingLocation
+        #if DEBUG
+        appDelegate.traceFolderQuit("wired")
+        #endif
         appDelegate.configureMenuBar(actions: actions,
                                      transcription: transcription,
                                      session: session,
@@ -2937,8 +2940,17 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     #if DEBUG
-    private func traceFolderQuit(_ event: String) {
-        guard MilaApp.folderUITestScenario() == .slowCopy else { return }
+    private var folderQuitEvents: [String] = []
+
+    fileprivate func traceFolderQuit(_ event: String) {
+        guard MilaApp.folderUITestScenario() == .slowCopy,
+              let root = MilaApp.validatedUITestCleanRoot(),
+              folderQuitEvents.count < 32 else { return }
+        folderQuitEvents.append(event)
+        // A bounded trace in the synthetic root, outside Recordings. App stdout
+        // is not exported by this native runner, so the UI test attaches it.
+        let data = Data(folderQuitEvents.joined(separator: "\n").utf8)
+        try? data.write(to: root.appendingPathComponent("Mila-UITest-quit-trace.txt"), options: .atomic)
         print("FolderQuitDiagnostic: \(event)")
     }
     #endif
