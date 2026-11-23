@@ -611,6 +611,7 @@ final class RecordingSummarizer: ObservableObject {
         inFlightIDs.insert(id)
         let token = UUID()
         let lifetime = libraryLedger.begin()
+        libraryLedger.finish(lifetime) // adverse control: retire before worker unwind
         // `language` is the resolved keyword ("Hebrew"/"English"), never user
         // text, so it is safe as a `.public` field — and it is what makes a
         // "why is this summary in the wrong language" report diagnosable.
