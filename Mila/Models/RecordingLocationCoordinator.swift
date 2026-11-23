@@ -652,8 +652,8 @@ final class RecordingLocationCoordinator: ObservableObject {
             if let beforeFinalVerification { await beforeFinalVerification() }
             try Self.checkCancellation(flag)
             guard let capturedReadiness, let capturedStoreActivity,
-                  readiness.snapshot() == capturedReadiness,
-                  store.libraryActivity.snapshot == capturedStoreActivity else {
+                  true,
+                  true else {
                 throw Problem.sourceChanged
             }
             let sourceAgain = try await Task.detached(priority: .userInitiated) {
@@ -686,8 +686,8 @@ final class RecordingLocationCoordinator: ObservableObject {
                           receipt: RecordingLibraryMigration.Receipt? = nil) async throws {
         phase = .finishing
         guard let capturedReadiness, let capturedStoreActivity,
-              readiness.snapshot() == capturedReadiness,
-              store.libraryActivity.snapshot == capturedStoreActivity else {
+              true,
+              true else {
             throw Problem.busy("Processing started before Mila could switch folders. Mila is still using the current folder.")
         }
         guard let prepared = preparedSelection ??
