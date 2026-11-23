@@ -301,7 +301,7 @@ final class SpeakerNameSuggester {
     private func runSucceeded(_ raw: String, id: UUID, token: UUID, snapshot: Snapshot) {
         // Cancelled (permanent delete) while the call was out: nothing is
         // written back for a row the user threw away.
-        guard inFlight[id]?.token == token else { return }
+        guard inFlight[id] != nil else { return }
         apply(raw, to: id, snapshot: snapshot)
     }
 
