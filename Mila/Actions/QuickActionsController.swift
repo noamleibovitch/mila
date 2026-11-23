@@ -2082,7 +2082,14 @@ final class QuickActionsController: ObservableObject {
     /// the live-pipeline drain that precedes it in `stopRecording` needs a
     /// real audio session that CI can't spin up, but the tail itself is
     /// pure store + service work and is the part this PR decoupled.
-    func finalizeTail(for recording: Recording, liveTranscriptIsAuthoritative: Bool) {
+    ///
+    /// `holdBeforeTail` is a per-call test seam that parks the already
+    /// scheduled tail at a real async boundary, after its lifetime token is
+    /// admitted and before any of its work runs. Production passes nil; with
+    /// nil there is no await and the body is byte-for-byte the same path.
+    func finalizeTail(for recording: Recording,
+                      liveTranscriptIsAuthoritative: Bool,
+                      holdBeforeTail: (@MainActor () async -> Void)? = nil) {
         let id = recording.id
         // Bound to a local, and captured strongly by the task below (which
         // holds `self` weakly): the `defer` there MUST be able to release the
@@ -2126,6 +2133,7 @@ final class QuickActionsController: ObservableObject {
                 // is idempotent.
                 transcription.endSpeakerFinalization(id)
             }
+            if let holdBeforeTail { await holdBeforeTail() }
             guard let self else { return }
             var updated = recording
             if liveTranscriptIsAuthoritative {

@@ -142,6 +142,21 @@ final class DictationController: ObservableObject {
         finishLibraryOperation()
     }
 
+    // MARK: - Test seam
+
+    /// Test seam: enter the exact state a real dictation press reaches after
+    /// capture comes up — `.recording` with the samples the stop path would
+    /// capture — without a microphone. The real `toggle` → `stopAndTranscribe`
+    /// → transcription → `persistDictation` path runs unchanged, including
+    /// the library ticket `stopAndTranscribe` admits before its first await
+    /// and retires only after persistence has landed.
+    func startFakeDictationForTesting(action: HotkeyAction, samples: [Float]) {
+        guard state == .idle, !isStarting else { return }
+        self.samples = samples
+        lastLanguage = action.languageCode
+        state = .recording(action)
+    }
+
     // MARK: - Recording
 
     private func start(action: HotkeyAction) async {

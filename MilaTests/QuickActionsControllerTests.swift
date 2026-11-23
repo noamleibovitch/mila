@@ -734,6 +734,152 @@ final class QuickActionsControllerTests: XCTestCase {
                        "the heavy finalize tail must run with the record button free")
     }
 
+    // MARK: - Held finalize-tail owner lifetime
+
+    /// The ledger obligation "QuickActions replaced/canceled finalization
+    /// tail", first half: admission happens synchronously, before the
+    /// scheduled Task body can run, and the token is retired only when the
+    /// real body has finished.
+    ///
+    /// The hold is the only inserted boundary. With no hold (production) the
+    /// body is unchanged; with it, the test can observe readiness in the
+    /// window between `finalizeTail` returning and the Task starting, and
+    /// again while the body is parked. The `.srt` written by the released
+    /// body proves the real tail ran rather than a stub.
+    func test_finalize_tail_admits_readiness_before_its_task_runs_and_settles_after_the_real_body() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        // `.m4a` keeps the authoritative body on its real path but makes the
+        // trailing `compressRecordingAudio` a no-op, so the test needs no
+        // AVFoundation encode and no service worker.
+        let recording = Recording(
+            title: "held-finalize",
+            duration: 1,
+            source: .microphone,
+            audioFileName: "held-finalize.m4a",
+            status: .completed,
+            language: languageSettings.current.rawValue,
+            segments: [TranscriptSegment(start: 0, end: 1, text: "held tail body")],
+            fullText: "held tail body")
+        store.add(recording)
+
+        let baseline = controller.libraryWorkState
+        XCTAssertTrue(baseline.isIdle, "sanity: the controller starts idle")
+        let hold = FinalizeTailHold()
+        defer { hold.release() }
+
+        controller.finalizeTail(for: recording,
+                                liveTranscriptIsAuthoritative: true,
+                                holdBeforeTail: { await hold.wait() })
+
+        // Still inside the same main-actor turn: the Task has been created but
+        // cannot have started its body, and readiness is already busy because
+        // the token is inserted synchronously before that creation.
+        let admitted = controller.libraryWorkState
+        XCTAssertFalse(hold.entered, "the scheduled tail body must not have run yet")
+        XCTAssertFalse(admitted.isIdle,
+                       "readiness must be busy before the finalize Task body starts")
+        XCTAssertEqual(admitted.owner, "Recording")
+        XCTAssertEqual(admitted.generation, baseline.generation + 1,
+                       "admission must be the one generation step before the body runs")
+
+        let entered = await waitUntil { hold.entered }
+        XCTAssertTrue(entered, "the tail must reach the held async boundary")
+        XCTAssertFalse(controller.libraryWorkState.isIdle,
+                       "readiness must stay busy while the tail is held")
+        XCTAssertEqual(controller.libraryWorkState.generation, admitted.generation)
+
+        let srt = store.recordingsDirectory
+            .appendingPathComponent("held-finalize.srt")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: srt.path),
+                       "the held tail must not have run its real body yet")
+
+        hold.release()
+        let settled = await waitUntil { controller.libraryWorkState.isIdle }
+        XCTAssertTrue(settled)
+        XCTAssertGreaterThan(controller.libraryWorkState.generation, admitted.generation)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srt.path),
+                      "the released tail must complete the real finalization body")
+        await controller.awaitFinalizeTails()
+    }
+
+    /// The ledger obligation "QuickActions replaced/canceled finalization
+    /// tail", replacement half: a second `finalizeTail` for the same id
+    /// cancels the first, but cancellation only stops the old task at its
+    /// next suspension — it cannot retire the newer owner. The old task's
+    /// token and the new task's token are independent, so readiness must stay
+    /// busy after the canceled old tail unwinds and only settle when the new
+    /// tail finishes.
+    func test_replaced_finalize_tail_cannot_retire_the_newer_owner_while_the_canceled_tail_unwinds() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let recording = Recording(
+            title: "replaced-finalize",
+            duration: 1,
+            source: .microphone,
+            audioFileName: "replaced-finalize.m4a",
+            status: .completed,
+            language: languageSettings.current.rawValue,
+            segments: [TranscriptSegment(start: 0, end: 1, text: "replaced tail body")],
+            fullText: "replaced tail body")
+        store.add(recording)
+
+        let first = FinalizeTailHold()
+        let second = FinalizeTailHold()
+        defer {
+            first.release()
+            second.release()
+        }
+
+        controller.finalizeTail(for: recording,
+                                liveTranscriptIsAuthoritative: true,
+                                holdBeforeTail: { await first.wait() })
+        let firstAdmission = controller.libraryWorkState
+        XCTAssertFalse(firstAdmission.isIdle)
+        let enteredFirst = await waitUntil { first.entered }
+        XCTAssertTrue(enteredFirst)
+
+        // Replace the same-id tail. The old Task is canceled, but it is parked
+        // on a checked continuation, so it stays counted until the test lets
+        // it unwind.
+        controller.finalizeTail(for: recording,
+                                liveTranscriptIsAuthoritative: true,
+                                holdBeforeTail: { await second.wait() })
+        let secondAdmission = controller.libraryWorkState
+        XCTAssertGreaterThan(secondAdmission.generation, firstAdmission.generation)
+        XCTAssertFalse(secondAdmission.isIdle)
+        let enteredSecond = await waitUntil { second.entered }
+        XCTAssertTrue(enteredSecond)
+        XCTAssertFalse(controller.libraryWorkState.isIdle,
+                       "the canceled old tail is still unwinding and the new owner is held")
+
+        let srt = store.recordingsDirectory
+            .appendingPathComponent("replaced-finalize.srt")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: srt.path))
+
+        // Let only the canceled old tail go. It runs its own body and defer;
+        // the generation moves, but the newer token must remain outstanding.
+        first.release()
+        let oldRetired = await waitUntil {
+            controller.libraryWorkState.generation > secondAdmission.generation
+        }
+        XCTAssertTrue(oldRetired, "the canceled old tail must unwind and retire its own token")
+        let afterOld = controller.libraryWorkState
+        XCTAssertFalse(afterOld.isIdle,
+                       "the old same-id tail must not retire the newer owner's ticket")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srt.path),
+                      "the canceled old tail must unwind through its real finalization body")
+
+        // Only the newer owner can settle readiness now.
+        second.release()
+        let settled = await waitUntil { controller.libraryWorkState.isIdle }
+        XCTAssertTrue(settled)
+        XCTAssertGreaterThan(controller.libraryWorkState.generation,
+                             afterOld.generation,
+                             "the newer owner's retirement is the final generation step")
+        await controller.awaitFinalizeTails()
+    }
+
     /// island-io/mila#86: `stopRecording` no longer blocks the Record button
     /// on the final Live-AI summary tick. Instead, for an authoritative
     /// Live-AI recording, `finalizeTail` regenerates the summary from the FULL
@@ -1113,6 +1259,30 @@ final class QuickActionsControllerTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return condition()
+    }
+}
+
+/// Parks a `finalizeTail` at the seam after its lifetime token is admitted
+/// and before its body runs. Main-actor state so the test can read `entered`
+/// from the synchronous polling helper; `release()` is idempotent so a
+/// failing assertion's teardown can always let the tail settle.
+@MainActor
+private final class FinalizeTailHold {
+    private(set) var entered = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
     }
 }
 
