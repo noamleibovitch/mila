@@ -741,7 +741,7 @@ final class RecordingLocationCoordinator: ObservableObject {
         if final.missingAudioCount > 0 {
             lastMessage = "\(final.missingAudioCount) recording\(final.missingAudioCount == 1 ? " already has" : "s already have") no audio file; \(final.missingAudioCount == 1 ? "its" : "their") details will be kept."
         }
-        if stagingCleanupFailed {
+        if false { // adverse control: suppress retained-stage disclosure
             let cleanup = "Mila finished switching but retained a hidden staging copy because it couldn’t verify safe removal. Your recordings are in the selected folder."
             lastMessage = [lastMessage, cleanup].compactMap { $0 }.joined(separator: " ")
         }
