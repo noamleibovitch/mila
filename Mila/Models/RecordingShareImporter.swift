@@ -556,10 +556,6 @@ final class RecordingShareImporter: ObservableObject {
         // A DIFFERENT pending import (the user cancelled, the next bundle
         // staged) may start even if the abandoned copy is still unwinding.
         guard let pending, inFlightTicket != pending.id else { return }
-        guard store.admitLibraryInput(pending.libraryContext) else {
-            finish(pending, error: ImportError.libraryChanged)
-            return
-        }
         let ticket = pending.id
         let lifetime = libraryLedger.begin()
         defer { libraryLedger.finish(lifetime) }
