@@ -408,6 +408,126 @@ final class RecordingLocationChangeUITests: XCTestCase {
         return app.dialogs.firstMatch
     }
 
+    // MARK: - MCP pointer failure (enabled warning vs disabled silence)
+
+    private static let storeLocationPointerName = "store-location.json"
+    private static let pointerRefusalSentinelName = "refuse overwrite"
+
+    /// Replace the app's real `store-location.json` at this test's synthetic
+    /// root with a NONEMPTY DIRECTORY after launch, so the next pointer write
+    /// genuinely fails. Both the obstruction and the sentinel live only inside
+    /// the validated UUID-owned root and are removed with it in teardown.
+    private func obstructStoreLocationPointer() throws -> URL {
+        let pointer = root.appendingPathComponent(Self.storeLocationPointerName)
+        guard pointer.path.hasPrefix(root.path + "/") else {
+            throw InterruptedCopyFixtureError("pointer obstruction must stay inside the test root")
+        }
+        if FileManager.default.fileExists(atPath: pointer.path) {
+            try FileManager.default.removeItem(at: pointer)
+        }
+        try FileManager.default.createDirectory(at: pointer, withIntermediateDirectories: false)
+        try Data([1]).write(to: pointer.appendingPathComponent(Self.pointerRefusalSentinelName))
+        return pointer
+    }
+
+    private func assertPointerObstructionRetained(_ pointer: URL,
+                                                  file: StaticString = #filePath,
+                                                  line: UInt = #line) {
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pointer.path, isDirectory: &isDirectory),
+                      "The synthetic pointer obstruction must remain after the switch",
+                      file: file, line: line)
+        XCTAssertTrue(isDirectory.boolValue,
+                      "The pointer must still be the nonempty directory that refused the write",
+                      file: file, line: line)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: pointer.appendingPathComponent(Self.pointerRefusalSentinelName).path),
+                      "The pointer directory's sentinel must remain", file: file, line: line)
+    }
+
+    /// Both MCP scenarios run the SAME actual adoption into a populated new
+    /// folder while the real pointer write is obstructed. The enabled scenario
+    /// must surface the pause warning; the disabled one must stay silent. The
+    /// switch, retained originals, and retained obstruction are asserted in
+    /// both, so a warning that merely appears without a real flip cannot pass.
+    private func runMCPPointerFailureAdoption(expectPauseWarning: Bool) throws {
+        let adoptedID = UUID()
+        let adoptedAudioName = "adopted.wav"
+        let seeded = try seedPopulatedDestination(recordingID: adoptedID,
+                                                  audioName: adoptedAudioName,
+                                                  title: "Adopted Recording")
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        let scenario = expectPauseWarning
+            ? "mcp-pointer-failure-enabled" : "mcp-pointer-failure-disabled"
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=\(scenario)"])
+        defer { app.terminate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalAudio = try Data(contentsOf: sourceAudio)
+        let originalIndex = try Data(contentsOf: sourceIndex)
+
+        let pointer = try obstructStoreLocationPointer()
+        chooseDestination(app)
+        let use = app.radioButtons["Use this folder"]
+        XCTAssertTrue(use.waitForExistence(timeout: 5))
+        use.click()
+        let continueButton = app.buttons["storage.changeSheet.continue"]
+        XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(continueButton.isEnabled)
+        continueButton.click()
+
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Adoption did not settle")
+        let outcomeText = visibleText(outcome)
+        XCTAssertTrue(outcomeText.contains(destination.path))
+        XCTAssertTrue(outcomeText.contains("with 1 recording"))
+
+        let warning = app.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.mcpPauseWarning").firstMatch
+        if expectPauseWarning {
+            XCTAssertTrue(warning.waitForExistence(timeout: 10),
+                          "MCP-enabled pointer failure must render its pause warning")
+            let warningText = visibleText(warning)
+            XCTAssertTrue(warningText.contains(
+                "MCP access is paused until Mila can verify the new location."),
+                "The warning must state that MCP access is paused")
+            XCTAssertTrue(warningText.contains("Reopening Mila may restore access."),
+                          "The warning must give the recovery path")
+            appWindowScreenshot(app, named: "MCP-enabled pointer failure paused access after switch")
+        } else {
+            XCTAssertFalse(warning.waitForExistence(timeout: 3),
+                           "MCP-disabled pointer failure must stay silent about MCP")
+            appWindowScreenshot(app, named: "MCP-disabled pointer failure stayed silent after switch")
+        }
+
+        // The actual switch (never the warning alone) is the failure proof.
+        let currentPath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, destination.path,
+                       "The folder change must still succeed despite the pointer failure")
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("recordings.json")),
+                       seeded.index,
+                       "Adopted raw index bytes must survive the pointer failure")
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent(adoptedAudioName)),
+                       seeded.audio,
+                       "Adopted audio bytes must survive the pointer failure")
+        XCTAssertEqual(try indexRows(at: destination.appendingPathComponent("recordings.json"))
+                        .first?["id"] as? String, adoptedID.uuidString,
+                       "The adopted destination UUID must survive the pointer failure")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceAudio.path),
+                      "Originals must remain after the pointer failure")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "Original audio bytes must remain after the pointer failure")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "Original index bytes must remain after the pointer failure")
+        assertPointerObstructionRetained(pointer)
+    }
+
     func test_radio_selection_continue_copy_reopen() throws {
         let app = launch()
         _ = openStorage(app)
@@ -1157,5 +1277,15 @@ final class RecordingLocationChangeUITests: XCTestCase {
             atPath: destination.appendingPathComponent("seed.wav").path))
         XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio)
         XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex)
+    }
+
+    // MARK: - MCP pointer pause and no-MCP silence (native)
+
+    func test_mcp_enabled_pointer_failure_warns_and_switches_to_new_folder() throws {
+        try runMCPPointerFailureAdoption(expectPauseWarning: true)
+    }
+
+    func test_mcp_disabled_pointer_failure_switches_without_mcp_warning() throws {
+        try runMCPPointerFailureAdoption(expectPauseWarning: false)
     }
 }

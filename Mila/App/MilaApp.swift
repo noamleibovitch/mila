@@ -453,6 +453,8 @@ struct MilaApp: App {
         case busy = "busy"
         case slowCheck = "slow-check"
         case slowCopy = "slow-copy"
+        case mcpPointerFailureEnabled = "mcp-pointer-failure-enabled"
+        case mcpPointerFailureDisabled = "mcp-pointer-failure-disabled"
     }
 
     /// The one already-validated UUID-owned clean root, or nil. Shared by the
@@ -472,10 +474,12 @@ struct MilaApp: App {
               let scenario = FolderUITestScenario(rawValue: String(arg.dropFirst("--ui-test-folder-scenario=".count))) else {
             return nil
         }
-        if scenario == .slowCopy {
-            // The interrupted-copy fixture writes into a test-owned stage and
-            // gates on a marker inside the validated root; it must never
-            // activate outside a seeded, validated clean root.
+        let requiresValidatedRoot: Bool = scenario == .slowCopy
+            || scenario == .mcpPointerFailureEnabled
+            || scenario == .mcpPointerFailureDisabled
+        if requiresValidatedRoot {
+            // These fixtures write only inside the validated root; they must
+            // never activate outside a seeded, validated clean root.
             guard arguments.contains("--ui-test-seed-recording"),
                   Self.validatedUITestCleanRoot() != nil else {
                 return nil
@@ -715,9 +719,36 @@ struct MilaApp: App {
         // the gate — a fail-open in the one place that must not have one.
         // There is no cycle: the store's callback below holds `mcpAccess`
         // weakly, and both objects are `@StateObject`-lived anyway.
+#if DEBUG
+        let folderScenario = Self.folderUITestScenario()
+        let mcpAccess: MCPAccessSettings
+        if folderScenario == .mcpPointerFailureEnabled || folderScenario == .mcpPointerFailureDisabled {
+            // These two scenarios deliberately make the real pointer write
+            // fail, which flips discoverability and rewrites the MCP gate. Keep
+            // that gate and its defaults inside the validated test root so the
+            // run never touches the user's MCP consent or gate file.
+            if let cleanRoot = Self.validatedUITestCleanRoot(),
+               let fixtureDefaults = Self.storageUITestDefaults() {
+                mcpAccess = MCPAccessSettings(defaults: fixtureDefaults,
+                                              root: cleanRoot,
+                                              storeIsDiscoverable: {
+                    store.storeLocationIsDiscoverable
+                })
+            } else {
+                mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
+                    store.storeLocationIsDiscoverable
+                })
+            }
+        } else {
+            mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
+                store.storeLocationIsDiscoverable
+            })
+        }
+#else
         let mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
             store.storeLocationIsDiscoverable
         })
+#endif
         // A mid-session relocation can flip discoverability either way, and
         // the helper's gate must follow immediately rather than at the next
         // launch. The store only calls this when the verdict actually
@@ -1203,7 +1234,6 @@ struct MilaApp: App {
         _dictation = StateObject(wrappedValue: dictationController)
 
 #if DEBUG
-        let folderScenario = Self.folderUITestScenario()
         let readiness: RecordingLibraryReadiness
         if case .some(.busy) = folderScenario {
             readiness = RecordingLibraryReadiness(providers: [{
@@ -1264,6 +1294,10 @@ struct MilaApp: App {
             location = RecordingLocationCoordinator(store: store,
                                                     storage: storage,
                                                     readiness: readiness)
+        case .some(.mcpPointerFailureEnabled), .some(.mcpPointerFailureDisabled):
+            location = RecordingLocationCoordinator(store: store,
+                                                    storage: storage,
+                                                    readiness: readiness)
         case .none:
             location = RecordingLocationCoordinator(store: store,
                                                     storage: storage,
@@ -1278,6 +1312,19 @@ struct MilaApp: App {
         _recordingLocation = StateObject(wrappedValue: location)
         _startupRecoveryWork = StateObject(wrappedValue: startupWork)
         location.isMCPEnabled = { [weak mcpAccess] in mcpAccess?.enabled == true }
+#if DEBUG
+        switch folderScenario {
+        case .some(.mcpPointerFailureEnabled):
+            // Local coordinator seam only: report MCP as enabled so the real
+            // post-switch pointer-failure warning renders. This never enables
+            // the helper service or changes the user's MCP consent.
+            location.isMCPEnabled = { true }
+        case .some(.mcpPointerFailureDisabled):
+            location.isMCPEnabled = { false }
+        default:
+            break
+        }
+#endif
         store.onLibraryActivated = { [weak coordinator, weak postCommand, weak offlineEmbedder,
                                      weak svc, weak shareImporter, weak actions,
                                      weak summarizer, weak nameSuggester] in

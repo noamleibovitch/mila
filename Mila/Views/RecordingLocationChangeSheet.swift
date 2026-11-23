@@ -62,6 +62,8 @@ struct RecordingLocationChangeSheet: View {
                     }
                     if let warning = coordinator.mcpPauseWarning {
                         notice(warning, systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                            .accessibilityIdentifier("storage.changeSheet.mcpPauseWarning")
+                            .accessibilityLabel(warning)
                     }
                     if let missing = missingAudioNotice {
                         notice(missing, systemImage: "waveform.slash", tint: .orange)
