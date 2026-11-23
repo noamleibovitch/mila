@@ -597,7 +597,7 @@ extension RecordingLibraryMigrationTests {
                                                               ofItemAtPath: files.path)
                     } catch { XCTFail("Could not deny the stage files path: \(error)") }
                 })) {
-                XCTAssertEqual($0 as? RecordingLibraryMigration.Problem, .ioFailure)
+                XCTAssertEqual($0 as? RecordingLibraryFileCopy.Problem, .ioFailure)
             }
             XCTAssertEqual(try Data(contentsOf: source.index), raw)
             XCTAssertEqual(try Data(contentsOf: recordings.appendingPathComponent("meeting.wav")), audio)
