@@ -13,6 +13,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
     override func setUp() async throws {
         try await super.setUp()
+        try selectLiteralKeyboardLayout()
         let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
         root = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         destination = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
@@ -31,6 +32,29 @@ final class RecordingLocationChangeUITests: XCTestCase {
             buffer.floatChannelData![0][frame] = Float(sin(Double(frame) * 2 * .pi * 440 / 16_000)) * 0.05
         }
         try file.write(from: buffer)
+    }
+
+    private func selectLiteralKeyboardLayout() throws {
+        func inputID(_ source: TISInputSource) -> String {
+            guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "unknown" }
+            return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+        }
+        let original = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        let originalID = inputID(original)
+        let enabled = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
+        let literal = try XCTUnwrap(enabled.first {
+            ["com.apple.keylayout.ABC", "com.apple.keylayout.US"].contains(inputID($0))
+        }, "Native literal shortcuts require an already-enabled ABC or US layout")
+        // Register restoration before selection, including assertion failures.
+        // Never enable a layout or write persistent input-source preferences.
+        addTeardownBlock {
+            XCTAssertEqual(TISSelectInputSource(original), noErr, "Restore original input source")
+            XCTAssertEqual(inputID(TISCopyCurrentKeyboardInputSource().takeRetainedValue()), originalID)
+            print("Picker keyboard restoration verified")
+        }
+        XCTAssertEqual(TISSelectInputSource(literal), noErr)
+        XCTAssertEqual(inputID(TISCopyCurrentKeyboardInputSource().takeRetainedValue()), inputID(literal))
+        print("Picker literal input verified:", inputID(literal))
     }
 
     override func tearDown() async throws {
