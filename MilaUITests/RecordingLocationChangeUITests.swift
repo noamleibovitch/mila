@@ -321,8 +321,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
     /// The inspected production Quit branch is `applicationShouldTerminate`
     /// (window close does not quit: `applicationShouldTerminateAfterLastWindowClosed`
-    /// returns false). This is the app-scoped Cmd-Q key equivalent, not a
-    /// global OS key event.
+    /// returns false). Use the app's observed native terminate: menu item.
+    /// Cmd-Q produced no handler entry in the confirmed file-trace diagnostic;
+    /// shortcut delivery remains a separate, unresolved proof obligation.
     @discardableResult
     private func captureFolderQuitTrace(_ phase: String) -> String {
         let url = root.appendingPathComponent("Mila-UITest-quit-trace.txt")
@@ -341,9 +342,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
     }
 
     private func requestQuit(_ app: XCUIApplication) throws {
-        let bootTrace = captureFolderQuitTrace("before Cmd-Q")
+        let bootTrace = captureFolderQuitTrace("before Quit menu")
         guard bootTrace.split(separator: "\n").contains("wired") else {
-            XCTFail("The app-side Quit trace must be live before sending Cmd-Q")
+            XCTFail("The app-side Quit trace must be live before clicking Quit")
             throw InterruptedCopyFixtureError("app-side Quit trace unavailable")
         }
         func snapshot(_ phase: String) {
@@ -360,10 +361,24 @@ final class RecordingLocationChangeUITests: XCTestCase {
                 add(window)
             }
         }
-        snapshot("before Cmd-Q")
-        app.typeKey("q", modifierFlags: [.command])
-        snapshot("after Cmd-Q")
-        captureFolderQuitTrace("after Cmd-Q")
+        snapshot("before Quit menu")
+        // These titles/identifier are present in the captured native app menu,
+        // distinct from the status-item menu that has had presentation failures.
+        let appMenu = app.menuBars.menuBarItems["Mila"]
+        guard appMenu.waitForExistence(timeout: 5), appMenu.isHittable else {
+            XCTFail("The native Mila application menu must be visible")
+            throw InterruptedCopyFixtureError("native application menu unavailable")
+        }
+        appMenu.click()
+        let quit = appMenu.menuItems["terminate:"]
+        guard quit.waitForExistence(timeout: 5), quit.isEnabled, quit.isHittable else {
+            snapshot("Quit menu unavailable")
+            XCTFail("The native terminate: item must be enabled and visible")
+            throw InterruptedCopyFixtureError("native Quit item unavailable")
+        }
+        quit.click()
+        snapshot("after Quit menu")
+        captureFolderQuitTrace("after Quit menu")
     }
 
     private func waitForRemovalConfirmation(_ app: XCUIApplication,
