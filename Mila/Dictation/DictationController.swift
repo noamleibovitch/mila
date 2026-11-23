@@ -48,7 +48,7 @@ final class DictationController: ObservableObject {
     }
 
     private func beginLibraryOperation() {
-        if libraryOperationTicket == nil { libraryOperationTicket = libraryLedger.begin() }
+        // adverse control: omit dictation ticket admission
     }
 
     private func finishLibraryOperation() {
