@@ -636,7 +636,7 @@ final class RecordingLocationCoordinator: ObservableObject {
                                                  done: min(completed, total.count), files: total.count)
                         }
                     }, completedFile: { count in done = count },
-                    chunkWrite: writeChunk)
+                    chunkWrite: nil)
             }.value
             publishProgress(copied: source.byteCount, total: source.byteCount,
                             done: total.count, files: total.count)
