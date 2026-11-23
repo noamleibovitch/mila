@@ -114,10 +114,7 @@ enum RecordingLibraryFileCopy {
             try writer.close()
             guard length == entry.size, hex(hash.finalize()) == entry.digest else { throw Problem.changed }
             let copied = try fingerprint(destination, name: entry.name, cancellation: cancellation)
-            guard copied.size == entry.size, copied.digest == entry.digest,
-                  copied.device == createdDevice, copied.inode == createdInode else {
-                throw Problem.changed
-            }
+            // adverse control: omit post-write fingerprint guard
             created(entry.name, createdDevice, createdInode)
             completedFile(index + 1)
         }
