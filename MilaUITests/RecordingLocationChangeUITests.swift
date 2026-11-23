@@ -324,7 +324,23 @@ final class RecordingLocationChangeUITests: XCTestCase {
     /// returns false). This is the app-scoped Cmd-Q key equivalent, not a
     /// global OS key event.
     private func requestQuit(_ app: XCUIApplication) {
+        func snapshot(_ phase: String) {
+            print("FolderQuitDiagnostic UI: \(phase) state=\(app.state.rawValue)")
+            guard app.state != .notRunning, app.state != .unknown else { return }
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "Folder Quit \(phase) app hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            if app.windows.firstMatch.exists {
+                let window = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+                window.name = "Folder Quit \(phase) app window"
+                window.lifetime = .keepAlways
+                add(window)
+            }
+        }
+        snapshot("before Cmd-Q")
         app.typeKey("q", modifierFlags: [.command])
+        snapshot("after Cmd-Q")
     }
 
     private func waitForRemovalConfirmation(_ app: XCUIApplication,

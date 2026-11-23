@@ -2936,7 +2936,17 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         route(configURLs: configURLs, shareURLs: shareURLs)
     }
 
+    #if DEBUG
+    private func traceFolderQuit(_ event: String) {
+        guard MilaApp.folderUITestScenario() == .slowCopy else { return }
+        print("FolderQuitDiagnostic: \(event)")
+    }
+    #endif
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        #if DEBUG
+        traceFolderQuit("entered coordinator=\(recordingLocation != nil) settling=\(recordingLocation?.isSettlingCopy ?? false) shutdown=\(didShutDown)")
+        #endif
         // Quit (Cmd+Q or the menu item) must never show the background
         // explanation or hide a window on the way out.
         menuBarWindow.beginTermination()
@@ -2947,7 +2957,14 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             alert.informativeText = "Mila is still copying your recordings. Your original recordings are unchanged. Keep copying to finish the folder change, or stop and quit."
             alert.addButton(withTitle: "Keep copying")
             alert.addButton(withTitle: "Stop and quit")
-            switch alert.runModal() {
+            #if DEBUG
+            traceFolderQuit("before-modal")
+            #endif
+            let response = alert.runModal()
+            #if DEBUG
+            traceFolderQuit("after-modal response=\(response.rawValue)")
+            #endif
+            switch response {
             case .alertSecondButtonReturn:
                 didShutDown = true
                 recordingLocation.cancel()
