@@ -2501,9 +2501,10 @@ final class RecordingSummarizerTests: XCTestCase {
         summarizer.cancel(recordingID: rec.id)
         XCTAssertFalse(summarizer.libraryWorkState.isIdle)
 
-        let destination = tempRoot.appendingPathComponent("NewLibrary-\(UUID().uuidString)",
+        let destination = tempRoot.deletingLastPathComponent().appendingPathComponent("NewLibrary-\(UUID().uuidString)",
                                                           isDirectory: true)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: destination) }
         var newer = rec
         newer.title = "Destination owns this UUID"
         let layout = try RecordingLibraryInspection.Layout(directory: destination,
