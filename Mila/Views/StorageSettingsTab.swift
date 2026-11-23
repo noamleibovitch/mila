@@ -153,6 +153,12 @@ struct StorageSettingsTab: View {
                 .focusable()
                 .focused($locationFocus, equals: .choose)
                 .accessibilityFocused($accessibleLocationFocus, equals: .choose)
+                .onKeyPress(.space) {
+                    guard !isLocationBusy else { return .ignored }
+                    prepareLocationFocus(.choose)
+                    coordinator.chooseFolder()
+                    return .handled
+                }
                 .disabled(isLocationBusy)
                 .help(isLocationBusy ? busyText : "Check a recordings folder before switching.")
                 .accessibilityValue(isLocationBusy ? busyText : "Ready")
@@ -166,6 +172,12 @@ struct StorageSettingsTab: View {
                 .focusable()
                 .focused($locationFocus, equals: .useDefault)
                 .accessibilityFocused($accessibleLocationFocus, equals: .useDefault)
+                .onKeyPress(.space) {
+                    guard !isLocationBusy else { return .ignored }
+                    prepareLocationFocus(.useDefault)
+                    coordinator.useDefaultLocation()
+                    return .handled
+                }
                 .disabled(isLocationBusy)
                 .help(isLocationBusy ? busyText : "Check the default recordings folder before switching.")
                 .accessibilityValue(isLocationBusy ? busyText : "Ready")
