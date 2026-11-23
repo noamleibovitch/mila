@@ -225,32 +225,82 @@ final class RecordingLocationChangeUITests: XCTestCase {
         try writeSyntheticWAV(at: audio, frequency: 440, frames: frames)
     }
 
+    private enum InterruptedCopyFixtureError: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
+    }
+
+    /// Must match `RecordingLocationUITestHarness.releaseMarkerName` in the app
+    /// target (that type is DEBUG-only and not linked into this UI test target,
+    /// so the single fixed name is mirrored here with the same literal).
+    private static let copyGateReleaseMarkerName = "Mila-UITest-copy-gate-release"
+
+    /// The combined copy-progress accessibility element, addressed by its
+    /// stable identifier rather than by a guessed label or element type.
     private func copyProgressElement(_ app: XCUIApplication) -> XCUIElement {
         app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", "Copying recordings"))
+            .matching(identifier: "storage.changeSheet.copyProgress")
             .firstMatch
+    }
+
+    /// The single release marker the DEBUG harness polls, inside this test's
+    /// already-validated UUID clean root. The test is the sole writer.
+    private var copyGateReleaseURL: URL {
+        root.appendingPathComponent(Self.copyGateReleaseMarkerName, isDirectory: false)
+    }
+
+    /// Release the held copy worker. Unconditional and idempotent so it is safe
+    /// in a `defer` on a failed assertion; it never writes outside the root.
+    private func releaseCopyGate() {
+        let url = copyGateReleaseURL
+        if FileManager.default.fileExists(atPath: url.path) { return }
+        _ = FileManager.default.createFile(atPath: url.path, contents: Data())
+    }
+
+    private func boundedDiagnostic(_ text: String, limit: Int = 200) -> String {
+        text.count <= limit ? text : String(text.prefix(limit)) + "…"
+    }
+
+    /// Bounded, synthetic-only snapshot of the actual accessibility label and
+    /// value, so a parser mismatch is diagnosed from observed values instead
+    /// of guessed. Contains only fixture UI text, never user data.
+    private func copyProgressDiagnostic(_ app: XCUIApplication) -> String {
+        let element = copyProgressElement(app)
+        guard element.exists else {
+            return "element missing (identifier storage.changeSheet.copyProgress)"
+        }
+        let label = boundedDiagnostic(element.label)
+        let value = boundedDiagnostic((element.value as? String) ?? "<nil>")
+        return "label=\(label) value=\(value)"
     }
 
     /// The copy view is one combined accessibility element whose value is
     /// "done of total files, copied of total bytes". Wait until the copied
     /// portion is a real KB/MB amount, so a pass proves observed byte progress
-    /// rather than only the copying phase.
+    /// rather than only the copying phase. Throws fail-fast (ending the test
+    /// body) if the element never appears or never reports nonzero bytes, so
+    /// later stage checks never run against a stale or completed stage.
     @discardableResult
     private func waitForRealCopyProgress(_ app: XCUIApplication,
-                                         timeout: TimeInterval = 25) -> XCUIElement {
+                                         timeout: TimeInterval = 25) throws -> XCUIElement {
         let element = copyProgressElement(app)
-        XCTAssertTrue(element.waitForExistence(timeout: timeout),
-                      "Copy progress must be visible")
+        guard element.waitForExistence(timeout: timeout) else {
+            XCTFail("Copy progress must be visible; \(copyProgressDiagnostic(app))")
+            throw InterruptedCopyFixtureError("copy progress element never appeared")
+        }
         let progressed = XCTNSPredicateExpectation(predicate: NSPredicate { object, _ in
-            guard let element = object as? XCUIElement,
-                  let value = element.value as? String,
-                  let marker = value.range(of: "files, ") else { return false }
-            let copied = String(value[marker.upperBound...])
+            guard let element = object as? XCUIElement else { return false }
+            let value = (element.value as? String) ?? ""
+            let text = value.isEmpty ? element.label : value
+            guard let marker = text.range(of: "files, ") else { return false }
+            let copied = String(text[marker.upperBound...])
                 .components(separatedBy: " of ").first ?? ""
             return copied.contains("KB") || copied.contains("MB")
         }, object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [progressed], timeout: timeout), .completed,
-                       "Copy progress must report real copied bytes, not only the phase")
+        guard XCTWaiter.wait(for: [progressed], timeout: timeout) == .completed else {
+            XCTFail("Copy progress must report real copied bytes, not only the phase; \(copyProgressDiagnostic(app))")
+            throw InterruptedCopyFixtureError("copy progress never reported nonzero bytes")
+        }
         return element
     }
 
@@ -725,6 +775,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
         let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
         defer { app.terminate() }
+        // Fail-safe: release the held worker even if an assertion throws, so
+        // teardown/app termination never waits on the gate.
+        defer { releaseCopyGate() }
         _ = openStorage(app)
         waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
                          "The chooser must become available after launch work settles")
@@ -735,16 +788,20 @@ final class RecordingLocationChangeUITests: XCTestCase {
         copy.click()
         app.buttons["storage.changeSheet.continue"].click()
 
-        waitForRealCopyProgress(app)
+        try waitForRealCopyProgress(app)
         settingsWindowScreenshot(app, named: "Copying with real byte progress before cancel")
         let midStages = incompleteStageDirectories(in: destination)
-        XCTAssertEqual(midStages.count, 1, "The copy must own exactly one hidden stage")
-        XCTAssertGreaterThan(stagedFileSize(midStages[0], named: "seed.wav"), 0,
+        guard midStages.count == 1, let midStage = midStages.first else {
+            return XCTFail("The copy must own exactly one hidden stage; found \(midStages.count)")
+        }
+        XCTAssertGreaterThan(stagedFileSize(midStage, named: "seed.wav"), 0,
                              "The stage must contain real copied bytes before Cancel")
 
         let cancel = app.buttons["Cancel"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         cancel.click()
+        // The real cancel is registered; now let the held worker settle.
+        releaseCopyGate()
 
         let outcome = app.staticTexts["storage.changeSheet.outcome"]
         XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Cancel during copy must settle")
@@ -770,11 +827,12 @@ final class RecordingLocationChangeUITests: XCTestCase {
             atPath: destination.appendingPathComponent("recordings.json").path),
                        "A canceled copy must not publish a destination library")
         let retainedStages = incompleteStageDirectories(in: destination)
-        XCTAssertEqual(retainedStages.count, 1,
-                       "A canceled copy whose ownership is unproven must stay on disk")
-        XCTAssertGreaterThan(stagedFileSize(retainedStages[0], named: "seed.wav"), 0)
+        guard retainedStages.count == 1, let retainedStage = retainedStages.first else {
+            return XCTFail("A canceled copy whose ownership is unproven must stay on disk as exactly one stage; found \(retainedStages.count)")
+        }
+        XCTAssertGreaterThan(stagedFileSize(retainedStage, named: "seed.wav"), 0)
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: retainedStages[0].appendingPathComponent(".mila-receipt.json").path),
+            atPath: retainedStage.appendingPathComponent(".mila-receipt.json").path),
                       "The retained stage must keep its real receipt")
     }
 
@@ -787,6 +845,8 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
         let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
         defer { app.terminate() }
+        // Fail-safe: release the held worker even if an assertion throws.
+        defer { releaseCopyGate() }
         _ = openStorage(app)
         waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
                          "The chooser must become available after launch work settles")
@@ -797,7 +857,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
         copy.click()
         app.buttons["storage.changeSheet.continue"].click()
-        waitForRealCopyProgress(app)
+        try waitForRealCopyProgress(app)
 
         requestQuit(app)
         XCTAssertTrue(app.buttons["Keep copying"].waitForExistence(timeout: 15),
@@ -821,6 +881,8 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
         app.buttons["Keep copying"].click()
         XCTAssertNotEqual(app.state, .notRunning, "Keep copying must cancel the quit")
+        // Keep copying is the real chosen action; let the held worker finish.
+        releaseCopyGate()
         let outcome = app.staticTexts["storage.changeSheet.outcome"]
         XCTAssertTrue(outcome.waitForExistence(timeout: 60),
                       "Keeping the copy running must let it finish")
@@ -872,6 +934,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
         let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy"])
         defer { app.terminate() }
+        // Fail-safe: release the held worker even if an assertion throws, so a
+        // failed Stop-and-quit assertion cannot leave the worker parked.
+        defer { releaseCopyGate() }
         _ = openStorage(app)
         waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
                          "The chooser must become available after launch work settles")
@@ -881,12 +946,15 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(copy.waitForExistence(timeout: 5))
         copy.click()
         app.buttons["storage.changeSheet.continue"].click()
-        waitForRealCopyProgress(app)
+        try waitForRealCopyProgress(app)
 
         requestQuit(app)
         XCTAssertTrue(app.buttons["Stop and quit"].waitForExistence(timeout: 15),
                       "Quit during copy must offer Stop and quit")
         app.buttons["Stop and quit"].click()
+        // Stop and quit has registered cancellation; release the held worker
+        // so settlement and termination can complete.
+        releaseCopyGate()
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 40),
                       "Stop and quit must terminate after the worker settles and cleanup runs")
 
@@ -894,9 +962,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
         // creation identity. Keep using that REAL canceled stage: it must be
         // retained, and no ownership may be fabricated for it.
         let canceledStages = incompleteStageDirectories(in: destination)
-        XCTAssertEqual(canceledStages.count, 1,
-                       "The stopped copy must leave exactly one real stage")
-        let canceledStage = canceledStages[0]
+        guard canceledStages.count == 1, let canceledStage = canceledStages.first else {
+            return XCTFail("The stopped copy must leave exactly one real stage; found \(canceledStages.count)")
+        }
         let partialSize = stagedFileSize(canceledStage, named: "seed.wav")
         XCTAssertGreaterThan(partialSize, 0, "The canceled stage holds real copied bytes")
         XCTAssertTrue(FileManager.default.fileExists(
@@ -966,11 +1034,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
                        "A safe-removal failure must keep the original folder selected")
 
         let retained = incompleteStageDirectories(in: destination)
-        XCTAssertEqual(retained.count, 1, "A safe-removal failure must retain the stage")
-        XCTAssertEqual(stagedFileSize(retained[0], named: "seed.wav"), partialSize,
+        guard retained.count == 1, let retainedStage = retained.first else {
+            return XCTFail("A safe-removal failure must retain exactly one stage; found \(retained.count)")
+        }
+        XCTAssertEqual(stagedFileSize(retainedStage, named: "seed.wav"), partialSize,
                        "A safe-removal failure must not truncate or delete staged bytes")
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: retained[0].appendingPathComponent(".mila-receipt.json").path))
+            atPath: retainedStage.appendingPathComponent(".mila-receipt.json").path))
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: destination.appendingPathComponent("sentinel-keep.txt").path),
                       "Safe refusal must not recursively delete the destination")

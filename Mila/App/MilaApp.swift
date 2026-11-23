@@ -455,6 +455,15 @@ struct MilaApp: App {
         case slowCopy = "slow-copy"
     }
 
+    /// The one already-validated UUID-owned clean root, or nil. Shared by the
+    /// scenario gate and the interrupted-copy harness so both name the exact
+    /// same canonical `Mila-UITest-<UUID>` root (same uid, exact 0700).
+    static func validatedUITestCleanRoot() -> URL? {
+        guard let raw = ProcessInfo.processInfo.environment["MILA_UI_TEST_CLEAN_ROOT"] else { return nil }
+        let candidate = URL(fileURLWithPath: raw).standardizedFileURL
+        return RecordingStore.isValidUITestRoot(candidate) ? candidate : nil
+    }
+
     static func folderUITestScenario(arguments: [String] = CommandLine.arguments) -> FolderUITestScenario? {
         guard arguments.contains("--uitests"),
               arguments.contains("--ui-test-clean-store"),
@@ -465,10 +474,10 @@ struct MilaApp: App {
         }
         if scenario == .slowCopy {
             // The interrupted-copy fixture writes into a test-owned stage and
-            // must never activate outside a seeded, validated clean root.
+            // gates on a marker inside the validated root; it must never
+            // activate outside a seeded, validated clean root.
             guard arguments.contains("--ui-test-seed-recording"),
-                  let raw = ProcessInfo.processInfo.environment["MILA_UI_TEST_CLEAN_ROOT"],
-                  RecordingStore.isValidUITestRoot(URL(fileURLWithPath: raw).standardizedFileURL) else {
+                  Self.validatedUITestCleanRoot() != nil else {
                 return nil
             }
         }
@@ -1235,14 +1244,22 @@ struct MilaApp: App {
                                                     readiness: readiness,
                                                     beforeInspection: { Thread.sleep(forTimeInterval: 12) })
         case .some(.slowCopy):
-            // Debug-only held-worker seam: real bytes plus a bounded pause on
-            // the detached copy worker so a native test can observe progress
-            // and cancel/quit mid-copy. Production passes no chunkWrite.
-            let harness = RecordingLocationUITestHarness()
-            location = RecordingLocationCoordinator(store: store,
-                                                    storage: storage,
-                                                    readiness: readiness,
-                                                    chunkWrite: harness.chunkWrite)
+            // Debug-only held-worker seam: real bytes plus a file-signalled
+            // bounded gate on the detached copy worker so a native test can
+            // observe persistent progress and interrupt mid-copy. The gate
+            // names its release marker inside the already-validated clean
+            // root. Production passes no chunkWrite.
+            if let cleanRoot = Self.validatedUITestCleanRoot() {
+                let harness = RecordingLocationUITestHarness(releaseRoot: cleanRoot)
+                location = RecordingLocationCoordinator(store: store,
+                                                        storage: storage,
+                                                        readiness: readiness,
+                                                        chunkWrite: harness.chunkWrite)
+            } else {
+                location = RecordingLocationCoordinator(store: store,
+                                                        storage: storage,
+                                                        readiness: readiness)
+            }
         case .some(.busy):
             location = RecordingLocationCoordinator(store: store,
                                                     storage: storage,

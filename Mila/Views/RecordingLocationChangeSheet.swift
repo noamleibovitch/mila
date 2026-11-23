@@ -241,6 +241,7 @@ struct RecordingLocationChangeSheet: View {
                 .foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("storage.changeSheet.copyProgress")
         .accessibilityLabel("Copying recordings")
         .accessibilityValue("\(progress.doneFiles) of \(progress.totalFiles) files, \(byteString(progress.copiedBytes)) of \(byteString(progress.totalBytes))")
     }
