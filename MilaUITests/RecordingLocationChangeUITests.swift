@@ -921,27 +921,31 @@ final class RecordingLocationChangeUITests: XCTestCase {
         try waitForRealCopyProgress(app)
 
         try requestQuit(app)
-        XCTAssertTrue(app.buttons["Keep copying"].waitForExistence(timeout: 15),
+        let quitDialog = app.dialogs["alert"]
+        XCTAssertTrue(quitDialog.waitForExistence(timeout: 15),
                       "Quit during copy must ask, with Keep copying as the default button")
         captureFolderQuitTrace("after Keep choice wait")
-        XCTAssertTrue(app.buttons["Stop and quit"].exists)
-        let quitDialog = app.dialogs.firstMatch
-        if quitDialog.exists, quitDialog.buttons.count >= 2 {
-            XCTAssertEqual(quitDialog.buttons.element(boundBy: 0).label, "Keep copying",
-                           "Keep copying must be the alert's default (first) button")
-            XCTAssertEqual(quitDialog.buttons.element(boundBy: 1).label, "Stop and quit")
-        }
-        XCTAssertTrue(app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Stop copying and quit?"))
+        let keep = quitDialog.buttons["action-button-1"]
+        let stop = quitDialog.buttons["action-button-2"]
+        XCTAssertTrue(keep.exists)
+        XCTAssertTrue(stop.exists)
+        XCTAssertEqual(keep.title, "Keep copying")
+        XCTAssertEqual(stop.title, "Stop and quit")
+        XCTAssertTrue(quitDialog.staticTexts
+            .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                  "Stop copying and quit?", "Stop copying and quit?"))
             .firstMatch.waitForExistence(timeout: 5),
                       "Quit during copy must show the inspected alert title")
-        XCTAssertTrue(app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS[c] %@",
+        XCTAssertTrue(quitDialog.staticTexts
+            .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
+                                  "Keep copying to finish the folder change",
                                   "Keep copying to finish the folder change"))
             .firstMatch.exists,
                       "The quit alert must explain the default and the stop choice")
 
-        app.buttons["Keep copying"].click()
+        // Exercise the actual default action, rather than inferring it from
+        // AX traversal order (which is spatial and includes Touch Bar copies).
+        app.typeKey(.return, modifierFlags: [])
         XCTAssertNotEqual(app.state, .notRunning, "Keep copying must cancel the quit")
         // Keep copying is the real chosen action; let the held worker finish.
         releaseCopyGate()
@@ -1011,10 +1015,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
         try waitForRealCopyProgress(app)
 
         try requestQuit(app, viaKeyboard: true)
-        XCTAssertTrue(app.buttons["Stop and quit"].waitForExistence(timeout: 15),
+        let quitDialog = app.dialogs["alert"]
+        XCTAssertTrue(quitDialog.waitForExistence(timeout: 15),
                       "Quit during copy must offer Stop and quit")
         captureFolderQuitTrace("after Stop choice wait")
-        app.buttons["Stop and quit"].click()
+        let stop = quitDialog.buttons["action-button-2"]
+        XCTAssertEqual(stop.title, "Stop and quit")
+        stop.click()
         // Stop and quit has registered cancellation; release the held worker
         // so settlement and termination can complete.
         releaseCopyGate()
