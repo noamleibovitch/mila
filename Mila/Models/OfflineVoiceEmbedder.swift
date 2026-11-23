@@ -120,7 +120,7 @@ final class OfflineVoiceEmbedder {
 
     func resetLibraryContext() {
         clearedByPass = nil
-        snapshots.removeAll()
+        // adverse control: retain dormant observations
     }
 
     var libraryWorkState: RecordingLibraryWorkState {
