@@ -639,6 +639,43 @@ extension RecordingLocationCoordinatorTests {
         XCTAssertEqual(store.recordings.map(\.id), [original.id])
     }
 
+    func test_external_source_file_change_before_final_verification_refuses_activation() async throws {
+        var original = row("External edit", audio: "meeting.wav")
+        original.fullText = "Original transcript"
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let sourceDirectory = store.recordingsDirectory
+        let sidecar = sourceDirectory.appendingPathComponent("meeting.txt")
+        let edited = Data("External transcript edit".utf8)
+        var editedAtFinalBoundary = false
+        coordinator = RecordingLocationCoordinator(store: store, storage: storage, readiness: readiness,
+                                                   beforeFinalVerification: {
+            let activity = self.store.libraryActivity.snapshot
+            do {
+                // External filesystem edit: deliberately bypass store mutation
+                // notifications so only the final source reinspection catches it.
+                try edited.write(to: sidecar)
+                editedAtFinalBoundary = true
+            } catch { XCTFail("Could not edit the synthetic sidecar: \(error)") }
+            XCTAssertEqual(self.store.libraryActivity.snapshot, activity,
+                           "External edits must not manufacture a store revision")
+        })
+        let destination = try makeCustom("ExternalEdit")
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.copy)
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        XCTAssertTrue(editedAtFinalBoundary)
+        guard case .failure = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertEqual(store.recordingsDirectory, sourceDirectory)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertEqual(try Data(contentsOf: sidecar), edited,
+                       "Refusal must preserve the external edit in the original library")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty,
+                      "The verified copy must be removed instead of activated with stale source bytes")
+    }
+
     func test_failed_transcript_rewrite_and_removal_blocks_migration_entry() async throws {
         let segments = [
             TranscriptSegment(start: 0, end: 1, text: " one"),
