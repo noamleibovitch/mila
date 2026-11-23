@@ -1547,6 +1547,17 @@ struct MilaApp: App {
     /// `.task` so the work is tied to the app's lifetime rather than
     /// to any single view.
     private func startMeetingDetectionIfNeeded() {
+        #if DEBUG
+        // App-hosted unit tests share the runner's desktop session. They
+        // exercise their own detector/coordinator instances and must never
+        // discover or prompt for the user's real calls from App startup.
+        // XCUITest's app process does not load XCTestCase, so explicit
+        // meeting UI fixtures still start through the normal path below.
+        guard NSClassFromString("XCTestCase") == nil else {
+            print("Skipping ambient meeting detection in unit-test host")
+            return
+        }
+        #endif
         meetingPrompt.start()
         meetingPrompt.bindEnabledChanges()
         #if DEBUG
