@@ -65,14 +65,19 @@ final class RecordingLocationChangeUITests: XCTestCase {
 
     private func chooseDestination(_ app: XCUIApplication) {
         app.buttons["storage.chooseFolder.button"].click()
-        let sheet = app.sheets.firstMatch
-        XCTAssertTrue(sheet.waitForExistence(timeout: 10), "Native folder panel did not appear")
-        app.typeKey("g", modifierFlags: [.command, .shift])
-        let field = sheet.textFields.firstMatch
+        // NSOpenPanel.begin presents a standalone open-panel window, not
+        // a sheet attached to Settings. Go to Folder is a sheet of that panel.
+        let panel = app.windows["open-panel"]
+        XCTAssertTrue(panel.waitForExistence(timeout: 10), "Native folder panel did not appear")
+        panel.typeKey("g", modifierFlags: [.command, .shift])
+        let goTo = panel.sheets.firstMatch
+        XCTAssertTrue(goTo.waitForExistence(timeout: 5), "Go to Folder did not appear")
+        let field = goTo.comboBoxes.firstMatch.exists
+            ? goTo.comboBoxes.firstMatch : goTo.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         field.typeText(destination.path)
-        app.typeKey(.return, modifierFlags: [])
-        let choose = sheet.buttons["Choose"]
+        panel.typeKey(.return, modifierFlags: [])
+        let choose = panel.buttons["OKButton"]
         XCTAssertTrue(choose.waitForExistence(timeout: 5))
         choose.click()
         XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10),
