@@ -14,7 +14,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         try selectLiteralKeyboardLayout()
-        let base = URL(fileURLWithPath: "/tmp", isDirectory: true).resolvingSymlinksInPath()
+        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
         root = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         destination = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         suiteID = UUID()
@@ -69,6 +69,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
     private func launch() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchEnvironment["MILA_UI_TEST_CLEAN_ROOT"] = root.path
+        // The runner is sandboxed and owns a different temporary directory
+        // from the unsandboxed app host. Align only this test process, keeping
+        // the exact private UUID root and the app's validation unchanged.
+        app.launchEnvironment["TMPDIR"] = root.deletingLastPathComponent().path
         app.launchArguments = [
             "--uitests",
             "--ui-test-clean-store",
