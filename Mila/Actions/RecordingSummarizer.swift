@@ -899,7 +899,7 @@ final class RecordingSummarizer: ObservableObject {
     /// again while IT is out. A GLOBAL setting flip mid-flight with no
     /// request keeps the result, as it always has.
     private func completion(of id: UUID, token: UUID, produced: Bool) -> Completion {
-        guard let run = inFlight[id], run.token == token else {
+        guard let run = inFlight[id] else {
             summarizerLog.log("discarded \(self.shortID(id), privacy: .public): run was cancelled")
             return .abandoned
         }
