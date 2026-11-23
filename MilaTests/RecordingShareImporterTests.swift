@@ -96,6 +96,49 @@ final class RecordingShareImporterTests: XCTestCase {
         }
     }
 
+    /// Counts invocations of the injected copier so one seam can park the
+    /// first confirm and let the next proceed.
+    private actor CopyCallCounter {
+        private var count = 0
+        func next() -> Int {
+            count += 1
+            return count
+        }
+    }
+
+    /// A main-actor latch so held work can be released synchronously from a
+    /// `defer` (the async `Gate` cannot be awaited there). Every waiter is
+    /// resumed exactly once and late waits return immediately.
+    @MainActor
+    private final class Latch {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        var opened: Bool { isOpen }
+        func open() {
+            guard !isOpen else { return }
+            isOpen = true
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+        }
+        func wait() async {
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+    }
+
+    /// Bounded polling for the async hand-offs in the held-copy tests. Never
+    /// used as settlement proof: each caller asserts the state it waited for.
+    private func waitUntil(timeout: TimeInterval = 5,
+                           _ condition: @escaping @MainActor () async -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
+    }
+
     private func makeVoiceSettings(enabled: Bool, ready: Bool = true) -> VoiceRecognitionSettings {
         let name = "RecordingShareImporterTests.\(UUID())"
         suiteNames.append(name)
@@ -311,6 +354,371 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertFalse(importer.isImporting)
         XCTAssertTrue(storeB.recordings.isEmpty, "the dismissed import must not reach the library")
         XCTAssertEqual(recordingsDirectoryNames(storeB), [], "no audio, no .partial left behind")
+    }
+
+    // MARK: - Held lifetimes around the detached copy
+
+    /// Cancel releases the sheet slot synchronously, so the next queued
+    /// bundle starts staging while the canceled copy is still parked. The
+    /// importer must not report idle, publish anything from the abandoned
+    /// copy, or retire the copy's lifetime early; the queued import must
+    /// still work once the old worker unwinds.
+    func test_canceled_detached_copy_keeps_the_queued_import_busy_and_never_publishes() async throws {
+        let abandoned = try makeCompletedRecording(in: storeA, title: "Abandoned share")
+        let queued = try makeCompletedRecording(in: storeA, title: "Queued share")
+        let abandonedBundle = try await export(abandoned, from: storeA)
+        let queuedBundle = try await export(queued, from: storeA)
+
+        let calls = CopyCallCounter()
+        let firstCopied = Latch()
+        let releaseFirst = Latch()
+        let importer = makeImporter(copyAudio: { source, destination in
+            try await RecordingShareImporter.copyFile(source, to: destination)
+            if await calls.next() == 1 {
+                await firstCopied.open()
+                await releaseFirst.wait()
+            }
+        })
+        defer { releaseFirst.open() }
+
+        let idle = importer.libraryWorkState
+        XCTAssertTrue(idle.isIdle)
+
+        await stage(abandonedBundle, with: importer)
+        guard let abandonedPending = importer.pending else {
+            return XCTFail("the abandoned bundle never staged")
+        }
+        XCTAssertEqual(abandonedPending.manifest.recording.id, abandoned.id)
+        let admitted = importer.libraryWorkState
+        XCTAssertFalse(admitted.isIdle)
+        XCTAssertEqual(admitted.generation, idle.generation &+ 2,
+                       "one stage admission and one stage retirement")
+
+        // A second sheet is queued behind the first, as when two bundles are
+        // double-clicked before the first confirm.
+        importer.handleOpen(queuedBundle)
+        XCTAssertFalse(importer.libraryWorkState.isIdle)
+        XCTAssertEqual(importer.pending?.id, abandonedPending.id, "the queued bundle must not replace the preview")
+
+        let abandonedImport = Task { @MainActor in await importer.confirm() }
+        guard await waitUntil { firstCopied.opened } else {
+            await releaseFirst.open()
+            await abandonedImport.value
+            return XCTFail("confirm() never reached the abandoned audio copy")
+        }
+        let duringCopy = importer.libraryWorkState
+        XCTAssertTrue(importer.isImporting)
+        XCTAssertFalse(duringCopy.isIdle)
+        XCTAssertEqual(duringCopy.generation, admitted.generation &+ 1,
+                       "confirm admits its full lifetime before the copy")
+        let partialsWhileCopying = recordingsDirectoryNames(storeB).filter { $0.hasSuffix(".partial") }
+        XCTAssertEqual(partialsWhileCopying.count, 1, "the abandoned copy is on disk before Cancel")
+
+        // Cancel clears the preview and the sheet slot at once. The queued
+        // bundle takes the staging slot synchronously, so readiness never
+        // dips to idle and the canceled copy's lifetime stays outstanding.
+        importer.cancel()
+        XCTAssertNil(importer.pending)
+        XCTAssertFalse(importer.isImporting)
+        let afterCancel = importer.libraryWorkState
+        XCTAssertFalse(afterCancel.isIdle, "the next stage admission or the unwinding copy still holds work")
+        XCTAssertEqual(afterCancel.generation, duringCopy.generation &+ 1,
+                       "the queued bundle's staging admission")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandonedPending.stagingDirectory.path),
+                       "Cancel removes the abandoned staging directory")
+
+        guard await waitUntil({ importer.pending?.manifest.recording.id == queued.id }) else {
+            await releaseFirst.open()
+            await abandonedImport.value
+            return XCTFail("the queued bundle never staged while the old copy was parked")
+        }
+        let staged = importer.libraryWorkState
+        XCTAssertFalse(staged.isIdle, "a pending preview is work")
+        XCTAssertEqual(staged.generation, afterCancel.generation &+ 1,
+                       "staging the next preview retires its ticket")
+        XCTAssertEqual(recordingsDirectoryNames(storeB).filter { $0.hasSuffix(".partial") },
+                       partialsWhileCopying,
+                       "staging the next preview does not touch the in-flight copy")
+
+        // The abandoned copy unwinds only now, after the next preview is on
+        // screen. It removes only its own .partial and publishes nothing.
+        await releaseFirst.open()
+        await abandonedImport.value
+
+        let afterAbandoned = importer.libraryWorkState
+        XCTAssertFalse(afterAbandoned.isIdle)
+        XCTAssertEqual(afterAbandoned.generation, staged.generation &+ 1,
+                       "the canceled lifetime retires exactly once, only after the copier returns")
+        XCTAssertEqual(importer.pending?.manifest.recording.id, queued.id,
+                       "the abandoned copy must not clear the new preview")
+        XCTAssertFalse(importer.isImporting, "the abandoned copy must not leave the sheet disabled")
+        XCTAssertTrue(storeB.recordings.isEmpty, "the abandoned copy never reaches the library")
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [], "no audio, no .partial from the abandoned copy")
+        XCTAssertNil(importer.lastImport)
+
+        // The queued import is still a complete import, not a casualty of the
+        // abandoned copy's late cleanup.
+        await importer.confirm()
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertNil(importer.refusalMessage)
+        XCTAssertEqual(storeB.recordings.map(\.id), [queued.id])
+        XCTAssertEqual(importer.lastImport?.recordingID, queued.id)
+        let settled = importer.libraryWorkState
+        XCTAssertTrue(settled.isIdle, "readiness is idle only after every holder has settled")
+        XCTAssertEqual(settled.generation, staged.generation &+ 3,
+                       "the canceled retirement then the queued confirm's admission and retirement")
+        let imported = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertTrue(recordingsDirectoryNames(storeB).contains(imported.audioFileName))
+        XCTAssertFalse(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") })
+        XCTAssertFalse(storeB.recordings.contains { $0.id == abandoned.id })
+    }
+
+    /// Two confirms can overlap when the sheet is cancelled and the next
+    /// preview is confirmed while the canceled copy is still unwinding. The
+    /// older copy's `defer` and cleanup must run for its own ticket only: it
+    /// cannot clear the newer import's busy slot, preview or `.partial`.
+    func test_older_canceled_copy_cannot_retire_the_newer_owner_or_remove_its_partial() async throws {
+        let abandoned = try makeCompletedRecording(in: storeA, title: "Old share")
+        let replacement = try makeCompletedRecording(in: storeA, title: "New share")
+        let abandonedBundle = try await export(abandoned, from: storeA)
+        let replacementBundle = try await export(replacement, from: storeA)
+
+        let calls = CopyCallCounter()
+        let firstCopied = Latch()
+        let releaseFirst = Latch()
+        let secondCopied = Latch()
+        let releaseSecond = Latch()
+        let importer = makeImporter(copyAudio: { source, destination in
+            try await RecordingShareImporter.copyFile(source, to: destination)
+            let call = await calls.next()
+            if call == 1 {
+                await firstCopied.open()
+                await releaseFirst.wait()
+            } else {
+                await secondCopied.open()
+                await releaseSecond.wait()
+            }
+        })
+        defer {
+            releaseFirst.open()
+            releaseSecond.open()
+        }
+
+        await stage(abandonedBundle, with: importer)
+        guard importer.pending?.manifest.recording.id == abandoned.id else {
+            return XCTFail("the abandoned bundle never staged")
+        }
+        let abandonedImport = Task { @MainActor in await importer.confirm() }
+        guard await waitUntil { firstCopied.opened } else {
+            await releaseFirst.open()
+            await abandonedImport.value
+            return XCTFail("confirm() never reached the abandoned audio copy")
+        }
+        importer.cancel()
+        XCTAssertNil(importer.pending)
+
+        importer.handleOpen(replacementBundle)
+        guard await waitUntil({ importer.pending?.manifest.recording.id == replacement.id }) else {
+            await releaseFirst.open()
+            await abandonedImport.value
+            return XCTFail("the replacement bundle never staged")
+        }
+        let replacementPending = importer.pending
+        let stagedReplacement = importer.libraryWorkState
+        XCTAssertFalse(stagedReplacement.isIdle)
+
+        let replacementImport = Task { @MainActor in await importer.confirm() }
+        guard await waitUntil { secondCopied.opened } else {
+            await releaseFirst.open()
+            await releaseSecond.open()
+            await abandonedImport.value
+            await replacementImport.value
+            return XCTFail("confirm() never reached the replacement audio copy")
+        }
+        XCTAssertTrue(importer.isImporting)
+        XCTAssertEqual(importer.pending?.id, replacementPending?.id)
+        let whenReplacementCopying = importer.libraryWorkState
+        XCTAssertEqual(whenReplacementCopying.generation, stagedReplacement.generation &+ 1,
+                       "the newer confirm admits its lifetime before its copy")
+        let partialsWithBothOwners = recordingsDirectoryNames(storeB).filter { $0.hasSuffix(".partial") }
+        XCTAssertEqual(partialsWithBothOwners.count, 2,
+                       "each in-flight confirm copies into its own fresh .partial")
+
+        // The older, canceled copy unwinds while the newer owner is copying.
+        await releaseFirst.open()
+        await abandonedImport.value
+
+        XCTAssertTrue(importer.isImporting, "the older defer must not clear the newer owner's slot")
+        XCTAssertEqual(importer.pending?.id, replacementPending?.id,
+                       "the older copy must not clear the newer preview")
+        let afterOlder = importer.libraryWorkState
+        XCTAssertFalse(afterOlder.isIdle)
+        XCTAssertEqual(afterOlder.generation, whenReplacementCopying.generation &+ 1,
+                       "only the older lifetime retires here")
+        XCTAssertTrue(storeB.recordings.isEmpty, "the older copy never publishes, even late")
+        XCTAssertNil(importer.lastImport)
+        let survivingPartials = recordingsDirectoryNames(storeB).filter { $0.hasSuffix(".partial") }
+        XCTAssertEqual(survivingPartials.count, 1, "the older copy removes only its own .partial")
+        XCTAssertTrue(Set(survivingPartials).isSubset(of: Set(partialsWithBothOwners)))
+        let survivor = try XCTUnwrap(survivingPartials.first)
+
+        // The newer owner finishes normally; the surviving copy is its audio.
+        await releaseSecond.open()
+        await replacementImport.value
+
+        XCTAssertTrue(importer.libraryWorkState.isIdle)
+        XCTAssertEqual(importer.libraryWorkState.generation, afterOlder.generation &+ 1,
+                       "the newer lifetime retires when its real import settles")
+        XCTAssertNil(importer.pending)
+        XCTAssertFalse(importer.isImporting)
+        XCTAssertEqual(storeB.recordings.map(\.id), [replacement.id])
+        XCTAssertEqual(importer.lastImport?.recordingID, replacement.id)
+        let imported = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertEqual(String(survivor.dropLast(".partial".count)), imported.audioFileName,
+                       "the newer owner's .partial becomes its audio, untouched by the old cleanup")
+        XCTAssertFalse(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") })
+        XCTAssertFalse(storeB.recordings.contains { $0.id == abandoned.id })
+    }
+
+    /// A staged preview is itself readiness. The real folder-change entry and
+    /// final gate must refuse while it is pending, so it cannot be carried
+    /// into another library; the refusal must not drop the still-valid import
+    /// from the current library.
+    func test_pending_preview_refuses_a_real_library_switch_and_the_import_stays_local() async throws {
+        let original = try makeCompletedRecording(in: storeA, title: "Local share")
+        let bundle = try await export(original, from: storeA)
+        let importer = makeImporter()
+        let destination = scratch.appendingPathComponent("switch-library", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let storage = makeStorageSettings(limitBytes: Int64(4) << 30)
+        let readiness = RecordingLibraryReadiness(providers: [
+            { self.storeB.libraryMigrationWorkState },
+            { importer.libraryWorkState },
+        ])
+        let coordinator = RecordingLocationCoordinator(
+            store: storeB, storage: storage, readiness: readiness,
+            capacity: { _ in 8_589_934_592 },
+            commitSelection: { _ in true })
+        let oldDirectory = storeB.recordingsDirectory
+
+        await stage(bundle, with: importer)
+        guard importer.pending != nil else {
+            return XCTFail("the preview never staged")
+        }
+        XCTAssertFalse(importer.libraryWorkState.isIdle)
+
+        await coordinator.inspectSelection(destination)
+        guard case .failure(let message) = coordinator.phase else {
+            return XCTFail("the switch should refuse while a preview is pending, got \(coordinator.phase)")
+        }
+        XCTAssertTrue(message.contains("shared recording import"), message)
+        XCTAssertEqual(storeB.recordingsDirectory, oldDirectory, "the library did not switch")
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+            "refusal writes no index into the destination")
+
+        // The preview is still the current library's import: refusing the
+        // switch must not silently discard it.
+        await importer.confirm()
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertEqual(storeB.recordings.map(\.id), [original.id])
+        XCTAssertEqual(importer.lastImport?.recordingID, original.id)
+        XCTAssertEqual(storeB.recordingsDirectory, oldDirectory)
+        XCTAssertTrue(importer.libraryWorkState.isIdle)
+    }
+
+    func test_cancel_without_a_queued_import_stays_busy_until_copy_unwinds() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let entered = Latch()
+        let release = Latch()
+        defer { release.open() }
+        let importer = makeImporter(copyAudio: { source, destination in
+            try FileManager.default.copyItem(at: source, to: destination)
+            await entered.open()
+            await release.wait()
+        })
+        await stage(bundle, with: importer)
+        let work = Task { await importer.confirm() }
+        let reached = await waitUntil { entered.opened }
+        guard reached else {
+            release.open()
+            await work.value
+            return XCTFail("Copy never reached the held boundary")
+        }
+        importer.cancel()
+        XCTAssertNil(importer.pending)
+        XCTAssertFalse(importer.isImporting)
+        let canceled = importer.libraryWorkState
+        XCTAssertFalse(canceled.isIdle, "Canceled detached copy still owns work without any queued preview")
+        release.open()
+        await work.value
+        XCTAssertTrue(importer.libraryWorkState.isIdle)
+        XCTAssertGreaterThan(importer.libraryWorkState.generation, canceled.generation)
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertFalse(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") })
+    }
+
+    func test_stale_preview_cannot_replace_same_uuid_after_direct_library_activation() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let importer = makeImporter()
+        await stage(try await export(original, from: storeA), with: importer)
+        XCTAssertNotNil(importer.pending)
+        let destination = scratch.appendingPathComponent("NewLibrary", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var newer = original
+        newer.title = "Destination owns this UUID"
+        let layout = try RecordingLibraryInspection.Layout(directory: destination, defaultRoot: rootB)
+        try storeB.activatePrepared(.init(layout: layout, recordings: [newer], folders: []),
+                                    expectedActivity: storeB.libraryActivity.snapshot,
+                                    commitSelection: {})
+        importer.resetLibraryContext()
+        await importer.confirm()
+        XCTAssertEqual(importer.errorMessage, RecordingShareImporter.ImportError.libraryChanged.errorDescription)
+        XCTAssertNil(importer.pending)
+        XCTAssertEqual(storeB.recordings.map(\.title), [newer.title])
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty,
+                      "Stale confirmation must not copy or publish into the new library")
+    }
+
+    func test_copy_resumption_cannot_publish_after_direct_library_activation() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let entered = Latch()
+        let release = Latch()
+        defer { release.open() }
+        let importer = makeImporter(copyAudio: { source, destination in
+            try FileManager.default.copyItem(at: source, to: destination)
+            await entered.open()
+            await release.wait()
+        })
+        await stage(bundle, with: importer)
+        let oldDirectory = storeB.recordingsDirectory
+        let work = Task { await importer.confirm() }
+        let reached = await waitUntil { entered.opened }
+        guard reached else {
+            release.open()
+            await work.value
+            return XCTFail("Copy never reached the held boundary")
+        }
+        let destination = scratch.appendingPathComponent("ResumedLibrary", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        var newer = original
+        newer.title = "New library row"
+        let layout = try RecordingLibraryInspection.Layout(directory: destination, defaultRoot: rootB)
+        try storeB.activatePrepared(.init(layout: layout, recordings: [newer], folders: []),
+                                    expectedActivity: storeB.libraryActivity.snapshot,
+                                    commitSelection: {})
+        importer.resetLibraryContext()
+        release.open()
+        await work.value
+        XCTAssertEqual(importer.errorMessage, RecordingShareImporter.ImportError.libraryChanged.errorDescription)
+        XCTAssertEqual(storeB.recordings.map(\.title), [newer.title])
+        XCTAssertTrue(importer.libraryWorkState.isIdle)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: oldDirectory.path)
+            .contains { $0.hasSuffix(".partial") })
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
     }
 
     func test_update_takes_the_bundle_content_but_keeps_the_local_folder_and_removes_old_files() async throws {

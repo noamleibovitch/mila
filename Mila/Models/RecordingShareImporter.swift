@@ -40,6 +40,7 @@ final class RecordingShareImporter: ObservableObject {
         case recordingBusy
         case storageCap(String)
         case saveFailed
+        case libraryChanged
 
         var errorDescription: String? {
             switch self {
@@ -47,6 +48,8 @@ final class RecordingShareImporter: ObservableObject {
                 return "Your copy of this recording is being transcribed right now. Try again when it finishes."
             case .storageCap(let detail):
                 return detail
+            case .libraryChanged:
+                return "The recordings folder changed. Open the shared recording again to import it here."
             case .saveFailed:
                 return "Couldn't save the imported recording to your library."
             }
@@ -55,6 +58,7 @@ final class RecordingShareImporter: ObservableObject {
 
     struct PendingImport: Identifiable {
         let id = UUID()
+        let libraryContext: RecordingLibraryActivity.Context
         let manifest: ShareManifest
         let stagingDirectory: URL
         let audioURL: URL
@@ -167,7 +171,7 @@ final class RecordingShareImporter: ObservableObject {
     }
 
     var libraryWorkState: RecordingLibraryWorkState {
-        if !queue.isEmpty || isStaging || isImporting || pending != nil || stageTicket != nil {
+        if !queue.isEmpty || isStaging || isImporting || pending != nil || stageTicket != nil || !libraryLedger.outstanding.isEmpty {
             return .busy("Shared recording import", "Finish the shared recording import before changing folders.",
                          generation: libraryLedger.generation)
         }
@@ -250,12 +254,13 @@ final class RecordingShareImporter: ObservableObject {
         // `pending`, leaking the loser's staging directory.
         isStaging = true
         stageTicket = libraryLedger.begin()
-        Task { await stage(next) }
+        let context = store.libraryActivity.context
+        Task { await stage(next, libraryContext: context) }
     }
 
     // MARK: - Stage
 
-    private func stage(_ url: URL) async {
+    private func stage(_ url: URL, libraryContext: RecordingLibraryActivity.Context) async {
         defer {
             isStaging = false
             if let ticket = stageTicket {
@@ -366,7 +371,9 @@ final class RecordingShareImporter: ObservableObject {
             }
             let disposition: Disposition = existing.map { .update(existing: $0) } ?? .add
 
+            guard store.admitLibraryInput(libraryContext) else { throw ImportError.libraryChanged }
             pending = PendingImport(
+                libraryContext: libraryContext,
                 manifest: manifest,
                 stagingDirectory: dir,
                 audioURL: audioURL,
@@ -549,6 +556,10 @@ final class RecordingShareImporter: ObservableObject {
         // A DIFFERENT pending import (the user cancelled, the next bundle
         // staged) may start even if the abandoned copy is still unwinding.
         guard let pending, inFlightTicket != pending.id else { return }
+        guard store.admitLibraryInput(pending.libraryContext) else {
+            finish(pending, error: ImportError.libraryChanged)
+            return
+        }
         let ticket = pending.id
         let lifetime = libraryLedger.begin()
         defer { libraryLedger.finish(lifetime) }
@@ -605,6 +616,11 @@ final class RecordingShareImporter: ObservableObject {
             // nothing of it may reach the library or the voice profiles.
             try? fileManager.removeItem(at: partial)
             log.log("import of \(manifest.recording.id, privacy: .public) cancelled during the audio copy")
+            return
+        }
+        guard store.admitLibraryInput(pending.libraryContext) else {
+            try? fileManager.removeItem(at: partial)
+            finish(pending, error: ImportError.libraryChanged)
             return
         }
         // The copy took as long as the audio is big, and the store can move
