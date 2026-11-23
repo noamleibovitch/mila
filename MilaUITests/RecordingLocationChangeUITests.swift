@@ -1092,7 +1092,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let confirmed = waitForRemovalConfirmation(reopened)
         let destructive = confirmed.buttons["action-button-1"]
         XCTAssertTrue(destructive.waitForExistence(timeout: 5))
-        XCTAssertEqual(destructive.title, "Remove incomplete copy")
+        XCTAssertEqual(destructive.label, "Remove incomplete copy")
         destructive.click()
 
         let outcome = reopened.staticTexts["storage.changeSheet.outcome"]
