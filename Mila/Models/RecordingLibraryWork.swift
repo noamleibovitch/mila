@@ -129,7 +129,7 @@ final class StartupRecoveryWork: ObservableObject {
     var isActive: Bool { ticket != nil }
 
     func begin() {
-        if ticket == nil { ticket = ledger.begin() }
+        // adverse control: omit whole-sweep ticket admission
     }
 
     func finish() {
