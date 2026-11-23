@@ -564,3 +564,101 @@ extension RecordingLibraryMigrationTests {
         }
     }
 }
+
+extension RecordingLibraryMigrationTests {
+    func test_midcopy_write_failure_leaves_source_and_no_published_library() throws {
+        try fixture { root in
+            let app = root.appendingPathComponent("ApplicationSupport")
+            let recordings = app.appendingPathComponent("Recordings")
+            let custom = root.appendingPathComponent("Custom")
+            let source = try RecordingLibraryInspection.Layout(directory: recordings, defaultRoot: app)
+            let destination = try RecordingLibraryInspection.Layout(directory: custom, defaultRoot: app)
+            let original = row()
+            let raw = try writeIndex([original], to: source.index)
+            let audio = Data(repeating: 7, count: 2_097_152)
+            try audio.write(to: recordings.appendingPathComponent("meeting.wav"))
+            try Data("Transcript".utf8).write(to: recordings.appendingPathComponent("meeting.txt"))
+            guard case .existing(let snapshot) = try RecordingLibraryInspection.inspect(source) else {
+                return XCTFail("source")
+            }
+            let plan = try RecordingLibraryMigration.makePlan(source: snapshot, destination: destination)
+            let stage = try RecordingLibraryMigration.createStage(for: plan)
+            let receipt = try XCTUnwrap(try RecordingLibraryMigration.loadReceipt(in: destination)?.1)
+            let files = stage.appendingPathComponent(RecordingLibraryMigration.stageFilesName)
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                                       ofItemAtPath: files.path)
+            }
+            XCTAssertThrowsError(try RecordingLibraryMigration.copy(plan, into: stage,
+                completedFile: { count in
+                    guard count == 1 else { return }
+                    do {
+                        try FileManager.default.setAttributes([.posixPermissions: 0o500],
+                                                              ofItemAtPath: files.path)
+                    } catch { XCTFail("Could not deny the stage files path: \(error)") }
+                })) {
+                XCTAssertEqual($0 as? RecordingLibraryMigration.Problem, .ioFailure)
+            }
+            XCTAssertEqual(try Data(contentsOf: source.index), raw)
+            XCTAssertEqual(try Data(contentsOf: recordings.appendingPathComponent("meeting.wav")), audio)
+            XCTAssertEqual(try Data(contentsOf: recordings.appendingPathComponent("meeting.txt")),
+                           Data("Transcript".utf8))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.index.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.directory
+                .appendingPathComponent("meeting.wav").path))
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: custom.path)),
+                           Set([stage.lastPathComponent]))
+            XCTAssertThrowsError(try RecordingLibraryInspection.inspect(destination)) {
+                XCTAssertEqual($0 as? RecordingLibraryInspection.Problem, .incompleteCopy)
+            }
+            XCTAssertThrowsError(try RecordingLibraryMigration.cleanup(stage: stage, receipt: receipt)) {
+                XCTAssertEqual($0 as? RecordingLibraryMigration.Problem, .unsafeReceipt)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+        }
+    }
+
+    func test_published_index_with_failed_cleanup_is_reinspected_as_complete() throws {
+        try fixture { root in
+            let app = root.appendingPathComponent("ApplicationSupport")
+            let recordings = app.appendingPathComponent("Recordings")
+            let custom = root.appendingPathComponent("Custom")
+            let source = try RecordingLibraryInspection.Layout(directory: recordings, defaultRoot: app)
+            let destination = try RecordingLibraryInspection.Layout(directory: custom, defaultRoot: app)
+            let original = row()
+            let raw = try writeIndex([original], to: source.index)
+            let audio = Data("audio bytes".utf8)
+            try audio.write(to: recordings.appendingPathComponent("meeting.wav"))
+            guard case .existing(let snapshot) = try RecordingLibraryInspection.inspect(source) else {
+                return XCTFail("source")
+            }
+            let plan = try RecordingLibraryMigration.makePlan(source: snapshot, destination: destination)
+            let stage = try RecordingLibraryMigration.createStage(for: plan)
+            try RecordingLibraryMigration.copy(plan, into: stage)
+            try RecordingLibraryMigration.publish(plan, stage: stage)
+            let planted = stage.appendingPathComponent(RecordingLibraryMigration.stageFilesName)
+                .appendingPathComponent("external.txt")
+            let plantedBytes = Data("external".utf8)
+            try plantedBytes.write(to: planted)
+            _ = try XCTUnwrap(try RecordingLibraryMigration.loadReceipt(in: destination))
+            XCTAssertThrowsError(try RecordingLibraryMigration.removeStageOnly(stage)) {
+                XCTAssertEqual($0 as? RecordingLibraryMigration.Problem, .unsafeReceipt)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+            XCTAssertEqual(try Data(contentsOf: planted), plantedBytes)
+
+            guard case .existing(let reinspected) = try RecordingLibraryInspection.inspect(destination) else {
+                return XCTFail("published library must reinspect as existing")
+            }
+            XCTAssertEqual(reinspected.indexBytes, raw)
+            XCTAssertEqual(reinspected.recordings.map(\.id), [original.id])
+            XCTAssertEqual(try Data(contentsOf: destination.directory.appendingPathComponent("meeting.wav")),
+                           audio)
+            _ = try XCTUnwrap(try RecordingLibraryMigration.loadReceipt(in: destination))
+
+            XCTAssertThrowsError(try RecordingLibraryMigration.removeStageOnly(stage))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+            XCTAssertEqual(try Data(contentsOf: planted), plantedBytes)
+        }
+    }
+}

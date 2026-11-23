@@ -155,3 +155,65 @@ extension RecordingLibraryFileCopyTests {
         }
     }
 }
+
+extension RecordingLibraryFileCopyTests {
+    func test_midcopy_source_byte_change_with_identical_size_is_refused_as_changed() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("mutable.wav")
+            let original = Data(repeating: 7, count: 2_097_152)
+            let altered = Data(repeating: 9, count: original.count)
+            try original.write(to: source)
+            let manifest = try RecordingLibraryFileCopy.inspect([source])
+            var mutated = false
+            XCTAssertThrowsError(try RecordingLibraryFileCopy.copy(manifest, into: stage,
+                progress: { _ in
+                    guard !mutated else { return }
+                    mutated = true
+                    do {
+                        try altered.write(to: source)
+                    } catch { XCTFail("Could not mutate the source mid-copy: \(error)") }
+                })) {
+                XCTAssertEqual($0 as? RecordingLibraryFileCopy.Problem, .changed)
+            }
+            XCTAssertTrue(mutated)
+            XCTAssertEqual(try Data(contentsOf: source), altered)
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                           Set(["mutable.wav", stage.lastPathComponent]),
+                           "A failed copy must not publish anything outside its hidden stage")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: stage.path),
+                           ["mutable.wav"])
+        }
+    }
+
+    func test_midcopy_write_failure_from_stage_path_denial_keeps_source_and_hidden_partial() throws {
+        try fixture { root, stage in
+            let first = root.appendingPathComponent("a.wav")
+            let second = root.appendingPathComponent("b.wav")
+            let firstBytes = Data("first".utf8)
+            let secondBytes = Data("second".utf8)
+            try firstBytes.write(to: first)
+            try secondBytes.write(to: second)
+            let manifest = try RecordingLibraryFileCopy.inspect([first, second])
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                                       ofItemAtPath: stage.path)
+            }
+            XCTAssertThrowsError(try RecordingLibraryFileCopy.copy(manifest, into: stage,
+                completedFile: { count in
+                    guard count == 1 else { return }
+                    do {
+                        try FileManager.default.setAttributes([.posixPermissions: 0o500],
+                                                              ofItemAtPath: stage.path)
+                    } catch { XCTFail("Could not deny the stage path: \(error)") }
+                })) {
+                XCTAssertEqual($0 as? RecordingLibraryFileCopy.Problem, .ioFailure)
+            }
+            XCTAssertEqual(try Data(contentsOf: first), firstBytes)
+            XCTAssertEqual(try Data(contentsOf: second), secondBytes)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: stage.path), ["a.wav"])
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                           Set(["a.wav", "b.wav", stage.lastPathComponent]),
+                           "Only the hidden stage may hold a partial copy")
+        }
+    }
+}

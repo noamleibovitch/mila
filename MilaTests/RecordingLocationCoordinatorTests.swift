@@ -599,3 +599,79 @@ extension RecordingLocationCoordinatorTests {
         XCTAssertEqual(try Data(contentsOf: source), Data("source".utf8))
     }
 }
+
+extension RecordingLocationCoordinatorTests {
+    func test_source_byte_change_then_revert_during_copy_refuses_through_store_activity() async throws {
+        var original = row("Transcript", audio: "meeting.wav")
+        original.fullText = "Original transcript"
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let sidecar = root.appendingPathComponent("Recordings/meeting.txt")
+        let originalSidecar = try Data(contentsOf: sidecar)
+        XCTAssertEqual(originalSidecar, Data("Original transcript".utf8))
+        var mutations = 0
+        coordinator = RecordingLocationCoordinator(store: store, storage: storage, readiness: readiness,
+                                                   beforeFinalVerification: {
+            var changed = original
+            changed.fullText = "Changed transcript"
+            XCTAssertTrue(self.store.update(changed))
+            mutations += 1
+            XCTAssertEqual(try? Data(contentsOf: sidecar), Data("Changed transcript".utf8))
+            XCTAssertTrue(self.store.update(original))
+            mutations += 1
+        })
+        let destination = try makeCustom("ByteRevert")
+        await coordinator.inspectSelection(destination)
+        coordinator.select(.copy)
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        XCTAssertEqual(mutations, 2, "The source bytes changed and were reverted before the final check")
+        guard case .failure(let message) = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertTrue(message.contains("still using"))
+        XCTAssertEqual(try Data(contentsOf: sidecar), originalSidecar)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destination.path)
+            .filter { $0 != ".DS_Store" }, [])
+        XCTAssertEqual(store.recordingsDirectory.standardizedFileURL,
+                       root.appendingPathComponent("Recordings").standardizedFileURL)
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertEqual(store.recordings.map(\.id), [original.id])
+    }
+
+    func test_failed_transcript_rewrite_and_removal_blocks_migration_entry() async throws {
+        let segments = [
+            TranscriptSegment(start: 0, end: 1, text: " one"),
+            TranscriptSegment(start: 1, end: 2, text: " two")
+        ]
+        var original = row("Trim", audio: "meeting.wav")
+        original.segments = segments
+        original.fullText = "one two"
+        try writeLibrary([original], at: root.appendingPathComponent("Recordings"), layout: false,
+                         files: ["meeting.wav": "audio"])
+        store.add(original)
+        let recordings = root.appendingPathComponent("Recordings")
+        let sidecar = recordings.appendingPathComponent("meeting.txt")
+        let stale = try Data(contentsOf: sidecar)
+        let manager = FileManager.default
+        try manager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: recordings.path)
+        defer {
+            try? manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: recordings.path)
+        }
+
+        XCTAssertNotNil(store.deleteSegments([segments[0].id], recordingID: original.id))
+        XCTAssertEqual(try Data(contentsOf: sidecar), stale,
+                       "The stale sidecar survived both the failed rewrite and the failed removal")
+        XCTAssertTrue(store.trimNotice?.contains("couldn't update the transcript's text file") == true)
+        XCTAssertFalse(store.libraryMigrationWorkState.isIdle)
+        XCTAssertEqual(store.libraryMigrationWorkState.reason, "Library changes are not saved yet.")
+
+        let destination = try makeCustom("BusyUnsavedTranscript")
+        await coordinator.inspectSelection(destination)
+        guard case .failure(let message) = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertTrue(message.contains("Finish"))
+        XCTAssertEqual(try manager.contentsOfDirectory(atPath: destination.path), [])
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertEqual(store.recordingsDirectory.standardizedFileURL,
+                       root.appendingPathComponent("Recordings").standardizedFileURL)
+    }
+}
