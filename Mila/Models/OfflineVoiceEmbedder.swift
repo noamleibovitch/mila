@@ -531,6 +531,7 @@ final class OfflineVoiceEmbedder {
     private func spawn(_ body: @escaping @Sendable () async -> Void) {
         let token = UUID()
         let ticket = libraryLedger.begin()
+        libraryLedger.finish(ticket) // adverse control: premature retirement
         pending[token] = Task.detached(priority: .utility) { [weak self] in
             await body()
             await MainActor.run {
