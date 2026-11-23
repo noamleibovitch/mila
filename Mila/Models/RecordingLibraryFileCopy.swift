@@ -44,11 +44,16 @@ enum RecordingLibraryFileCopy {
 
     /// On failure, leaves only newly created files in the owned hidden stage.
     /// Caller cleanup must use the receipt and may never remove the source.
+    /// `chunkRead`/`chunkWrite` are per-call deterministic I/O seams for held
+    /// worker tests. Production leaves both nil, which uses the real
+    /// `FileHandle.read(upToCount:)` and `write(contentsOf:)` calls unchanged.
     static func copy(_ entries: [Entry], into stage: URL,
                      cancellation: () throws -> Void = {},
                      progress: (UInt64) -> Void = { _ in },
                      completedFile: (Int) -> Void = { _ in },
-                     created: (String, UInt64, UInt64) -> Void = { _, _, _ in }) throws {
+                     created: (String, UInt64, UInt64) -> Void = { _, _, _ in },
+                     chunkRead: ((FileHandle, Int) throws -> Data?)? = nil,
+                     chunkWrite: ((FileHandle, Data) throws -> Void)? = nil) throws {
         let fm = FileManager.default
         let normalized = stage.standardizedFileURL
         guard normalized == normalized.resolvingSymlinksInPath(),
@@ -87,9 +92,18 @@ enum RecordingLibraryFileCopy {
             var length: UInt64 = 0
             while true {
                 try cancellation()
-                let bytes = try reader.read(upToCount: 1_048_576) ?? Data()
+                let bytes: Data
+                if let chunkRead {
+                    bytes = try chunkRead(reader, 1_048_576) ?? Data()
+                } else {
+                    bytes = try reader.read(upToCount: 1_048_576) ?? Data()
+                }
                 if bytes.isEmpty { break }
-                try writer.write(contentsOf: bytes)
+                if let chunkWrite {
+                    try chunkWrite(writer, bytes)
+                } else {
+                    try writer.write(contentsOf: bytes)
+                }
                 hash.update(data: bytes)
                 length += UInt64(bytes.count)
                 guard length <= entry.size else { throw Problem.changed }

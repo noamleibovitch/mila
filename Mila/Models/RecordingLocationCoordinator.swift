@@ -93,6 +93,9 @@ final class RecordingLocationCoordinator: ObservableObject {
     /// Optional deterministic verification boundary for held-worker tests.
     /// Production leaves it nil; no suspension is added to the commit turn.
     private let beforeFinalVerification: (@MainActor () async -> Void)?
+    /// Optional deterministic chunk-write fault seam for held-worker tests.
+    /// Production leaves it nil, so the real `FileHandle.write` is used.
+    private let chunkWrite: (@Sendable (FileHandle, Data) throws -> Void)?
     private let commitFolderSelection: (RecordingStorageSettings.PreparedSelection) -> Bool
     private let fileManager = FileManager.default
 
@@ -125,8 +128,10 @@ final class RecordingLocationCoordinator: ObservableObject {
          readiness: RecordingLibraryReadiness,
          capacity: @escaping (URL) -> UInt64? = RecordingLibraryMigration.availableCapacity,
          commitSelection: ((RecordingStorageSettings.PreparedSelection) -> Bool)? = nil,
-         beforeFinalVerification: (@MainActor () async -> Void)? = nil) {
+         beforeFinalVerification: (@MainActor () async -> Void)? = nil,
+         chunkWrite: (@Sendable (FileHandle, Data) throws -> Void)? = nil) {
         self.beforeFinalVerification = beforeFinalVerification
+        self.chunkWrite = chunkWrite
         self.capacity = capacity
         self.commitFolderSelection = commitSelection ?? { storage.commitSelection($0) }
         self.store = store
@@ -586,6 +591,7 @@ final class RecordingLocationCoordinator: ObservableObject {
                          url: URL) async {
         let operationID = UUID()
         let flag = cancellation
+        let writeChunk = chunkWrite
         var stage: URL?
         var receipt: RecordingLibraryMigration.Receipt?
         do {
@@ -621,7 +627,8 @@ final class RecordingLocationCoordinator: ObservableObject {
                             self?.publishProgress(copied: copied, total: source.byteCount,
                                                  done: min(completed, total.count), files: total.count)
                         }
-                    }, completedFile: { count in done = count })
+                    }, completedFile: { count in done = count },
+                    chunkWrite: writeChunk)
             }.value
             publishProgress(copied: source.byteCount, total: source.byteCount,
                             done: total.count, files: total.count)

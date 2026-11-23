@@ -217,3 +217,82 @@ extension RecordingLibraryFileCopyTests {
         }
     }
 }
+
+extension RecordingLibraryFileCopyTests {
+    func test_short_read_chunks_still_copy_and_hash_verify_entire_file() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("streamed.wav")
+            let bytes = Data(repeating: 7, count: 40_000)
+            try bytes.write(to: source)
+            let entries = try RecordingLibraryFileCopy.inspect([source])
+            var reads = 0
+            var copied: UInt64 = 0
+            try RecordingLibraryFileCopy.copy(entries, into: stage,
+                progress: { copied = $0 },
+                chunkRead: { handle, requested in
+                    reads += 1
+                    return try handle.read(upToCount: min(requested, 3_001))
+                })
+            XCTAssertGreaterThan(reads, 1, "The real reader must have returned smaller chunks")
+            XCTAssertEqual(copied, UInt64(bytes.count))
+            XCTAssertEqual(try Data(contentsOf: stage.appendingPathComponent("streamed.wav")), bytes)
+            XCTAssertEqual(try RecordingLibraryMigration.digest(
+                stage.appendingPathComponent("streamed.wav")), entries[0].digest)
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+        }
+    }
+
+    func test_silent_short_write_is_refused_as_changed_and_leaves_source_untouched() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("silent.wav")
+            let bytes = Data(repeating: 7, count: 8_192)
+            try bytes.write(to: source)
+            let entries = try RecordingLibraryFileCopy.inspect([source])
+            var wrote = false
+            XCTAssertThrowsError(try RecordingLibraryFileCopy.copy(entries, into: stage,
+                chunkWrite: { handle, data in
+                    wrote = true
+                    try handle.write(contentsOf: Data(data.prefix(max(1, data.count / 2))))
+                })) {
+                XCTAssertEqual($0 as? RecordingLibraryFileCopy.Problem, .changed)
+            }
+            XCTAssertTrue(wrote)
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                           Set(["silent.wav", stage.lastPathComponent]),
+                           "A silent short write must not publish anything outside the hidden stage")
+            let staged = try Data(contentsOf: stage.appendingPathComponent("silent.wav"))
+            XCTAssertLessThan(staged.count, bytes.count,
+                              "The staged bytes stay short, so only the post-copy verification can refuse")
+        }
+    }
+
+    func test_injected_enospc_after_prefix_write_is_refused_and_keeps_hidden_partial() throws {
+        try fixture { root, stage in
+            let source = root.appendingPathComponent("full.wav")
+            let bytes = Data(repeating: 7, count: 8_192)
+            try bytes.write(to: source)
+            let entries = try RecordingLibraryFileCopy.inspect([source])
+            var wrotePrefix = false
+            XCTAssertThrowsError(try RecordingLibraryFileCopy.copy(entries, into: stage,
+                chunkWrite: { handle, data in
+                    try handle.write(contentsOf: Data(data.prefix(max(1, data.count / 2))))
+                    wrotePrefix = true
+                    throw POSIXError(.ENOSPC)
+                })) { error in
+                guard let posix = error as? POSIXError else {
+                    return XCTFail("Expected the injected POSIXError, got \(error)")
+                }
+                XCTAssertEqual(posix.code, .ENOSPC)
+            }
+            XCTAssertTrue(wrotePrefix, "A real prefix must reach the opened stage descriptor first")
+            XCTAssertEqual(try Data(contentsOf: source), bytes)
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)),
+                           Set(["full.wav", stage.lastPathComponent]),
+                           "The injected failure must not publish anything outside the hidden stage")
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: stage.path), ["full.wav"])
+            XCTAssertLessThan(try Data(contentsOf: stage.appendingPathComponent("full.wav")).count,
+                              bytes.count)
+        }
+    }
+}

@@ -676,3 +676,56 @@ extension RecordingLocationCoordinatorTests {
                        root.appendingPathComponent("Recordings").standardizedFileURL)
     }
 }
+
+extension RecordingLocationCoordinatorTests {
+    func test_injected_enospc_during_real_copy_refuses_and_retains_unverified_stage() async throws {
+        let original = row()
+        let originals = root.appendingPathComponent("Recordings")
+        try writeLibrary([original], at: originals, layout: false,
+                         files: ["meeting.wav": "audio", "meeting.txt": "Transcript"])
+        store.add(original)
+        let originalIndex = try Data(contentsOf: root.appendingPathComponent("recordings.json"))
+        let originalAudio = try Data(contentsOf: originals.appendingPathComponent("meeting.wav"))
+        let previous = store.recordingsDirectory
+        let destination = try makeCustom("InjectedENOSPC")
+        coordinator = RecordingLocationCoordinator(store: store, storage: storage, readiness: readiness,
+                                                   chunkWrite: { handle, data in
+            try handle.write(contentsOf: Data(data.prefix(max(1, data.count / 2))))
+            throw POSIXError(.ENOSPC)
+        })
+        await coordinator.inspectSelection(destination)
+        XCTAssertEqual(coordinator.preview?.choices, [.copy, .startFresh])
+        coordinator.select(.copy)
+        await coordinator.continueSelection()
+        await coordinator.awaitOperationSettled()
+        guard case .failure(let message) = coordinator.phase else { return XCTFail("\(coordinator.phase)") }
+        XCTAssertTrue(message.contains("Mila couldn’t change the recordings folder"))
+        XCTAssertTrue(message.contains("still using"))
+        XCTAssertTrue(message.contains("retained the incomplete copy because it couldn’t verify safe removal"))
+        XCTAssertEqual(store.recordingsDirectory.standardizedFileURL,
+                       root.appendingPathComponent("Recordings").standardizedFileURL)
+        XCTAssertEqual(store.recordings.map(\.id), [original.id])
+        XCTAssertNil(defaults.data(forKey: RecordingStorageSettings.bookmarkKey))
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("recordings.json")), originalIndex)
+        XCTAssertEqual(try Data(contentsOf: originals.appendingPathComponent("meeting.wav")), originalAudio)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("recordings.json").path),
+                       "No published index may appear after the injected write failure")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("meeting.wav").path))
+        let stages = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+            .filter { $0.hasPrefix(RecordingLibraryMigration.stagePrefix) }
+        XCTAssertEqual(stages.count, 1)
+        let stage = destination.appendingPathComponent(stages[0])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path))
+        let staged = stage.appendingPathComponent(RecordingLibraryMigration.stageFilesName)
+        let stagedNames = try FileManager.default.contentsOfDirectory(atPath: staged.path)
+        XCTAssertFalse(stagedNames.isEmpty)
+        let stagedSizes = try stagedNames.map { name -> Int in
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: staged.appendingPathComponent(name).path)
+            return (attributes[.size] as? NSNumber)?.intValue ?? 0
+        }
+        XCTAssertTrue(stagedSizes.contains { $0 > 0 },
+                      "The injected failure happens after a real prefix write")
+        XCTAssertEqual(store.recordingsDirectory, previous)
+    }
+}

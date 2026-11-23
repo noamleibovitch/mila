@@ -662,3 +662,56 @@ extension RecordingLibraryMigrationTests {
         }
     }
 }
+
+extension RecordingLibraryMigrationTests {
+    func test_injected_enospc_after_prefix_write_leaves_no_published_library() throws {
+        try fixture { root in
+            let app = root.appendingPathComponent("ApplicationSupport")
+            let recordings = app.appendingPathComponent("Recordings")
+            let custom = root.appendingPathComponent("Custom")
+            let source = try RecordingLibraryInspection.Layout(directory: recordings, defaultRoot: app)
+            let destination = try RecordingLibraryInspection.Layout(directory: custom, defaultRoot: app)
+            let original = row()
+            let raw = try writeIndex([original], to: source.index)
+            let audio = Data(repeating: 7, count: 8_192)
+            try audio.write(to: recordings.appendingPathComponent("meeting.wav"))
+            let transcript = Data("Transcript".utf8)
+            try transcript.write(to: recordings.appendingPathComponent("meeting.txt"))
+            guard case .existing(let snapshot) = try RecordingLibraryInspection.inspect(source) else {
+                return XCTFail("source")
+            }
+            let plan = try RecordingLibraryMigration.makePlan(source: snapshot, destination: destination)
+            let stage = try RecordingLibraryMigration.createStage(for: plan)
+            let receipt = try XCTUnwrap(try RecordingLibraryMigration.loadReceipt(in: destination)?.1)
+            var wrotePrefix = false
+            XCTAssertThrowsError(try RecordingLibraryMigration.copy(plan, into: stage,
+                chunkWrite: { handle, data in
+                    try handle.write(contentsOf: Data(data.prefix(max(1, data.count / 2))))
+                    wrotePrefix = true
+                    throw POSIXError(.ENOSPC)
+                })) { error in
+                guard let posix = error as? POSIXError else {
+                    return XCTFail("Expected the injected POSIXError, got \(error)")
+                }
+                XCTAssertEqual(posix.code, .ENOSPC)
+            }
+            XCTAssertTrue(wrotePrefix, "The injected failure happens after a real prefix write")
+            XCTAssertEqual(try Data(contentsOf: source.index), raw)
+            XCTAssertEqual(try Data(contentsOf: recordings.appendingPathComponent("meeting.wav")), audio)
+            XCTAssertEqual(try Data(contentsOf: recordings.appendingPathComponent("meeting.txt")), transcript)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.index.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.directory
+                .appendingPathComponent("meeting.wav").path))
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: custom.path)),
+                           Set([stage.lastPathComponent]))
+            XCTAssertThrowsError(try RecordingLibraryInspection.inspect(destination)) {
+                XCTAssertEqual($0 as? RecordingLibraryInspection.Problem, .incompleteCopy)
+            }
+            XCTAssertThrowsError(try RecordingLibraryMigration.cleanup(stage: stage, receipt: receipt)) {
+                XCTAssertEqual($0 as? RecordingLibraryMigration.Problem, .unsafeReceipt)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stage.path),
+                          "Ownership cannot be proven, so the stage is retained")
+        }
+    }
+}

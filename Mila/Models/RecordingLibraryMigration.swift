@@ -150,10 +150,14 @@ enum RecordingLibraryMigration {
     /// Copy every verified source byte into the hidden stage. The stage holds
     /// a flat `files/` directory plus the receipt; publication maps each file
     /// to its layout-specific destination.
+    /// `chunkWrite` is forwarded to the copy worker as a held-worker I/O seam.
+    /// Production leaves it nil, so the worker's real `FileHandle.write` is
+    /// used unchanged.
     static func copy(_ plan: Plan, into stage: URL,
                      cancellation: () throws -> Void = {},
                      progress: (UInt64) -> Void = { _ in },
-                     completedFile: (Int) -> Void = { _ in }) throws {
+                     completedFile: (Int) -> Void = { _ in },
+                     chunkWrite: ((FileHandle, Data) throws -> Void)? = nil) throws {
         let fm = FileManager.default
         guard stage.lastPathComponent.hasPrefix(stagePrefix),
               stage.standardizedFileURL == stage.resolvingSymlinksInPath(),
@@ -171,8 +175,9 @@ enum RecordingLibraryMigration {
                                           cancellation: cancellation, progress: progress,
                                           completedFile: completedFile,
                                           created: { name, device, inode in
-            created[name] = Receipt.FileIdentity(device: device, inode: inode)
-        })
+                                              created[name] = Receipt.FileIdentity(device: device, inode: inode)
+                                          },
+                                          chunkWrite: chunkWrite)
         // Creation identities become durable only once the whole copy has
         // been verified. A crash or cancellation before this point leaves
         // staged files without ownership proof, so cleanup retains them.
