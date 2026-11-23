@@ -1048,19 +1048,19 @@ final class SpeakerNameSuggestionTests: XCTestCase {
 /// synchronous so a `defer` can always unblock the parked call.
 @MainActor
 private final class SuggestionGate {
-    private var open = false
+    private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func open() {
-        guard !open else { return }
-        open = true
+        guard !isOpen else { return }
+        isOpen = true
         let pending = waiters
         waiters.removeAll()
         for continuation in pending { continuation.resume() }
     }
 
     func wait() async {
-        if open { return }
+        if isOpen { return }
         await withCheckedContinuation { waiters.append($0) }
     }
 }
