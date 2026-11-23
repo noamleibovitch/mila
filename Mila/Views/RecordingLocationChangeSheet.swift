@@ -250,6 +250,8 @@ struct RecordingLocationChangeSheet: View {
     private func incomplete(_ message: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             notice(message, systemImage: "exclamationmark.triangle.fill", tint: .orange)
+                .accessibilityIdentifier("storage.changeSheet.incompleteWarning")
+                .accessibilityLabel(message)
             HStack(spacing: 10) {
                 Button("Remove incomplete copy") { confirmingRemoval = true }
                     .accessibilityHint("Removes only the unchanged files Mila copied earlier. Your original recordings are not removed.")

@@ -199,8 +199,7 @@ final class RecordingLocationChangeUITests: XCTestCase {
     /// accessibility groups surface their text as a label, not a static text.
     private func renderedElement(_ app: XCUIApplication, labelContains fragment: String) -> XCUIElement {
         app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS[c] %@ OR value CONTAINS[c] %@",
-                                  fragment, fragment))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", fragment))
             .firstMatch
     }
 
@@ -1057,11 +1056,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
         _ = openStorage(reopened)
         chooseDestination(reopened)
 
-        XCTAssertTrue(renderedElement(reopened,
-                                     labelContains: "incomplete copy from an earlier attempt")
-                        .waitForExistence(timeout: 15),
+        let warning = reopened.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.incompleteWarning").firstMatch
+        XCTAssertTrue(warning.waitForExistence(timeout: 15),
                       "A cold reselect must surface the real incomplete copy")
-        XCTAssertTrue(renderedElement(reopened, labelContains: "Remove the incomplete copy").exists)
+        let warningText = visibleText(warning)
+        XCTAssertTrue(warningText.contains("incomplete copy from an earlier attempt"))
+        XCTAssertTrue(warningText.contains("Remove the incomplete copy"))
         let remove = reopened.buttons["Remove incomplete copy"]
         XCTAssertTrue(remove.waitForExistence(timeout: 5))
         remove.click()
