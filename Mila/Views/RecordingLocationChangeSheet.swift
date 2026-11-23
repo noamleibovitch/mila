@@ -211,6 +211,8 @@ struct RecordingLocationChangeSheet: View {
                             .foregroundStyle(.secondary)
                     } else {
                         notice(copySpaceWarning(preview), systemImage: "internaldrive", tint: .orange)
+                            .accessibilityIdentifier("storage.changeSheet.spaceWarning")
+                            .accessibilityLabel(copySpaceWarning(preview))
                     }
                 }
                 if let choice = coordinator.selectedChoice,

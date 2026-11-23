@@ -143,6 +143,7 @@ struct StorageSettingsTab: View {
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(busyText)
+                .accessibilityIdentifier("storage.busyReason")
             }
         }
         .padding(12)

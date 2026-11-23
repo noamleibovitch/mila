@@ -518,9 +518,12 @@ final class RecordingLocationChangeUITests: XCTestCase {
         chooseDestination(app)
 
         XCTAssertTrue(app.staticTexts["storage.changeSheet.title"].waitForExistence(timeout: 10))
-        let warning = renderedElement(app, labelContains: "Not enough space")
+        settingsWindowScreenshot(app, named: "Insufficient space before warning verification")
+        let warning = app.descendants(matching: .any)
+            .matching(identifier: "storage.changeSheet.spaceWarning").firstMatch
         XCTAssertTrue(warning.waitForExistence(timeout: 5),
                       "Insufficient space must render its required/available reason")
+        XCTAssertTrue(visibleText(warning).contains("Not enough space"))
         XCTAssertTrue(visibleText(warning).contains("needed"),
                       "The reason must state how much space the copy needs")
         XCTAssertTrue(visibleText(warning).contains("available"),
@@ -569,8 +572,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let useDefault = app.buttons["storage.resetDefault.button"]
         XCTAssertTrue(useDefault.exists)
         XCTAssertFalse(useDefault.isEnabled, "A busy library must refuse the default-folder check")
-        XCTAssertTrue(renderedElement(app, labelContains: "Synthetic busy state for native verification.")
-                        .waitForExistence(timeout: 10),
+        let busyReason = app.descendants(matching: .any)
+            .matching(identifier: "storage.busyReason").firstMatch
+        XCTAssertTrue(busyReason.waitForExistence(timeout: 10))
+        XCTAssertTrue(visibleText(busyReason).contains("Synthetic busy state for native verification."),
                       "The busy refusal must be visible, not silent")
 
         // Keyboard and VoiceOver users receive the refusal through the
