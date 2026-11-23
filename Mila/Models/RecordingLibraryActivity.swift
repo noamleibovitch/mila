@@ -91,7 +91,6 @@ final class RecordingLibraryActivity {
         committing = true
         // Even a failed attempt invalidates previously captured UI/work
         // contexts. Never restore an old epoch (switch-away-and-back ABA).
-        context = Context(id: UUID())
         defer { committing = false }
         return try operation(context)
     }
