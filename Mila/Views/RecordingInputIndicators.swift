@@ -24,6 +24,7 @@ struct RecordingInputIndicators: View {
     /// not audio cadence. Mirroring them in this leaf keeps the leg state
     /// ("Included" vs "Unavailable") honest after a watchdog rebuild without
     /// any parent observing the recorders.
+    @FocusState private var focusedLeg: LiveInputSource?
     @State private var micIsRunning = false
     @State private var systemIsRunning = false
 
@@ -65,7 +66,7 @@ struct RecordingInputIndicators: View {
             Toggle(isOn: Binding(
                 get: { included(leg) },
                 set: { requested in
-                    Task { await actions.setLiveSource(leg, included: requested) }
+                    changeSource(leg, included: requested)
                 }
             )) {
                 HStack(spacing: 6) {
@@ -79,6 +80,13 @@ struct RecordingInputIndicators: View {
             .toggleStyle(.switch)
             .controlSize(.small)
             .disabled(controlsDisabled)
+            .focusable()
+            .focused($focusedLeg, equals: leg)
+            .onKeyPress(.space) {
+                guard !controlsDisabled else { return .ignored }
+                changeSource(leg, included: !included(leg))
+                return .handled
+            }
             .help(leg.helpText)
             .accessibilityIdentifier(leg.toggleIdentifier)
             .accessibilityHint(leg.hint(for: stateText))
@@ -95,6 +103,18 @@ struct RecordingInputIndicators: View {
                                 label: leg.meterLabel,
                                 isActive: meterActive)
                 .frame(width: 84)
+        }
+    }
+
+    private func changeSource(_ leg: LiveInputSource, included: Bool) {
+        focusedLeg = leg
+        Task {
+            await actions.setLiveSource(leg, included: included)
+            // A disabled Starting switch can lose AppKit keyboard focus.
+            // Restore the invoking switch after the accepted change settles.
+            if actions.isRecording && !actions.isStoppingRecording {
+                focusedLeg = leg
+            }
         }
     }
 
@@ -151,6 +171,8 @@ struct RecordingInputIndicators: View {
                     .foregroundStyle(.orange)
                     .accessibilityHidden(true)
                 Text(message)
+                    .accessibilityLabel(message)
+                    .accessibilityIdentifier("recording.inputs.error.message")
                     .font(.caption)
                     .foregroundStyle(.primary)
                     .fixedSize(horizontal: false, vertical: true)
