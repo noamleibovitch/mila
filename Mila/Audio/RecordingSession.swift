@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 import OSLog
+import os
 import ScreenCaptureKit
 import TranscriptionCore
 
@@ -41,6 +42,181 @@ final class RecordingSession: ObservableObject {
     let system = SystemAudioRecorder()
 
     private(set) var source: RecordingSource = .microphone
+
+    // MARK: - Live source inclusion (mic/app toggles during a recording)
+
+    /// Accepted live inclusion of each capture leg. `source` above stays the
+    /// INITIAL metadata for the whole recording (title, saved
+    /// `Recording.source`, stop-time diagnostics); live routing keys on these
+    /// booleans plus `micLegOpened` / `systemLegOpened`, never on the enum.
+    ///
+    /// Low-frequency by construction: only `setLiveSources` and the
+    /// start/stop lifecycle write them, so publishing them here cannot put
+    /// the session on the audio cadence that #280 removed.
+    @Published private(set) var micIncluded = false
+    @Published private(set) var systemIncluded = false
+    @Published private(set) var micStarting = false
+    @Published private(set) var systemStarting = false
+    /// Set when the most recent explicit bring-up of that leg failed. Cleared
+    /// by the next enable request (at its start) or by a successful one.
+    @Published private(set) var micUnavailable = false
+    @Published private(set) var systemUnavailable = false
+    /// Low-frequency in-flight flag for the serialized source change. The
+    /// controller disables both switches while this is true.
+    @Published private(set) var isChangingLiveSources = false
+    /// True once the accepted inclusion actually changed during this
+    /// recording. In-memory only — no schema/metadata change. The controller
+    /// reads it to suppress the short-capture warning for a deliberately
+    /// narrowed recording.
+    @Published private(set) var legsChangedDuringRecording = false
+    /// True only when the session is `.paused` because BOTH sources are
+    /// excluded. Re-enabling a source auto-resumes this pause only; a manual
+    /// pause is never resumed by a toggle.
+    @Published private(set) var autoPausedBySourceState = false
+    /// Why the most recent `resume()` was refused, for the controller to read
+    /// out. `nil` once a resume succeeds or a new recording starts.
+    @Published private(set) var lastResumeRefusal: ResumeRefusal?
+
+    /// Whether the leg's capture engine has ever been opened for this
+    /// recording. A muted leg can stay open for clock/watchdog purposes; an
+    /// `off` leg has never been opened. Distinct from `isRunning`, which a
+    /// fake test session never sets.
+    private(set) var micLegOpened = false
+    private(set) var systemLegOpened = false
+
+    /// Monotonic generation for live reconfiguration. Bumped at the start of
+    /// every accepted `setLiveSources`, and by `start`/`stop`/`cancelAll`
+    /// BEFORE teardown. An in-flight leg bring-up captures the value it began
+    /// with and refuses to publish anything after it changes.
+    ///
+    /// Deliberately separate from `captureEpoch`: that one means "a new
+    /// recording began" and drives live-pipeline resume detection; it must
+    /// not move on a mere source toggle, pause or stop.
+    private(set) var liveConfigGeneration = 0
+    private var liveChangeCancellation: CaptureStartCancellation?
+    private var liveChangeTask: Task<LegBringUpOutcome, Never>?
+    /// `cancelAll()` keeps its historical state-transition behavior (no
+    /// `.stopping` publish at terminate), so this private flag is what makes
+    /// `setLiveSources` refuse a reconfiguration racing teardown.
+    private var isCancellingAll = false
+
+    /// Per-leg result of a bring-up performed inside `setLiveSources`.
+    private struct LegBringUpOutcome: Sendable {
+        var micStarted = false
+        var systemStarted = false
+        var micError: LiveSourceChangeError?
+        var systemError: LiveSourceChangeError?
+        var cancelled = false
+    }
+
+    /// Why an explicit resume was refused. Readable for the controller so it
+    /// can explain it inline rather than silently no-op'ing.
+    enum ResumeRefusal: Equatable, Sendable {
+        case bothSourcesExcluded
+
+        var message: String {
+            switch self {
+            case .bothSourcesExcluded:
+                return "Turn on the microphone or app audio to resume."
+            }
+        }
+    }
+
+    /// Bounded, per-leg failure of a live source change. The controller maps
+    /// permission cases onto its existing permission flags and everything
+    /// else onto a concise recording error.
+    enum LiveSourceChangeError: LocalizedError, Equatable, Sendable {
+        case noActiveRecording
+        case changeInFlight
+        case microphonePermissionDenied
+        case microphoneUnavailable(String)
+        case systemAudioPermissionDenied
+        case systemAudioUnavailable(String)
+        case cancelled
+
+        var errorDescription: String? {
+            switch self {
+            case .noActiveRecording:
+                return "No recording is active."
+            case .changeInFlight:
+                return "A microphone or app-audio change is already in progress."
+            case .microphonePermissionDenied:
+                return "Microphone access is required to include the microphone."
+            case .microphoneUnavailable(let detail):
+                return detail
+            case .systemAudioPermissionDenied:
+                return "Screen & System Audio Recording permission is required to include app audio."
+            case .systemAudioUnavailable(let detail):
+                return detail
+            case .cancelled:
+                return "The microphone or app-audio change was cancelled."
+            }
+        }
+    }
+
+    /// UI-facing per-leg state, derived from the accepted inclusion and
+    /// whether the engine was ever opened. The global `.paused` state is
+    /// separate; the leaf combines the two (a clocking-but-excluded mic reads
+    /// `muted`, never `off`).
+    enum LiveLegState: Equatable, Sendable {
+        case off
+        case muted
+        case starting
+        case listening
+        case unavailable
+    }
+
+    var micLiveState: LiveLegState {
+        if micStarting { return .starting }
+        if micUnavailable && !micIncluded { return .unavailable }
+        if micIncluded { return (isFakeForTesting || mic.isRunning) ? .listening : .unavailable }
+        return micLegOpened ? .muted : .off
+    }
+
+    var systemLiveState: LiveLegState {
+        if systemStarting { return .starting }
+        if systemUnavailable && !systemIncluded { return .unavailable }
+        if systemIncluded { return (isFakeForTesting || system.isRunning) ? .listening : .unavailable }
+        return systemLegOpened ? .muted : .off
+    }
+
+    /// Read-only snapshot for the controller/leaf. The individual published
+    /// properties above are the observation points; this is just the
+    /// convenience bundle the next slice needs.
+    struct LiveSourceSnapshot: Equatable, Sendable {
+        var micIncluded: Bool
+        var systemIncluded: Bool
+        var micOpened: Bool
+        var systemOpened: Bool
+        var micStarting: Bool
+        var systemStarting: Bool
+        var micUnavailable: Bool
+        var systemUnavailable: Bool
+        var isChanging: Bool
+        var isAutoPaused: Bool
+        var legsChanged: Bool
+        var micState: LiveLegState
+        var systemState: LiveLegState
+    }
+
+    var liveSourceSnapshot: LiveSourceSnapshot {
+        LiveSourceSnapshot(
+            micIncluded: micIncluded,
+            systemIncluded: systemIncluded,
+            micOpened: micLegOpened,
+            systemOpened: systemLegOpened,
+            micStarting: micStarting,
+            systemStarting: systemStarting,
+            micUnavailable: micUnavailable,
+            systemUnavailable: systemUnavailable,
+            isChanging: isChangingLiveSources,
+            isAutoPaused: autoPausedBySourceState,
+            legsChanged: legsChangedDuringRecording,
+            micState: micLiveState,
+            systemState: systemLiveState
+        )
+    }
+
     /// Mic frames captured by the most recent recording, snapshotted at
     /// `stop()` before the engine is torn down. 0 for a mic/meeting recording
     /// means the microphone produced nothing — read by the caller to surface
@@ -133,6 +309,59 @@ final class RecordingSession: ObservableObject {
         system.selectedApp = app
     }
 
+    /// Initial per-leg inclusion for a recording: the `source` enum describes
+    /// what the user asked for at start and stays the recording's metadata.
+    /// Live changes after this point move the booleans, never `source`.
+    static func initialInclusion(for source: RecordingSource) -> (mic: Bool, system: Bool) {
+        switch source {
+        case .microphone, .voiceMemo:
+            return (mic: true, system: false)
+        case .systemAudio:
+            return (mic: false, system: true)
+        case .meeting:
+            return (mic: true, system: true)
+        }
+    }
+
+    /// The one WAV writer configuration, shared by the real `start` and the
+    /// test-only fake start so saved-WAV assertions exercise the same path.
+    private func makeAudioFile(at outputURL: URL) throws -> AVAudioFile {
+        let format = WhisperAudioFormat.pcmFloat32
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: format.channelCount,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        return try AVAudioFile(forWriting: outputURL, settings: settings,
+                               commonFormat: .pcmFormatFloat32, interleaved: false)
+    }
+
+    /// Reset every in-memory live-source flag. Called at start (then the
+    /// initial inclusion is applied), and at teardown so a new recording
+    /// never inherits an unavailable leg, an auto-pause, a resume refusal or
+    /// a "legs changed" marker from the previous one.
+    private func resetLiveSourceState() {
+        micIncluded = false
+        systemIncluded = false
+        micStarting = false
+        systemStarting = false
+        micUnavailable = false
+        systemUnavailable = false
+        isChangingLiveSources = false
+        legsChangedDuringRecording = false
+        autoPausedBySourceState = false
+        lastResumeRefusal = nil
+        micLegOpened = false
+        systemLegOpened = false
+        liveChangeCancellation = nil
+        liveChangeTask = nil
+        isCancellingAll = false
+    }
+
     /// Thrown when `start`'s caller-supplied `isStillValid` predicate turns
     /// false during the async bring-up (e.g. a per-app prompt was revoked or
     /// superseded while the permission or engine handshake was in flight).
@@ -168,6 +397,14 @@ final class RecordingSession: ObservableObject {
         self.systemBuffersSinceStart = 0
         self.overflowFlushesSinceStart = 0
         self.isFakeForTesting = false
+        self.lastMicFrameCount = 0
+        liveConfigGeneration += 1
+        resetLiveSourceState()
+        let initial = Self.initialInclusion(for: source)
+        micIncluded = initial.mic
+        systemIncluded = initial.system
+        micLegOpened = initial.mic
+        systemLegOpened = initial.system
         // Never inherit a stale system-audio tail from the previous
         // recording: a `consumeSystem` call that was already dequeued when
         // the last stop() ran its flush can append to `pendingSystem`
@@ -175,18 +412,7 @@ final class RecordingSession: ObservableObject {
         pendingSystem.removeAll(keepingCapacity: false)
 
         do {
-            let format = WhisperAudioFormat.pcmFloat32
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: format.sampleRate,
-                AVNumberOfChannelsKey: format.channelCount,
-                AVLinearPCMBitDepthKey: 32,
-                AVLinearPCMIsFloatKey: true,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: false
-            ]
-            self.audioFile = try AVAudioFile(forWriting: outputURL, settings: settings,
-                                             commonFormat: .pcmFormatFloat32, interleaved: false)
+            self.audioFile = try makeAudioFile(at: outputURL)
 
             if source == .microphone || source == .meeting {
                 _ = await mic.requestAccess()
@@ -279,6 +505,10 @@ final class RecordingSession: ObservableObject {
     /// half-created WAV so `state` returns cleanly to `.idle`. Idempotent —
     /// safe to call after only some of the legs started.
     private func teardownPartialStart() async {
+        liveConfigGeneration += 1
+        liveChangeCancellation?.cancel()
+        liveChangeCancellation = nil
+        liveChangeTask = nil
         micTask?.cancel(); micTask = nil
         systemTask?.cancel(); systemTask = nil
         await mic.stop()
@@ -286,6 +516,7 @@ final class RecordingSession: ObservableObject {
         audioFile = nil
         fileURL = nil
         pendingSystem.removeAll(keepingCapacity: false)
+        resetLiveSourceState()
     }
 
     /// Drives the `elapsed` clock while a session is active. Kept running
@@ -336,33 +567,55 @@ final class RecordingSession: ObservableObject {
     /// device really does die while paused, we want it repaired before the
     /// user resumes, not four seconds after.
     func pause() async {
-        guard state == .recording else { return }
+        guard state == .recording, !isCancellingAll else { return }
+        // An explicit Pause is never an auto-pause: even if both sources are
+        // excluded, re-enabling one later must not resume this session.
+        autoPausedBySourceState = false
+        await performPause()
+    }
+
+    /// The shared pause work. `pause()` calls this for a user-requested
+    /// pause; `setLiveSources` calls it when both sources are turned off and
+    /// marks `autoPausedBySourceState` first.
+    private func performPause() async {
         pausedAt = Date()
         // Flip the gate FIRST so nothing else lands in `pendingSystem` while
         // the flush below awaits.
         state = .paused
-        // Meeting mode parks system audio here for the mic clock to consume.
-        // Whatever is parked at the pause instant is audio the other side
-        // already produced BEFORE the pause, so write it out (system-only, at
-        // full scale — exactly what `stop()` does with the same tail) instead
-        // of discarding it. Discarding is normally a sub-100ms loss, but the
-        // buffer holds up to 30s when the mic clock is stalled (display
-        // sleep/wake), and losing half a minute of the other side of a meeting
-        // to a Pause tap is not a trade the user agreed to.
+        // Meeting mode / app-only-under-the-mic-clock parks system audio here
+        // for the mic clock to consume. Whatever is parked at the pause
+        // instant is audio the other side already produced BEFORE the pause,
+        // so write it out (system-only, at full scale — exactly what `stop()`
+        // does with the same tail) instead of discarding it. Discarding is
+        // normally a sub-100ms loss, but the buffer holds up to 30s when the
+        // mic clock is stalled (display sleep/wake), and losing half a minute
+        // of the other side of a meeting to a Pause tap is not a trade the
+        // user agreed to.
         await flushPendingSystemTail()
         // The meters are driven from `consumeMic` / `consumeSystem`, which
         // stop running now — without this they'd sit frozen at their last
         // pre-pause reading and read as "still listening".
         meters.micLevel = 0
         meters.systemLevel = 0
-        recLog.log("pause: source=\(self.source.rawValue, privacy: .public) elapsed=\(self.elapsed, privacy: .public)")
+        recLog.log("pause: source=\(self.source.rawValue, privacy: .public) elapsed=\(self.elapsed, privacy: .public) auto=\(self.autoPausedBySourceState, privacy: .public)")
     }
 
     /// Resume a paused session. Accumulates the just-finished pause into
     /// `totalPaused` so `elapsed` skips it, and clears any system audio that
     /// slipped in while paused before capture resumes.
-    func resume() {
-        guard state == .paused else { return }
+    ///
+    /// Returns whether the session actually resumed. An explicit resume while
+    /// both sources are excluded is refused — there would be nothing to
+    /// capture — and `lastResumeRefusal` carries the readable cause for the
+    /// controller. `@discardableResult` keeps the existing callers unchanged.
+    @discardableResult
+    func resume() -> Bool {
+        guard state == .paused, !isCancellingAll else { return false }
+        guard micIncluded || systemIncluded else {
+            lastResumeRefusal = .bothSourcesExcluded
+            recLog.log("resume refused: both sources are excluded")
+            return false
+        }
         if let pausedAt {
             totalPaused += Date().timeIntervalSince(pausedAt)
         }
@@ -376,7 +629,10 @@ final class RecordingSession: ObservableObject {
         // with the gap collapsed out. Drop it.
         pendingSystem.removeAll(keepingCapacity: false)
         state = .recording
+        autoPausedBySourceState = false
+        lastResumeRefusal = nil
         recLog.log("resume: source=\(self.source.rawValue, privacy: .public) totalPaused=\(self.totalPaused, privacy: .public)")
+        return true
     }
 
     /// UI-test seam: flip state to .recording without spinning up
@@ -388,14 +644,36 @@ final class RecordingSession: ObservableObject {
     ///
     /// Stop is the same as the real flow: caller invokes `stop()` and
     /// gets back the (possibly nil) outputURL.
-    func startFakeForTesting(outputURL: URL) async {
+    /// `writeFile` is a test-only seam: the default `false` keeps the
+    /// historical behavior (no `AVAudioFile`; injected samples never hit
+    /// disk). Passing `true` opens the SAME writer configuration the real
+    /// `start` uses, so source-toggle tests can assert actual saved WAV
+    /// samples through the real `write` path on test-owned temp files. The
+    /// production path is untouched.
+    func startFakeForTesting(outputURL: URL, writeFile: Bool = false) async {
         guard state == .idle else { return }
         self.source = .microphone
         self.fileURL = outputURL
         self.writesSinceStart = 0
+        self.systemBuffersSinceStart = 0
+        self.overflowFlushesSinceStart = 0
         self.isFakeForTesting = true
-        // Skip AVAudioFile setup — the test injects samples directly
-        // into onLiveSamples; nothing should be writing to disk.
+        self.lastMicFrameCount = 0
+        liveConfigGeneration += 1
+        resetLiveSourceState()
+        let initial = Self.initialInclusion(for: .microphone)
+        micIncluded = initial.mic
+        systemIncluded = initial.system
+        micLegOpened = initial.mic
+        systemLegOpened = initial.system
+        pendingSystem.removeAll(keepingCapacity: false)
+        if writeFile {
+            audioFile = try? makeAudioFile(at: outputURL)
+        } else {
+            // Skip AVAudioFile setup — the test injects samples directly
+            // into onLiveSamples; nothing should be writing to disk.
+            audioFile = nil
+        }
         startTime = Date()
         pausedAt = nil
         totalPaused = 0
@@ -406,7 +684,16 @@ final class RecordingSession: ObservableObject {
 
     func stop() async -> URL? {
         guard state == .recording || state == .paused else { return fileURL }
+        // Invalidate any in-flight reconfiguration BEFORE teardown, then wait
+        // for that leg bring-up to finish. The generation bump makes its
+        // continuation refuse to publish; awaiting it here means a late
+        // `mic.start`/`system.start` can never install capture after we tore
+        // down (or touch a following recording's engine).
+        liveConfigGeneration += 1
+        liveChangeCancellation?.cancel()
+        let inFlight = liveChangeTask
         state = .stopping
+        if let inFlight { _ = await inFlight.value }
         // Snapshot the mic frame count BEFORE teardown so the caller can tell
         // a genuinely-empty mic session apart from a normal one. A fake
         // UI-test session never started the real mic, so report a non-zero
@@ -438,6 +725,7 @@ final class RecordingSession: ObservableObject {
         totalPaused = 0
         meters.elapsed = 0
         isFakeForTesting = false
+        resetLiveSourceState()
         state = .idle
         return url
     }
@@ -448,6 +736,13 @@ final class RecordingSession: ObservableObject {
     /// pinned by a half-running session.
     func cancelAll() async {
         guard state != .idle else { return }
+        isCancellingAll = true
+        // Same fence as `stop()`: invalidate first, then let any in-flight
+        // leg bring-up finish so it cannot resurrect capture after teardown.
+        liveConfigGeneration += 1
+        liveChangeCancellation?.cancel()
+        let inFlight = liveChangeTask
+        if let inFlight { _ = await inFlight.value }
         await mic.stop()
         await system.stop()
         micTask?.cancel(); micTask = nil
@@ -462,88 +757,451 @@ final class RecordingSession: ObservableObject {
         isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
         state = .idle
+        resetLiveSourceState()
+    }
+
+    // MARK: - Live source reconfiguration
+
+    // Test-only permission seam, nil on every production caller. The race
+    // below owns ONLY the permission request, never an engine start. A late
+    // OS reply cannot reach capture after Stop/Quit wins cancellation.
+    var liveMicrophonePermissionOverride: (@MainActor () async -> Bool)?
+
+    private enum LivePermissionResult: Sendable, Equatable { case granted, denied, cancelled, timedOut }
+
+    private static func liveMicrophonePermission(
+        cancellation: CaptureStartCancellation,
+        operation: @escaping @MainActor () async -> Bool
+    ) async -> LivePermissionResult {
+        let claimed = OSAllocatedUnfairLock(initialState: false)
+        return await withCheckedContinuation { continuation in
+            let finish: @Sendable (LivePermissionResult) -> Void = { result in
+                let first = claimed.withLock { done -> Bool in
+                    if done { return false }
+                    done = true
+                    return true
+                }
+                if first { continuation.resume(returning: result) }
+            }
+            Task { @MainActor in
+                let granted = await operation()
+                finish(granted ? .granted : .denied)
+            }
+            Task { @MainActor in
+                for _ in 0..<300 {
+                    if claimed.withLock({ $0 }) { return }
+                    if cancellation.isCancelled { finish(.cancelled); return }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                finish(.timedOut)
+            }
+        }
+    }
+
+
+    /// Serialized mic / app-audio inclusion change for the CURRENT recording.
+    ///
+    /// Reuses the existing per-leg permission/start paths and never creates a
+    /// second whole-session start/stop cycle: the WAV identity/URL, elapsed
+    /// clock, live pipeline and initial `source` metadata are untouched.
+    /// Turning a leg on opens it when it was never opened or stopped; a
+    /// previously opened leg that was muted stays running for clock/watchdog
+    /// purposes and is simply re-included.
+    ///
+    /// Both off reuses `pause()` but records that the pause came from the
+    /// source state, so re-enabling one resumes it. A manual pause is never
+    /// auto-resumed. Calling this while manually paused may still bring up the
+    /// requested leg, but the existing paused gate keeps every sample out.
+    ///
+    /// Failures roll back only the leg that failed: the recording and the
+    /// other leg keep running, the failed leg is marked unavailable, and the
+    /// per-leg error is thrown for the controller to map onto its existing
+    /// permission/error surfaces.
+    ///
+    /// Returns whether an accepted inclusion change was applied (`false` for
+    /// a no-op request). Throws `LiveSourceChangeError` for rejection/failure.
+    @discardableResult
+    func setLiveSources(wantMic: Bool, wantSystem: Bool) async throws -> Bool {
+        guard state == .recording || state == .paused, !isCancellingAll else {
+            throw LiveSourceChangeError.noActiveRecording
+        }
+        guard !isChangingLiveSources else {
+            throw LiveSourceChangeError.changeInFlight
+        }
+
+        let micWasIncluded = micIncluded
+        let systemWasIncluded = systemIncluded
+        guard wantMic != micWasIncluded || wantSystem != systemWasIncluded else {
+            return false
+        }
+
+        let generation = liveConfigGeneration + 1
+        liveConfigGeneration = generation
+        liveChangeCancellation?.cancel()
+        let cancellation = CaptureStartCancellation()
+        liveChangeCancellation = cancellation
+        isChangingLiveSources = true
+        defer {
+            // A stop/cancel bumps the generation and resets this itself; only
+            // the still-current attempt may clear the in-flight state.
+            if generation == liveConfigGeneration {
+                isChangingLiveSources = false
+                micStarting = false
+                systemStarting = false
+                liveChangeCancellation = nil
+                liveChangeTask = nil
+            }
+        }
+
+        // The routing changed at this boundary. Anything parked was produced
+        // under the old routing and must not be replayed after the change.
+        pendingSystem.removeAll(keepingCapacity: false)
+
+        if !wantMic && micIncluded {
+            micIncluded = false
+            meters.micLevel = 0
+        }
+        if !wantSystem && systemIncluded {
+            systemIncluded = false
+            meters.systemLevel = 0
+        }
+
+        let needsMicBringUp = wantMic && (!micLegOpened || (!isFakeForTesting && !mic.isRunning))
+        let needsSystemBringUp = wantSystem && (!systemLegOpened || (!isFakeForTesting && !system.isRunning))
+        if needsMicBringUp {
+            micStarting = true
+            micUnavailable = false
+            meters.micLevel = 0
+        }
+        if needsSystemBringUp {
+            systemStarting = true
+            systemUnavailable = false
+            meters.systemLevel = 0
+        }
+
+        // One task for the awaited bring-up so `stop()`/`cancelAll()` can
+        // invalidate the token and wait for a late completion before they
+        // tear down. The task never throws: a failed leg is recorded in the
+        // outcome so the other leg can still succeed.
+        let task: Task<LegBringUpOutcome, Never> = Task { @MainActor [weak self] in
+            guard let self else {
+                var gone = LegBringUpOutcome()
+                gone.cancelled = true
+                return gone
+            }
+            var outcome = LegBringUpOutcome()
+
+            if needsMicBringUp {
+                let permission = await Self.liveMicrophonePermission(cancellation: cancellation) {
+                    if let override = self.liveMicrophonePermissionOverride { return await override() }
+                    return await self.mic.requestAccess()
+                }
+                if permission == .cancelled {
+                    outcome.cancelled = true
+                } else if permission == .timedOut {
+                    outcome.micError = .microphoneUnavailable("Microphone permission did not complete. Try turning the microphone on again.")
+                } else if permission == .denied {
+                    outcome.micError = .microphonePermissionDenied
+                } else if cancellation.isCancelled
+                            || self.liveConfigGeneration != generation
+                            || !self.isLiveSourceActive {
+                    outcome.cancelled = true
+                } else {
+                    do {
+                        try await self.mic.start(cancellation: cancellation)
+                        if cancellation.isCancelled
+                            || self.liveConfigGeneration != generation
+                            || !self.isLiveSourceActive {
+                            outcome.cancelled = true
+                        } else {
+                            outcome.micStarted = true
+                        }
+                    } catch is CaptureStartCancellation.Cancelled {
+                        outcome.cancelled = true
+                    } catch {
+                        outcome.micError = .microphoneUnavailable(error.localizedDescription)
+                    }
+                }
+            }
+
+            if needsSystemBringUp && !outcome.cancelled {
+                if cancellation.isCancelled
+                    || self.liveConfigGeneration != generation
+                    || !self.isLiveSourceActive {
+                    outcome.cancelled = true
+                } else {
+                    do {
+                        try await self.system.start(cancellation: cancellation)
+                        if cancellation.isCancelled
+                            || self.liveConfigGeneration != generation
+                            || !self.isLiveSourceActive {
+                            outcome.cancelled = true
+                        } else {
+                            outcome.systemStarted = true
+                        }
+                    } catch SystemAudioRecorder.CaptureError.permissionDenied {
+                        outcome.systemError = .systemAudioPermissionDenied
+                    } catch is CaptureStartCancellation.Cancelled {
+                        outcome.cancelled = true
+                    } catch {
+                        outcome.systemError = .systemAudioUnavailable(error.localizedDescription)
+                    }
+                }
+            }
+
+            return outcome
+        }
+        liveChangeTask = task
+
+        let outcome = await task.value
+
+        // Stop/cancel wins if it invalidated us while the bring-up awaited.
+        // `stop()`/`cancelAll()` are waiting on this task before their own
+        // teardown, so whatever engine opened is their responsibility.
+        guard !outcome.cancelled,
+              !cancellation.isCancelled,
+              liveConfigGeneration == generation,
+              isLiveSourceActive else {
+            throw LiveSourceChangeError.cancelled
+        }
+
+        if needsMicBringUp {
+            if outcome.micStarted {
+                installMicConsumer()
+                micLegOpened = true
+                micIncluded = true
+                micUnavailable = false
+            } else {
+                micIncluded = false
+                micUnavailable = outcome.micError != nil
+                meters.micLevel = 0
+            }
+            micStarting = false
+        } else if wantMic && !micIncluded {
+            // Previously opened (muted) leg: no bring-up needed.
+            micIncluded = true
+            micUnavailable = false
+        }
+
+        if needsSystemBringUp {
+            if outcome.systemStarted {
+                installSystemConsumer()
+                systemLegOpened = true
+                systemIncluded = true
+                systemUnavailable = false
+            } else {
+                systemIncluded = false
+                systemUnavailable = outcome.systemError != nil
+                meters.systemLevel = 0
+            }
+            systemStarting = false
+        } else if wantSystem && !systemIncluded {
+            systemIncluded = true
+            systemUnavailable = false
+        }
+        if !wantMic { micStarting = false }
+        if !wantSystem { systemStarting = false }
+
+        if micIncluded != micWasIncluded || systemIncluded != systemWasIncluded {
+            legsChangedDuringRecording = true
+        }
+        // A previously-refused resume is no longer refused once a source is
+        // back in the accepted set, even if the session stays manually paused.
+        if micIncluded || systemIncluded {
+            lastResumeRefusal = nil
+        }
+
+        if !micIncluded && !systemIncluded {
+            // Both off: reuse the existing pause, but mark it so re-enabling
+            // a source resumes ONLY this pause.
+            if state == .recording {
+                autoPausedBySourceState = true
+                await performPause()
+            }
+        } else if state == .paused && autoPausedBySourceState {
+            _ = resume()
+        }
+
+        if let micError = outcome.micError {
+            throw micError
+        }
+        if let systemError = outcome.systemError {
+            throw systemError
+        }
+        return true
+    }
+
+    /// The active recording states a source change can run in. `.stopping` /
+    /// `.idle` mean Stop won the race.
+    private var isLiveSourceActive: Bool {
+        state == .recording || state == .paused
+    }
+
+    private func installMicConsumer() {
+        micTask?.cancel()
+        let epoch = captureEpoch
+        micTask = Task { [weak self] in
+            guard let self else { return }
+            for await buffer in self.mic.audioStream {
+                if Task.isCancelled { break }
+                // A later recording owns a different capture epoch; this
+                // consumer must not feed it stale buffers. Source toggles in
+                // the SAME recording keep the epoch, and inclusion booleans
+                // gate their samples instead.
+                guard self.captureEpoch == epoch else { break }
+                await self.consumeMic(buffer)
+            }
+        }
+    }
+
+    private func installSystemConsumer() {
+        systemTask?.cancel()
+        let epoch = captureEpoch
+        systemTask = Task { [weak self] in
+            guard let self else { return }
+            for await buffer in self.system.audioStream {
+                if Task.isCancelled { break }
+                guard self.captureEpoch == epoch else { break }
+                await self.consumeSystem(buffer)
+            }
+        }
     }
 
     // MARK: - Mixing
 
-    /// Internal rather than private so `RecordingSessionMetersTests` can push
-    /// buffers through the REAL mic path of a fake session and count who
-    /// publishes; nothing in the app calls it from outside this file.
+    /// Internal rather than private so `RecordingSessionMetersTests` and the
+    /// source-toggle tests can push buffers through the REAL mic path of a
+    /// fake session and count who publishes; nothing in the app calls it from
+    /// outside this file.
     func consumeMic(_ buffer: AVAudioPCMBuffer) async {
         // Paused: discard the buffer entirely so nothing reaches the WAV or
         // the live transcriber. The engine keeps running; we just drop its
         // output until `resume()`.
         guard state == .recording else { return }
         let samples = AudioConvert.samples(from: buffer)
+
+        if !micIncluded {
+            // Muted / clock-only mic. Its real samples never reach the meter,
+            // the live feed or the WAV. An already-open mic still paces app
+            // audio parked by `consumeSystem`, exactly like the meeting clock
+            // — but muted spans drain at FULL system scale (never averaged
+            // against a muted zero, which would halve the app audio).
+            meters.micLevel = 0
+            guard micLegOpened, systemIncluded else { return }
+            await drainPendingSystemOnMutedMicClock(frames: samples.count)
+            return
+        }
+
         // Assign directly instead of hopping through `MainActor.run`: the
         // whole class is already `@MainActor`, so the hop bought nothing and
         // cost a suspension point — one a `pause()` could land inside, which
         // would leave the meter lit at a live-looking level for the rest of
         // the pause with nothing still running to clear it.
         meters.micLevel = AudioMeter.level(from: buffer)
-        if source == .microphone {
+        if !systemIncluded {
             // Mic-only: the live feed and the saved file are both just the
             // mic, so drive the live transcriber here and write directly.
             if let onLive = onLiveSamples { onLive(samples[0..<samples.count]) }
             await write(samples)
             return
         }
-        // Meeting mode: the mic is the master clock. Each mic chunk pulls an
-        // equal span of system audio out of `pendingSystem` (silence where
-        // the app wasn't playing) and mixes the two, then drives BOTH the
-        // saved file and the live transcriber with the result. Driving the
-        // mix off the mic's steady 16kHz cadence — rather than the old
-        // min(pendingMic, pendingSystem) pairing — means the live feed can't
-        // starve when the system leg goes quiet, and the app-audio side now
-        // reaches the live pane instead of only the on-disk WAV.
+        // Both legs included: the mic is the master clock. Each mic chunk
+        // pulls an equal span of system audio out of `pendingSystem`
+        // (silence where the app wasn't playing) and mixes the two, then
+        // drives BOTH the saved file and the live transcriber with the
+        // result. Driving the mix off the mic's steady 16kHz cadence — rather
+        // than the old min(pendingMic, pendingSystem) pairing — means the
+        // live feed can't starve when the system leg goes quiet, and the
+        // app-audio side reaches the live pane instead of only the on-disk
+        // WAV.
         let mixed = mixWithBufferedSystem(mic: samples)
         if let onLive = onLiveSamples { onLive(mixed[0..<mixed.count]) }
         await write(mixed)
     }
 
-    private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
-        // Paused: drop system audio too (both the inline `.systemAudio`
-        // write and the `.meeting` jitter-buffer append) so the paused span
-        // is absent from the recording.
+    /// Drain app audio against a muted-but-still-open mic's cadence. The mic
+    /// samples themselves are excluded; the app span is written at FULL
+    /// system scale. Where the app had nothing buffered for part of the span
+    /// the remainder is digital silence, which keeps the WAV duration paced by
+    /// the mic clock and never substitutes the muted mic audio.
+    private func drainPendingSystemOnMutedMicClock(frames: Int) async {
+        guard frames > 0 else { return }
+        let take = min(frames, pendingSystem.count)
+        var span: [Float]
+        if take > 0 {
+            span = Array(pendingSystem.prefix(take))
+            pendingSystem.removeFirst(take)
+        } else {
+            span = []
+        }
+        if span.count < frames {
+            span.append(contentsOf: [Float](repeating: 0, count: frames - span.count))
+        }
+        guard !span.isEmpty else { return }
+        if let onLive = onLiveSamples { onLive(span[0..<span.count]) }
+        await write(span)
+    }
+
+    /// Internal like `consumeMic` so tests can drive the real system path
+    /// (`deliverForTesting` pushes through the real SCK-shaped stream; this
+    /// method is the routing under test). Nothing in the app calls it from
+    /// outside this file.
+    func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
+        // Paused: drop system audio too (both the inline app-only write and
+        // the mic-clock jitter-buffer append) so the paused span is absent
+        // from the recording.
         guard state == .recording else { return }
         systemBuffersSinceStart += 1
         let samples = AudioConvert.samples(from: buffer)
-        // Direct assignment for the same reason as `consumeMic` — see there.
-        meters.systemLevel = AudioMeter.level(from: buffer)
-        if source == .systemAudio {
-            // No mic to clock against — system audio IS the recording.
-            // write() drives the live feed for `.systemAudio`.
-            await write(samples)
+
+        if !systemIncluded {
+            // Muted app audio: exclude its samples from the meter, live feed
+            // and WAV. A straggler queued before the change lands here too,
+            // which is why no pre-mute tail can be replayed.
+            meters.systemLevel = 0
             return
         }
-        // Meeting mode: park the system audio for the mic clock to consume
-        // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
-        // it without limit. The cap is generous (~30s), so an SCK burst at
-        // session start or slow clock skew just delays app audio until the mic
-        // clock catches up — it isn't dropped.
-        pendingSystem.append(contentsOf: samples)
-        if pendingSystem.count > maxPendingSystem {
-            // Hitting the cap means the mic clock has stalled outright
-            // (display sleep/wake, input device yanked) while
-            // ScreenCaptureKit kept delivering. The old behavior discarded
-            // the oldest span, which cost a real user ~58 seconds of the
-            // other side of a meeting after a display wake (2,883
-            // consecutive 320-sample drops in one diagnostic bundle). The
-            // mic isn't producing anything during a stall, so nothing is
-            // being written — flush the overflow straight to the WAV and
-            // the live feed instead (system-only, full scale, exactly what
-            // `flushPendingSystemTail` does at stop). When the mic clock
-            // resumes, mixing continues from the ≤30s still buffered.
-            let overflowCount = pendingSystem.count - maxPendingSystem
-            let overflow = Array(pendingSystem.prefix(overflowCount))
-            pendingSystem.removeFirst(overflowCount)
-            overflowFlushesSinceStart += 1
-            if overflowFlushesSinceStart == 1 || overflowFlushesSinceStart % 100 == 0 {
-                recLog.error("system jitter buffer overflow #\(self.overflowFlushesSinceStart, privacy: .public) — mic clock stalled; flushing \(overflow.count, privacy: .public) samples to the WAV instead of dropping")
+
+        // Direct assignment for the same reason as `consumeMic` — see there.
+        meters.systemLevel = AudioMeter.level(from: buffer)
+
+        if micLegOpened {
+            // A mic clock exists (included, or open-but-muted). Park the
+            // system audio for it to consume in `consumeMic`. Bound the
+            // backlog so a stalled clock can't grow it without limit. The cap
+            // is generous (~30s), so an SCK burst at session start or slow
+            // clock skew just delays app audio until the clock catches up —
+            // it isn't dropped.
+            pendingSystem.append(contentsOf: samples)
+            if pendingSystem.count > maxPendingSystem {
+                // Hitting the cap means the mic clock has stalled outright
+                // (display sleep/wake, input device yanked) while
+                // ScreenCaptureKit kept delivering. The old behavior
+                // discarded the oldest span, which cost a real user ~58
+                // seconds of the other side of a meeting after a display wake
+                // (2,883 consecutive 320-sample drops in one diagnostic
+                // bundle). The clock isn't producing anything during a stall,
+                // so nothing is being written — flush the overflow straight to
+                // the WAV and the live feed instead (system-only, full scale,
+                // exactly what `flushPendingSystemTail` does at stop). When the
+                // clock resumes, mixing continues from the ≤30s still buffered.
+                let overflowCount = pendingSystem.count - maxPendingSystem
+                let overflow = Array(pendingSystem.prefix(overflowCount))
+                pendingSystem.removeFirst(overflowCount)
+                overflowFlushesSinceStart += 1
+                if overflowFlushesSinceStart == 1 || overflowFlushesSinceStart % 100 == 0 {
+                    recLog.error("system jitter buffer overflow #\(self.overflowFlushesSinceStart, privacy: .public) — mic clock stalled; flushing \(overflow.count, privacy: .public) samples to the WAV instead of dropping")
+                }
+                if let onLive = onLiveSamples { onLive(overflow[0..<overflow.count]) }
+                await write(overflow)
             }
-            if let onLive = onLiveSamples { onLive(overflow[0..<overflow.count]) }
-            await write(overflow)
+            return
         }
+
+        // App-only: no mic clock exists (the mic is off and was never
+        // opened), so ScreenCaptureKit is the clock. Write at full scale.
+        if let onLive = onLiveSamples { onLive(samples[0..<samples.count]) }
+        await write(samples)
     }
 
     /// Mix one mic chunk with the head of the buffered system audio and
@@ -573,13 +1231,12 @@ final class RecordingSession: ObservableObject {
         return mixed
     }
 
-    /// Flush any system audio still buffered when the mic clock stops
-    /// (meeting mode only — `.microphone` / `.systemAudio` write inline, so
-    /// `pendingSystem` is empty for them). The mic is already torn down by
-    /// the time `stop()` calls this, so the trailing span is system-only and
-    /// goes out at full scale (the same way mic-only spans are written full
-    /// scale in `mixWithBufferedSystem`), so the last bit of app audio isn't
-    /// lost.
+    /// Flush any app audio still buffered when the mic clock stops (dual
+    /// capture, or mic-muted app-only under an already-open mic clock). The
+    /// clock is already stopped by the time `stop()`/`pause()` calls this, so
+    /// the trailing span is app-only and goes out at full scale (the same way
+    /// mic-only spans are written full scale in `mixWithBufferedSystem`), so
+    /// the last bit of app audio isn't lost.
     private func flushPendingSystemTail() async {
         guard !pendingSystem.isEmpty else { return }
         let tail = pendingSystem
@@ -628,13 +1285,11 @@ final class RecordingSession: ObservableObject {
                 \(error.localizedDescription, privacy: .private)
                 """)
         }
-        // Live-transcription feed: `.microphone` and `.meeting` fire
-        // `onLiveSamples` from `consumeMic` (the latter with the mic+system
-        // mix, so app audio reaches the live pane). `.systemAudio` has no
-        // mic clock, so it drives the live feed from here instead.
-        if source == .systemAudio, let onLive = onLiveSamples {
-            onLive(samples[0..<samples.count])
-        }
+        // The live-transcription feed is fired by the routing site, never
+        // here: `consumeMic` handles mic-only, dual and muted-mic clock spans;
+        // `consumeSystem` handles the inline app-only span; the two tail
+        // flushes handle their own. Keeping it out of `write` means the feed
+        // stays correct when the routing changes mid-recording.
     }
 }
 
