@@ -15,6 +15,11 @@ struct LevelMeterView: View {
     /// the level monitor is paused (e.g. during an active recording, when
     /// the real `MicrophoneRecorder` owns the device).
     let isLive: Bool
+    /// Accessibility label. Defaulted so the Settings audio meter keeps its
+    /// historical "Microphone level" reading; the live recording inputs pass
+    /// a distinct label per leg (Microphone / App audio) so VoiceOver never
+    /// presents two identical meters.
+    var label: String = "Microphone level"
 
     private static let segmentCount = 12
 
@@ -29,7 +34,7 @@ struct LevelMeterView: View {
             }
             .frame(height: geo.size.height)
             .accessibilityElement()
-            .accessibilityLabel("Microphone level")
+            .accessibilityLabel(label)
             .accessibilityValue(isLive ? "\(Int(level * 100)) percent" : "off")
         }
         .frame(height: 14)

@@ -134,6 +134,15 @@ struct LiveAIRecordingView: View {
     private var header: some View {
         VStack(spacing: 10) {
             controlsRow
+            // Live mic / app-audio controls and meters live on their own row
+            // BELOW the Stop/Pause/clock/language strip — never squeezed
+            // between them, so those controls keep their intrinsic size at
+            // the minimum window width. Gated on an actual recording so the
+            // RTL layout fixture, which forces this view with no session,
+            // keeps its existing header.
+            if actions.isRecording {
+                RecordingInputIndicators()
+            }
             metaRow
         }
         .padding(.horizontal, 18)
@@ -847,16 +856,37 @@ struct RecordingPauseButton: View {
 
     var body: some View {
         let paused = session.state == .paused
+        // While both sources are excluded the session refuses to resume, so
+        // this shared control (Live AI header, Home and the floating chip)
+        // must show that refusal itself instead of an enabled Resume that
+        // silently does nothing. Turning a source on resumes an automatic
+        // all-sources-off pause; a manual pause still needs an explicit tap.
+        let bothSourcesExcluded = !session.micIncluded && !session.systemIncluded
+        let resumeBlocked = paused && bothSourcesExcluded
+        let blockedTitle = session.autoPausedBySourceState
+            ? "Turn on a source to resume"
+            : "Turn on a source, then Resume"
         Button {
             Task { await actions.togglePause() }
         } label: {
             if compact {
-                Image(systemName: paused ? "play.fill" : "pause.fill")
-                    .foregroundStyle(paused ? Color.accentColor : .primary)
+                if resumeBlocked {
+                    HStack(spacing: 4) {
+                        Image(systemName: "play.slash.fill")
+                        Text("Turn on a source")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                } else {
+                    Image(systemName: paused ? "play.fill" : "pause.fill")
+                        .foregroundStyle(paused ? Color.accentColor : .primary)
+                }
             } else {
                 HStack(spacing: 6) {
-                    Image(systemName: paused ? "play.fill" : "pause.fill")
-                    Text(paused ? "Resume" : "Pause")
+                    Image(systemName: resumeBlocked
+                          ? "play.slash.fill"
+                          : (paused ? "play.fill" : "pause.fill"))
+                    Text(resumeBlocked ? blockedTitle : (paused ? "Resume" : "Pause"))
                         .font((prominent ? Font.body : Font.callout).weight(.semibold))
                 }
                 .padding(.horizontal, prominent ? 16 : 10)
@@ -868,10 +898,19 @@ struct RecordingPauseButton: View {
         .buttonStyle(.plain)
         // This recording's own stop, not `isFinalizingRecording` — since #356
         // that can be the PREVIOUS recording's drain while this one records.
-        .disabled(actions.isStoppingRecording)
-        .help(paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)")
-        .accessibilityLabel(paused ? "Resume recording" : "Pause recording")
-        .accessibilityIdentifier(paused ? "recording.resume" : "recording.pause")
+        // A blocked resume is disabled rather than an enabled no-op; its
+        // visible title and accessibility label explain why.
+        .disabled(actions.isStoppingRecording || resumeBlocked)
+        .help(resumeBlocked
+              ? blockedTitle
+              : (paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)"))
+        .accessibilityLabel(resumeBlocked
+                            ? blockedTitle
+                            : (paused ? "Resume recording" : "Pause recording"))
+        .accessibilityHint(resumeBlocked ? "Both microphone and app audio are off." : "")
+        .accessibilityIdentifier(resumeBlocked
+                                 ? "recording.resumeBlocked"
+                                 : (paused ? "recording.resume" : "recording.pause"))
     }
 }
 

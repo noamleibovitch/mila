@@ -24,6 +24,8 @@ final class QuickActionsControllerTests: XCTestCase {
     private var controller: QuickActionsController!
     private var languageDefaults: UserDefaults!
     private let languageSuite = "QuickActionsControllerTests.language"
+    private var sourceDefaults: UserDefaults!
+    private let sourceSuite = "QuickActionsControllerTests.liveSources"
 
     override func setUp() async throws {
         try await super.setUp()
@@ -42,6 +44,8 @@ final class QuickActionsControllerTests: XCTestCase {
         UserDefaults().removePersistentDomain(forName: languageSuite)
         languageDefaults = UserDefaults(suiteName: languageSuite)
         languageSettings = RecordingLanguageSettings(defaults: languageDefaults)
+        UserDefaults().removePersistentDomain(forName: sourceSuite)
+        sourceDefaults = UserDefaults(suiteName: sourceSuite)
         controller = QuickActionsController(session: session,
                                             store: store,
                                             transcription: service,
@@ -49,12 +53,14 @@ final class QuickActionsControllerTests: XCTestCase {
                                             postRecording: PostRecordingCoordinator(
                                                 store: store,
                                                 transcription: service,
-                                                llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm")!)))
+                                                llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm")!)),
+                                            defaults: sourceDefaults)
     }
 
     override func tearDown() async throws {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
         languageDefaults?.removePersistentDomain(forName: languageSuite)
+        sourceDefaults?.removePersistentDomain(forName: sourceSuite)
         try await super.tearDown()
     }
 
@@ -146,6 +152,184 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertTrue(session.state == .recording)
         controller.isStoppingRecording = false
         _ = await session.stop()
+    }
+
+    // MARK: - Live source changes during a recording
+
+    /// Both sources off auto-pauses through the backend's real pause path,
+    /// refuses Resume with a readable cause, and leaves Stop usable. The
+    /// accepted mic-off change is the only preference persisted.
+    func test_both_sources_off_pause_refuse_resume_and_keep_stop_usable() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "BothSourcesOff")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        sourceDefaults.set(true, forKey: QuickActionsController.microphonePreferenceKey)
+        sourceDefaults.set(true, forKey: QuickActionsController.appAudioPreferenceKey)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        // A fake mic recording starts mic-included / app-excluded.
+        await controller.setLiveSource(.microphone, included: false)
+
+        XCTAssertFalse(session.micIncluded)
+        XCTAssertFalse(session.systemIncluded)
+        XCTAssertEqual(session.state, .paused)
+        XCTAssertTrue(session.autoPausedBySourceState)
+        XCTAssertFalse(sourceDefaults.bool(forKey: QuickActionsController.microphonePreferenceKey),
+                       "the accepted mic-off change persists for the next recording")
+
+        controller.resumeRecording()
+        XCTAssertTrue(controller.isPaused, "resume must be refused while both sources are off")
+        XCTAssertEqual(session.lastResumeRefusal,
+                       RecordingSession.ResumeRefusal.bothSourcesExcluded)
+        XCTAssertNotNil(controller.liveSourceError,
+                        "the refusal must be readable, not a silent no-op")
+
+        // Stop is not gated on `canRecord` or a source being included.
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertFalse(store.recordings.isEmpty)
+    }
+
+    /// Re-enabling a source resumes ONLY the automatic all-sources-off pause.
+    func test_reenabling_a_source_resumes_an_all_sources_off_pause() async {
+        let url = store.freshAudioURL(suggestedName: "AutoResume")
+        sourceDefaults.set(true, forKey: QuickActionsController.microphonePreferenceKey)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        await controller.setLiveSource(.microphone, included: false)
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertTrue(session.autoPausedBySourceState)
+
+        await controller.setLiveSource(.microphone, included: true)
+        XCTAssertTrue(session.micIncluded)
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertFalse(session.autoPausedBySourceState)
+        XCTAssertTrue(sourceDefaults.bool(forKey: QuickActionsController.microphonePreferenceKey))
+        _ = await session.stop()
+    }
+
+    /// A manual pause is never resumed by a source toggle, even when both
+    /// sources were off in between.
+    func test_source_toggles_never_auto_resume_a_manual_pause() async {
+        let url = store.freshAudioURL(suggestedName: "ManualPause")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        await controller.pauseRecording()
+        XCTAssertTrue(controller.isPaused)
+
+        await controller.setLiveSource(.microphone, included: false)
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertFalse(session.autoPausedBySourceState)
+
+        await controller.setLiveSource(.microphone, included: true)
+        XCTAssertTrue(controller.isPaused, "a manual pause must survive the source toggle")
+        XCTAssertFalse(session.autoPausedBySourceState)
+
+        controller.resumeRecording()
+        XCTAssertFalse(controller.isPaused)
+        _ = await session.stop()
+    }
+
+    /// A failed lazy app-audio enable keeps the recording and the microphone
+    /// alive, marks the requested leg Unavailable, maps the permission flag,
+    /// and leaves the prior preferences untouched.
+    func test_failed_lazy_enable_keeps_other_source_and_prior_preferences() async {
+        let url = store.freshAudioURL(suggestedName: "EnableFailure")
+        sourceDefaults.set(true, forKey: QuickActionsController.microphonePreferenceKey)
+        sourceDefaults.set(false, forKey: QuickActionsController.appAudioPreferenceKey)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        session.system.bringUpOverride = {
+            throw SystemAudioRecorder.CaptureError.permissionDenied
+        }
+
+        await controller.setLiveSource(.appAudio, included: true)
+
+        XCTAssertEqual(session.state, .recording)
+        XCTAssertTrue(session.micIncluded, "the other source and recording stay alive")
+        XCTAssertFalse(session.systemIncluded)
+        XCTAssertTrue(session.systemUnavailable)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertTrue(controller.screenRecordingPermissionMissing)
+        XCTAssertNotNil(controller.liveSourceError)
+        XCTAssertFalse(sourceDefaults.bool(forKey: QuickActionsController.appAudioPreferenceKey),
+                       "a failed request must not persist the requested preference")
+        XCTAssertTrue(sourceDefaults.bool(forKey: QuickActionsController.microphonePreferenceKey),
+                      "the prior microphone preference is unchanged")
+        _ = await session.stop()
+    }
+
+    /// Only an accepted change persists its leg. A second change that arrives
+    /// while the first is still in flight is rejected by the session and must
+    /// not touch preferences or the other source.
+    func test_in_flight_change_is_rejected_without_persisting() async {
+        let url = store.freshAudioURL(suggestedName: "InFlight")
+        sourceDefaults.set(true, forKey: QuickActionsController.microphonePreferenceKey)
+        sourceDefaults.set(false, forKey: QuickActionsController.appAudioPreferenceKey)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        let held = HeldSystemBringUp()
+        session.system.bringUpOverride = { await held.wait() }
+        let first = Task { await controller.setLiveSource(.appAudio, included: true) }
+        for _ in 0..<400 where !held.hasStarted || !session.isChangingLiveSources {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertTrue(held.hasStarted)
+        XCTAssertTrue(session.isChangingLiveSources)
+
+        await controller.setLiveSource(.microphone, included: false)
+        XCTAssertNotNil(controller.liveSourceError)
+        XCTAssertTrue(session.micIncluded, "the in-flight request cannot change the other source")
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertTrue(sourceDefaults.bool(forKey: QuickActionsController.microphonePreferenceKey))
+        XCTAssertFalse(sourceDefaults.bool(forKey: QuickActionsController.appAudioPreferenceKey))
+
+        held.release()
+        await first.value
+        XCTAssertTrue(session.systemIncluded)
+        XCTAssertTrue(sourceDefaults.bool(forKey: QuickActionsController.appAudioPreferenceKey),
+                      "the accepted app-audio change persists once it completes")
+        _ = await session.stop()
+    }
+
+    /// A request before any recording is rejected and writes nothing.
+    func test_live_source_change_while_idle_is_rejected_without_persisting() async {
+        sourceDefaults.set(false, forKey: QuickActionsController.microphonePreferenceKey)
+        sourceDefaults.set(false, forKey: QuickActionsController.appAudioPreferenceKey)
+
+        await controller.setLiveSource(.microphone, included: true)
+
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertNotNil(controller.liveSourceError)
+        XCTAssertFalse(sourceDefaults.bool(forKey: QuickActionsController.microphonePreferenceKey))
+        XCTAssertFalse(sourceDefaults.bool(forKey: QuickActionsController.appAudioPreferenceKey))
+    }
+
+    /// A live source change deliberately narrows the captured audio, so the
+    /// post-stop diagnostics must not blame capture death or a dead mic for
+    /// it. These are the exact policies `stopRecording` applies.
+    func test_changed_sources_suppress_false_short_capture_and_empty_mic_guidance() {
+        XCTAssertFalse(QuickActionsController.shouldSurfaceShortCaptureWarning(
+            source: .microphone, wallClock: 1200, captured: 600, legsChanged: true))
+        XCTAssertTrue(QuickActionsController.shouldSurfaceShortCaptureWarning(
+            source: .microphone, wallClock: 1200, captured: 600, legsChanged: false))
+
+        XCTAssertFalse(QuickActionsController.shouldSurfaceEmptyMicGuidance(
+            source: .microphone, micFrames: 0, legsChanged: true,
+            micIncluded: false, systemIncluded: true, systemBuffers: 12, captured: 30),
+            "intentional mic mute with delivered app audio is not a dead microphone")
+        XCTAssertTrue(QuickActionsController.shouldSurfaceEmptyMicGuidance(
+            source: .microphone, micFrames: 0, legsChanged: false,
+            micIncluded: true, systemIncluded: false, systemBuffers: 0, captured: 0),
+            "an unchanged mic-only recording with zero frames is still a real failure")
+        XCTAssertTrue(QuickActionsController.shouldSurfaceEmptyMicGuidance(
+            source: .microphone, micFrames: 0, legsChanged: true,
+            micIncluded: true, systemIncluded: true, systemBuffers: 12, captured: 30),
+            "a mic that stayed included is not excused by a change to the other leg")
+        XCTAssertFalse(QuickActionsController.shouldSurfaceEmptyMicGuidance(
+            source: .meeting, micFrames: 0, legsChanged: false,
+            micIncluded: true, systemIncluded: true, systemBuffers: 12, captured: 30))
     }
 
     // MARK: - Pause and the short-capture heuristic
@@ -1360,4 +1544,24 @@ final class ShortCapturePolicyTests: XCTestCase {
             source: .meeting, wallClock: wall, captured: wall * ratio - 0.5))
     }
 
+}
+
+/// Deterministic hold for a synthetic system-audio bring-up. The override
+/// signals that it has started, then waits until the test releases it, so an
+/// in-flight `setLiveSource` request can be observed without any real
+/// ScreenCaptureKit stream.
+@MainActor
+private final class HeldSystemBringUp {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var hasStarted = false
+
+    func wait() async {
+        hasStarted = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
 }

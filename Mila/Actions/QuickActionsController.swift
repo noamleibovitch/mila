@@ -12,6 +12,14 @@ import os
 private let quickActionsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                      category: "QuickActionsController")
 
+/// The two capture legs that can be included or excluded while a recording
+/// is running. Distinct from `RecordingSource`: that enum is the recording's
+/// INITIAL metadata, while these are live per-leg inclusions.
+enum LiveInputSource: String, CaseIterable, Sendable {
+    case microphone
+    case appAudio
+}
+
 /// Single entry point used by the Home tiles + sidebar buttons.
 /// Hides recording/transcription orchestration from the UI layer.
 @MainActor
@@ -92,6 +100,12 @@ final class QuickActionsController: ObservableObject {
     /// IslandWhisper → Mila rename), so macOS treats this as a brand
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
+
+    /// Concise, non-modal explanation of the most recent refused or failed
+    /// live mic / app-audio change. The recording continues; the shared
+    /// recording-inputs leaf shows this inline. Per-leg `Unavailable` state
+    /// lives on `RecordingSession` and therefore survives dismissing this.
+    @Published private(set) var liveSourceError: String?
 
     /// Mila folder the *next* recording is filed into (nil = All Transcriptions).
     /// Always defaults to All Transcriptions on launch — the choice is
@@ -215,6 +229,17 @@ final class QuickActionsController: ObservableObject {
     let transcription: TranscriptionService
     let languageSettings: RecordingLanguageSettings
     let postRecording: PostRecordingCoordinator
+    /// Defaults that own the next-recording Microphone / App-audio
+    /// preferences (`home.record.microphone`, `home.record.withSystemAudio`).
+    /// Production uses `.standard`, the same suite Home's `@AppStorage`
+    /// reads. Tests inject a custom suite so no test can write the real
+    /// preference domain.
+    let defaults: UserDefaults
+
+    /// Storage keys shared with HomeView's `@AppStorage`. Kept here so the
+    /// live-change persistence and the idle preference UI cannot drift.
+    static let microphonePreferenceKey = "home.record.microphone"
+    static let appAudioPreferenceKey = "home.record.withSystemAudio"
 
     /// Late-bound by `MilaApp` after construction so the controller can
     /// decide at stop time whether Live AI was active for the current
@@ -494,12 +519,14 @@ final class QuickActionsController: ObservableObject {
          store: RecordingStore,
          transcription: TranscriptionService,
          languageSettings: RecordingLanguageSettings,
-         postRecording: PostRecordingCoordinator) {
+         postRecording: PostRecordingCoordinator,
+         defaults: UserDefaults = .standard) {
         self.session = session
         self.store = store
         self.transcription = transcription
         self.languageSettings = languageSettings
         self.postRecording = postRecording
+        self.defaults = defaults
     }
 
     // MARK: - Unified Record
@@ -661,6 +688,72 @@ final class QuickActionsController: ObservableObject {
         } else {
             await startAppRecording(app: nil, includeMic: false)
         }
+    }
+
+    // MARK: - Live source changes during a recording
+
+    /// The one UI entry point for changing Microphone / App audio while a
+    /// recording is running. The shared recording-inputs leaf's switches are
+    /// bound to the session's ACCEPTED inclusion (never to `@AppStorage`), and
+    /// this method serializes every requested change through
+    /// `RecordingSession.setLiveSources`.
+    ///
+    /// Persistence is transactional: the next-recording preference for the
+    /// requested leg is written only after the session accepted the change.
+    /// A rejected request (idle / change in flight) and a failed bring-up
+    /// leave the stored preference untouched, so the switch keeps showing the
+    /// accepted state and the next recording is not silently reconfigured.
+    /// The per-leg `Unavailable` flag remains on the session until the user
+    /// asks again or a retry succeeds.
+    func setLiveSource(_ source: LiveInputSource, included: Bool) async {
+        liveSourceError = nil
+        guard isRecording else {
+            presentLiveSourceError("Start a recording before changing a live source.")
+            return
+        }
+        let wantMic = source == .microphone ? included : session.micIncluded
+        let wantSystem = source == .appAudio ? included : session.systemIncluded
+        do {
+            let changed = try await session.setLiveSources(wantMic: wantMic,
+                                                           wantSystem: wantSystem)
+            guard changed else { return }
+            switch source {
+            case .microphone:
+                defaults.set(session.micIncluded,
+                             forKey: Self.microphonePreferenceKey)
+            case .appAudio:
+                defaults.set(session.systemIncluded,
+                             forKey: Self.appAudioPreferenceKey)
+            }
+        } catch let error as RecordingSession.LiveSourceChangeError {
+            switch error {
+            case .microphonePermissionDenied:
+                microphonePermissionMissing = true
+            case .systemAudioPermissionDenied:
+                screenRecordingPermissionMissing = true
+            case .cancelled:
+                // Stop / cancel won the race; the user already got the Stop
+                // they asked for, so do not raise a stale change error over it.
+                return
+            case .noActiveRecording, .changeInFlight, .microphoneUnavailable,
+                 .systemAudioUnavailable:
+                break
+            }
+            presentLiveSourceError(error.localizedDescription)
+        } catch {
+            presentLiveSourceError(error.localizedDescription)
+        }
+    }
+
+    /// Dismiss the inline live-source explanation. Per-leg `Unavailable` is
+    /// session state and is deliberately not cleared here.
+    func dismissLiveSourceError() {
+        liveSourceError = nil
+    }
+
+    private func presentLiveSourceError(_ message: String) {
+        liveSourceError = message
+        AccessibilityNotification.Announcement(message).post()
     }
 
     /// UI-TEST SEAM. Starts a recording without AVAudioEngine / the mic
@@ -1370,6 +1463,13 @@ final class QuickActionsController: ObservableObject {
         // live text into a final transcript and skip the batch pass.
         let runsLivePipeline = ownsLivePipeline && recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
+        // Snapshot the live per-leg state BEFORE `session.stop()` resets it.
+        // A changed-leg recording is deliberately narrower than its wall
+        // clock, so the post-stop short-capture warning and the empty-mic
+        // guidance must be able to tell "the user muted a leg" from "capture
+        // died".
+        let liveSourcesBeforeStop = session.liveSourceSnapshot
+        let systemBuffersBeforeStop = session.systemBuffersSinceStart
         // For the calendar match: the audio's duration leaves paused time
         // out, so only the wall clock says when the recording really began.
         let wallClockStart = session.startedAt
@@ -1501,7 +1601,18 @@ final class QuickActionsController: ObservableObject {
         // (the recording itself is still saved, so the rename sheet appears
         // as usual — this just explains the empty result). Meeting captures
         // can still succeed on the system-audio leg, so don't warn there.
-        if source == .microphone, session.lastMicFrameCount == 0 {
+        //
+        // Narrowed for a deliberate live mute: a recording that STARTED as
+        // mic-only but had its mic switched off while app audio was included
+        // and delivered buffers must not claim "Microphone captured no
+        // audio" — the user turned it off and the app leg has the audio.
+        if Self.shouldSurfaceEmptyMicGuidance(source: source,
+                                              micFrames: session.lastMicFrameCount,
+                                              legsChanged: liveSourcesBeforeStop.legsChanged,
+                                              micIncluded: liveSourcesBeforeStop.micIncluded,
+                                              systemIncluded: liveSourcesBeforeStop.systemIncluded,
+                                              systemBuffers: systemBuffersBeforeStop,
+                                              captured: capturedDuration) {
             transcription.lastError = "Microphone captured no audio. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
             quickActionsLog.error("mic-only recording captured 0 frames — surfaced audio-input guidance to the user")
         }
@@ -1512,9 +1623,15 @@ final class QuickActionsController: ObservableObject {
         // loud instead. `transcription.lastError` is only set when nothing more
         // specific claimed it (the 0-frame case above is strictly better
         // guidance for its own situation).
-        if Self.capturedAudioFellShort(source: source,
-                                       wallClock: durationBeforeStop,
-                                       captured: capturedDuration) {
+        // A live source change intentionally narrows the captured audio (for
+        // example app-only after muting the mic), so elapsed time is no longer
+        // a truthful expected length. Suppress the mid-session failure warning
+        // for changed-leg recordings; genuine capture death on an unchanged
+        // recording still surfaces.
+        if Self.shouldSurfaceShortCaptureWarning(source: source,
+                                                 wallClock: durationBeforeStop,
+                                                 captured: capturedDuration,
+                                                 legsChanged: liveSourcesBeforeStop.legsChanged) {
             quickActionsLog.error("captured only \(capturedDuration, privacy: .public)s of audio for a \(durationBeforeStop, privacy: .public)s recording (source=\(source.rawValue, privacy: .public), micRebuilds=\(self.session.mic.restartCount, privacy: .public)) — capture died mid-session")
             if transcription.lastError == nil {
                 transcription.lastError = "Only \(formatDuration(capturedDuration)) of audio was captured for a \(formatDuration(durationBeforeStop)) recording — capture stopped early. This usually means the input device changed or went away mid-recording (headphones unplugged, a USB mic removed, or another app taking over the device). Pinning a specific input in Settings ▸ Audio Input makes it less likely."
@@ -2546,6 +2663,37 @@ final class QuickActionsController: ObservableObject {
         return captured < wallClock * shortCaptureRatio
     }
 
+    /// Whether a finished recording should raise the short-capture warning,
+    /// given that the user may have deliberately changed which legs are
+    /// included while it ran. Pure for unit testing; the policy above is
+    /// unchanged for recordings whose sources stayed put.
+    nonisolated static func shouldSurfaceShortCaptureWarning(source: RecordingSource,
+                                                             wallClock: TimeInterval,
+                                                             captured: TimeInterval,
+                                                             legsChanged: Bool) -> Bool {
+        guard !legsChanged else { return false }
+        return capturedAudioFellShort(source: source, wallClock: wallClock, captured: captured)
+    }
+
+    /// Whether the post-stop "Microphone captured no audio" guidance is
+    /// truthful. It is not when the recording started mic-only but the user
+    /// deliberately muted the microphone and the app-audio leg was included
+    /// and actually delivered buffers. Any other zero-frame mic recording
+    /// (including a changed recording whose mic stayed included) keeps the
+    /// historical guidance.
+    nonisolated static func shouldSurfaceEmptyMicGuidance(source: RecordingSource,
+                                                          micFrames: Int,
+                                                          legsChanged: Bool,
+                                                          micIncluded: Bool,
+                                                          systemIncluded: Bool,
+                                                          systemBuffers: Int,
+                                                          captured: TimeInterval) -> Bool {
+        guard source == .microphone, micFrames == 0 else { return false }
+        let intentionallyMutedMicWithAppAudio =
+            legsChanged && !micIncluded && systemIncluded && systemBuffers > 0 && captured > 0
+        return !intentionallyMutedMicWithAppAudio
+    }
+
     // MARK: - Helpers
 
     var isRecording: Bool {
@@ -2640,7 +2788,14 @@ final class QuickActionsController: ObservableObject {
     /// elapsed clock. No-op if not currently paused.
     func resumeRecording() {
         guard isPaused else { return }
-        session.resume()
+        if session.resume() {
+            liveSourceError = nil
+        } else if let refusal = session.lastResumeRefusal {
+            // Never a silent no-op: every Resume caller (Live AI header, Home,
+            // floating chip) reaches the same session state, and the readable
+            // cause is published for the inline leaf and VoiceOver.
+            presentLiveSourceError(refusal.message)
+        }
     }
 
     /// Toggle between paused and recording. Bound to the Pause/Resume UI

@@ -44,12 +44,20 @@ struct HomeView: View {
             VStack(spacing: 24) {
                 header
                 heroAction
-                sourceToggles
                 if actions.isRecording {
+                    // While recording, the next-recording preference pair is
+                    // replaced by the shared live controls + meters. This is
+                    // the same leaf the Live AI header mounts, so both
+                    // surfaces show one accepted source state. The idle pair
+                    // is hidden here, which also keeps its accessibility IDs
+                    // unique.
+                    RecordingInputIndicators()
                     // Pause/Resume sits under the hero Record/Stop button so
                     // it's reachable even in Live AI background mode, where
                     // the app stays on Home instead of the split-pane view.
                     RecordingPauseButton(prominent: true)
+                } else {
+                    sourceToggles
                 }
                 recordingDestination
                 dictationHint
@@ -132,16 +140,25 @@ struct HomeView: View {
         // controller's "click accepted, capture not up yet" — the button
         // shows a spinner + "Starting…" and refuses the second click that
         // used to run a second bring-up (#293).
-        .disabled(actions.isStoppingRecording || actions.isStartingRecording
-                  || transcription.isPreparingModel || !canRecord)
+        // The idle-only gates (`canRecord`, model preparation, start-in-flight)
+        // must never disable the active Stop. Both sources can be excluded
+        // (auto-paused) while the recording still has to be stoppable, so
+        // they apply only when this button is the idle Record affordance.
+        .disabled(actions.isStoppingRecording
+                  || (!actions.isRecording
+                      && (actions.isStartingRecording
+                          || transcription.isPreparingModel
+                          || !canRecord)))
     }
 
-    /// The two independent source toggles below the Record button:
-    /// Microphone and App audio. Both default-on (= meeting capture).
-    /// Turn the mic off to record app audio only; turn app audio off for
-    /// a plain voice memo. Disabled while a recording is in flight so the
-    /// user can't change the source mid-capture. When both are off, a
-    /// hint replaces the (disabled) Record affordance's silence.
+    /// The two independent next-recording source toggles below the Record
+    /// button: Microphone and App audio. Both default-on (= meeting capture).
+    /// Turn the mic off to record app audio only; turn app audio off for a
+    /// plain voice memo. Shown only while idle — during a recording the same
+    /// position holds `RecordingInputIndicators`, whose switches bind to the
+    /// session's accepted live inclusion instead of these preferences. When
+    /// both are off, a hint replaces the (disabled) Record affordance's
+    /// silence.
     private var sourceToggles: some View {
         VStack(spacing: 10) {
             Toggle(isOn: $recordMicrophone) {
