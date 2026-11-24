@@ -44,12 +44,15 @@ struct HomeView: View {
             VStack(spacing: 24) {
                 header
                 heroAction
-                sourceToggles
                 if actions.isRecording {
+                    RecordingInputActivityView()
+                        .frame(maxWidth: 460)
                     // Pause/Resume sits under the hero Record/Stop button so
                     // it's reachable even in Live AI background mode, where
                     // the app stays on Home instead of the split-pane view.
                     RecordingPauseButton(prominent: true)
+                } else {
+                    sourceToggles
                 }
                 recordingDestination
                 dictationHint

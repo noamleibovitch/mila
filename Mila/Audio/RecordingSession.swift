@@ -163,6 +163,7 @@ final class RecordingSession: ObservableObject {
         defer { startInFlight = false }
         let fileAlreadyExisted = FileManager.default.fileExists(atPath: outputURL.path)
         self.source = source
+        meters.clearInputLevels()
         self.fileURL = outputURL
         self.writesSinceStart = 0
         self.systemBuffersSinceStart = 0
@@ -353,8 +354,7 @@ final class RecordingSession: ObservableObject {
         // The meters are driven from `consumeMic` / `consumeSystem`, which
         // stop running now — without this they'd sit frozen at their last
         // pre-pause reading and read as "still listening".
-        meters.micLevel = 0
-        meters.systemLevel = 0
+        meters.clearInputLevels()
         recLog.log("pause: source=\(self.source.rawValue, privacy: .public) elapsed=\(self.elapsed, privacy: .public)")
     }
 
@@ -388,9 +388,10 @@ final class RecordingSession: ObservableObject {
     ///
     /// Stop is the same as the real flow: caller invokes `stop()` and
     /// gets back the (possibly nil) outputURL.
-    func startFakeForTesting(outputURL: URL) async {
+    func startFakeForTesting(outputURL: URL, source: RecordingSource = .microphone) async {
         guard state == .idle else { return }
-        self.source = .microphone
+        self.source = source
+        meters.clearInputLevels()
         self.fileURL = outputURL
         self.writesSinceStart = 0
         self.isFakeForTesting = true
@@ -437,6 +438,7 @@ final class RecordingSession: ObservableObject {
         pausedAt = nil
         totalPaused = 0
         meters.elapsed = 0
+        meters.clearInputLevels()
         isFakeForTesting = false
         state = .idle
         return url
@@ -459,6 +461,7 @@ final class RecordingSession: ObservableObject {
         pausedAt = nil
         totalPaused = 0
         meters.elapsed = 0
+        meters.clearInputLevels()
         isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
         state = .idle
@@ -480,7 +483,7 @@ final class RecordingSession: ObservableObject {
         // cost a suspension point — one a `pause()` could land inside, which
         // would leave the meter lit at a live-looking level for the rest of
         // the pause with nothing still running to clear it.
-        meters.micLevel = AudioMeter.level(from: buffer)
+        meters.updateMicrophone(AudioMeter.level(from: buffer))
         if source == .microphone {
             // Mic-only: the live feed and the saved file are both just the
             // mic, so drive the live transcriber here and write directly.
@@ -501,7 +504,8 @@ final class RecordingSession: ObservableObject {
         await write(mixed)
     }
 
-    private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
+    // Internal for the same real-buffer meter tests as consumeMic.
+    func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
         // Paused: drop system audio too (both the inline `.systemAudio`
         // write and the `.meeting` jitter-buffer append) so the paused span
         // is absent from the recording.
@@ -509,7 +513,7 @@ final class RecordingSession: ObservableObject {
         systemBuffersSinceStart += 1
         let samples = AudioConvert.samples(from: buffer)
         // Direct assignment for the same reason as `consumeMic` — see there.
-        meters.systemLevel = AudioMeter.level(from: buffer)
+        meters.updateAppAudio(AudioMeter.level(from: buffer))
         if source == .systemAudio {
             // No mic to clock against — system audio IS the recording.
             // write() drives the live feed for `.systemAudio`.
@@ -657,4 +661,36 @@ final class RecordingMeters: ObservableObject {
     @Published fileprivate(set) var elapsed: TimeInterval = 0
     @Published fileprivate(set) var micLevel: Float = 0
     @Published fileprivate(set) var systemLevel: Float = 0
+
+    // Display-only freshness. Raw levels above still serve the existing
+    // diagnostics; timestamps never publish or invalidate the app scene.
+    private var microphoneUpdatedAt: ContinuousClock.Instant?
+    private var appAudioUpdatedAt: ContinuousClock.Instant?
+
+    func displayLevels(now: ContinuousClock.Instant = ContinuousClock.now) -> RecordingInputLevels {
+        func fresh(_ level: Float, since updated: ContinuousClock.Instant?) -> Float {
+            guard let updated, now >= updated,
+                  updated.duration(to: now) <= .milliseconds(350) else { return 0 }
+            return level
+        }
+        return RecordingInputLevels(microphone: fresh(micLevel, since: microphoneUpdatedAt),
+                                    appAudio: fresh(systemLevel, since: appAudioUpdatedAt))
+    }
+
+    fileprivate func updateMicrophone(_ level: Float) {
+        microphoneUpdatedAt = ContinuousClock.now
+        micLevel = level
+    }
+
+    fileprivate func updateAppAudio(_ level: Float) {
+        appAudioUpdatedAt = ContinuousClock.now
+        systemLevel = level
+    }
+
+    fileprivate func clearInputLevels() {
+        microphoneUpdatedAt = nil
+        appAudioUpdatedAt = nil
+        micLevel = 0
+        systemLevel = 0
+    }
 }

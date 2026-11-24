@@ -135,6 +135,7 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 10) {
             controlsRow
             metaRow
+            RecordingInputActivityView()
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
