@@ -1180,13 +1180,13 @@ final class RecordingLocationChangeUITests: XCTestCase {
             .matching(identifier: "storage.changeSheet.path.Current folder").firstMatch
         XCTAssertTrue(currentPath.waitForExistence(timeout: 5),
                       "The full current-folder path must be exposed as one label")
-        XCTAssertEqual(currentPath.value as? String, sourceRecordings.path)
+        XCTAssertEqual(currentPath.label, "Current folder: \(sourceRecordings.path)")
         let newPath = app.descendants(matching: .any)
             .matching(identifier: "storage.changeSheet.path.New folder").firstMatch
         XCTAssertTrue(newPath.waitForExistence(timeout: 5),
                       "The full Hebrew/Arabic destination path must be exposed as one label")
-        XCTAssertEqual(newPath.value as? String, bidiDestination.path)
-        XCTAssertTrue((newPath.value as? String ?? "").contains(longName),
+        XCTAssertEqual(newPath.label, "New folder: \(bidiDestination.path)")
+        XCTAssertTrue(newPath.label.contains(longName),
                       "The destination label must retain the complete mixed-direction name")
         XCTAssertTrue(visibleText(fresh).contains("Start fresh"),
                       "The full action label must not be abbreviated")
