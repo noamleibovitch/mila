@@ -781,7 +781,12 @@ final class QuickActionsController: ObservableObject {
     /// Unlike the real starts it does not start the Live AI session — it
     /// never has — so the hand-over it requests carries no session start
     /// either.
-    func startFakeRecordingForTesting(outputURL: URL) async {
+    ///
+    /// `writeFile` forwards to the session's existing test-only seam so a
+    /// native fixture can exercise the REAL WAV writer path with synthetic
+    /// samples on a test-owned URL. The default `false` keeps every existing
+    /// caller and the historical no-file behavior unchanged.
+    func startFakeRecordingForTesting(outputURL: URL, writeFile: Bool = false) async {
         if refuseStartDuringLocationChange() { return }
         if isStoppingRecording {
             quickActionsLog.log("startFakeRecordingForTesting ignored — stop in progress")
@@ -789,7 +794,7 @@ final class QuickActionsController: ObservableObject {
         }
         guard activeJob == .none else { return }
         prepareLivePipeline(startingLiveAISession: false)
-        await session.startFakeForTesting(outputURL: outputURL)
+        await session.startFakeForTesting(outputURL: outputURL, writeFile: writeFile)
         claimLivePipeline(startingLiveAISession: false)
         activeJob = .recording(withSystemAudio: false)
     }

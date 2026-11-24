@@ -444,6 +444,35 @@ struct MilaApp: App {
     }
 
 #if DEBUG
+    /// The one bounded native-fixture scenario for the live recording input
+    /// controls. It requires the normal `--uitests` clean-store isolation, a
+    /// UUID-owned storage suite, the explicit scenario flag and the validated
+    /// `Mila-UITest-<UUID>` 0700 root. Any missing/partial flag returns nil so
+    /// production and unrelated UI tests take the unchanged path.
+    @MainActor
+    static func recordingInputsUITestScenario(arguments: [String] = CommandLine.arguments) -> RecordingInputUITestHarness.Scenario? {
+        guard arguments.contains("--uitests"),
+              arguments.contains("--ui-test-clean-store"),
+              storageUITestDefaults(arguments: arguments) != nil,
+              let arg = arguments.first(where: {
+                  $0.hasPrefix(RecordingInputUITestHarness.launchArgumentPrefix)
+              }),
+              let scenario = RecordingInputUITestHarness.Scenario(
+                  rawValue: String(arg.dropFirst(RecordingInputUITestHarness.launchArgumentPrefix.count))),
+              validatedUITestCleanRoot() != nil else {
+            return nil
+        }
+        return scenario
+    }
+
+    /// The UUID-owned suite this fixture keeps every settings write in. Only
+    /// the complete validated scenario above qualifies.
+    @MainActor
+    static func recordingInputsUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard recordingInputsUITestScenario(arguments: arguments) != nil else { return nil }
+        return storageUITestDefaults(arguments: arguments)
+    }
+
     /// Deterministic, UI-test-only folder scenarios. Each requires the normal
     /// `--uitests` clean-store isolation plus a validated UUID-owned storage
     /// suite; a production launch, or any missing flag, takes the unchanged
@@ -512,6 +541,20 @@ struct MilaApp: App {
         let fixtureDefaults = Self.prepareBatchUITestDefaults()
             ?? Self.storageUITestDefaults()
             ?? Self.autoSaveUITestDefaults()
+#if DEBUG
+        // Live recording-input native fixture: keep every setting it can
+        // influence inside the same UUID-owned suite, and seed live
+        // transcription, diarization, meetings, LLM and remote transcription
+        // off before those objects are constructed.
+        let recordingInputsDefaults = Self.recordingInputsUITestDefaults()
+        if let recordingInputsDefaults,
+           let scenario = Self.recordingInputsUITestScenario() {
+            RecordingInputUITestHarness.prepareIsolatedDefaults(recordingInputsDefaults,
+                                                                scenario: scenario)
+        }
+#else
+        let recordingInputsDefaults: UserDefaults? = nil
+#endif
         let storage = RecordingStorageSettings(defaults: fixtureDefaults ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
@@ -549,22 +592,25 @@ struct MilaApp: App {
         // `.milaconfig` field. Precedence: managed > `.milaconfig` > the
         // user's own choice. See `ManagedSettings` and docs/mdm.md (#360).
         let managedSettings = ManagedSettings.loadFromSystem()
-        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false,
+        let diarSettings = DiarizationSettings(defaults: recordingInputsDefaults ?? .standard,
+                                               defaultEnabledIfUnset: false,
                                                managed: managedSettings)
         // Remote transcription backend (opt-in, off by default). Constructed
         // here so the same instance backs both the Settings UI and the
         // transcription router.
-        let remoteSettings = RemoteTranscriptionSettings(managed: managedSettings)
+        let remoteSettings = RemoteTranscriptionSettings(defaults: recordingInputsDefaults ?? .standard,
+                                                         managed: managedSettings)
         let svc = TranscriptionService(store: store,
                                        modelManager: mgr,
                                        diarizationSettings: diarSettings,
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
-        let langSettings = RecordingLanguageSettings(managed: managedSettings)
+        let langSettings = RecordingLanguageSettings(defaults: recordingInputsDefaults ?? .standard,
+                                                     managed: managedSettings)
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
-        let llm = LLMSettings()
+        let llm = LLMSettings(defaults: recordingInputsDefaults ?? .standard)
         // Calendar match (off by default). Constructing this reads no
         // calendar and raises no prompt: the EventKit store is created on
         // first use, and access is requested only from the Settings toggle.
@@ -575,7 +621,8 @@ struct MilaApp: App {
                                              store: store,
                                              transcription: svc,
                                              languageSettings: langSettings,
-                                             postRecording: coordinator)
+                                             postRecording: coordinator,
+                                             defaults: recordingInputsDefaults ?? .standard)
         let hotkeys = HotkeySettings()
         // UI-test bypass for the hardware gate: hosted macos-26 runners
         // sometimes report as MacBook Air via `hw.model`, which trips
@@ -611,7 +658,7 @@ struct MilaApp: App {
         // The validated fixture suite supplies typed preferences. Launch
         // arguments are strings, so `object(forKey:) as? Bool` would ignore
         // an argument-domain "NO" and silently default live transcription ON.
-        let liveAI = LiveAISettings(defaults: fixtureDefaults ?? .standard,
+        let liveAI = LiveAISettings(defaults: recordingInputsDefaults ?? fixtureDefaults ?? .standard,
                                     capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
@@ -1139,7 +1186,7 @@ struct MilaApp: App {
             }
         }
         #endif
-        let meetingSettings = MeetingDetectionSettings(defaults: meetingDefaults,
+        let meetingSettings = MeetingDetectionSettings(defaults: recordingInputsDefaults ?? meetingDefaults,
                                                         managed: meetingManagedSettings)
         let detector = MeetingDetector()
         var meetingActions: any MeetingRecordingActions = actions
@@ -1219,7 +1266,7 @@ struct MilaApp: App {
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
         // it here is cheap (no DB / filesystem work in init).
-        let vmSettings = VoiceMemosSettings()
+        let vmSettings = VoiceMemosSettings(defaults: recordingInputsDefaults ?? .standard)
         let vmImporter = VoiceMemosImporter(store: store,
                                             transcription: svc,
                                             settings: vmSettings,
@@ -1238,6 +1285,23 @@ struct MilaApp: App {
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
+
+#if DEBUG
+        // Bounded native fixture: start the app's real fake-recording start
+        // path (real controller bookkeeping and the real session buffer/WAV
+        // path) only when the complete isolated scenario is present. The
+        // harness feeds synthetic buffers; no hardware, TCC, ScreenCaptureKit
+        // stream, live model, LLM or remote backend is opened.
+        if let scenario = Self.recordingInputsUITestScenario(),
+           let cleanRoot = Self.validatedUITestCleanRoot() {
+            let harness = RecordingInputUITestHarness(scenario: scenario,
+                                                      root: cleanRoot,
+                                                      actions: actions,
+                                                      session: session,
+                                                      store: store)
+            harness.start()
+        }
+#endif
 
 #if DEBUG
         let readiness: RecordingLibraryReadiness
