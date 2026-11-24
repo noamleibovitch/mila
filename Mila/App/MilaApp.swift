@@ -453,6 +453,7 @@ struct MilaApp: App {
         case busy = "busy"
         case slowCheck = "slow-check"
         case slowCopy = "slow-copy"
+        case slowCopySleep = "slow-copy-sleep"
         case permissionDenied = "permission-denied"
         case largeType = "large-type"
         case mcpPointerFailureEnabled = "mcp-pointer-failure-enabled"
@@ -477,6 +478,7 @@ struct MilaApp: App {
             return nil
         }
         let requiresValidatedRoot: Bool = scenario == .slowCopy
+            || scenario == .slowCopySleep
             || scenario == .permissionDenied
             || scenario == .largeType
             || scenario == .mcpPointerFailureEnabled
@@ -1277,12 +1279,14 @@ struct MilaApp: App {
                                                     storage: storage,
                                                     readiness: readiness,
                                                     beforeInspection: { Thread.sleep(forTimeInterval: 12) })
-        case .some(.slowCopy):
+        case .some(.slowCopy), .some(.slowCopySleep):
             // Debug-only held-worker seam: real bytes plus a file-signalled
             // bounded gate on the detached copy worker so a native test can
             // observe persistent progress and interrupt mid-copy. The gate
             // names its release marker inside the already-validated clean
-            // root. Production passes no chunkWrite.
+            // root. The sleep scenario reuses this exact gate and starts the
+            // bounded synthetic will-sleep trigger below. Production passes
+            // no chunkWrite.
             if let cleanRoot = Self.validatedUITestCleanRoot() {
                 let harness = RecordingLocationUITestHarness(releaseRoot: cleanRoot)
                 location = RecordingLocationCoordinator(store: store,
@@ -1350,6 +1354,10 @@ struct MilaApp: App {
             location.isMCPEnabled = { false }
         default:
             break
+        }
+        if folderScenario == .slowCopySleep,
+           let cleanRoot = Self.validatedUITestCleanRoot() {
+            FolderSleepUITestTrigger.start(root: cleanRoot, location: location)
         }
 #endif
         store.onLibraryActivated = { [weak coordinator, weak postCommand, weak offlineEmbedder,
@@ -2919,6 +2927,70 @@ struct MilaApp: App {
         modelManager.ensureCoreMLInstalled()
     }
 }
+
+#if DEBUG
+/// Deterministic, bounded synthetic sleep trigger for the folder-copy native
+/// proof only.
+///
+/// It is started exclusively by the DEBUG `slow-copy-sleep` scenario, which
+/// requires every UI-test isolation flag plus the validated
+/// `Mila-UITest-<UUID>` 0700 root. It polls ONE request marker the UI test
+/// writes inside that root after it has observed real, nonzero copy progress,
+/// then posts ONE `NSWorkspace.willSleepNotification` through
+/// `NSWorkspace.shared.notificationCenter` — the exact center the app's
+/// already-registered `MilaAppDelegate.handleWillSleep` observer listens on.
+/// It never calls `RecordingLocationCoordinator.cancel()` itself and never
+/// sleeps the OS, runs AppleScript or issues power commands.
+///
+/// After posting it waits, on the main actor, for the production observer's
+/// cancellation to move the coordinator to `.stopping`. Only then does it
+/// write the acknowledgement marker, whose text the UI test reads before it
+/// releases the held copy worker. A missed request or a handler that does not
+/// reach `.stopping` therefore degrades to a visible test failure instead of a
+/// silent hang. Nothing is read from or written to any path outside `root`,
+/// there is no mutable global state, and Release never compiles this type.
+enum FolderSleepUITestTrigger {
+    /// The UI test creates this after real copy progress is visible.
+    static let requestMarkerName = "Mila-UITest-copy-sleep-request"
+    /// The app creates this only after the notification post and the
+    /// production handler's cancellation were both observed.
+    static let acknowledgementMarkerName = "Mila-UITest-copy-sleep-ack"
+
+    static func start(root: URL,
+                      location: RecordingLocationCoordinator,
+                      timeout: TimeInterval = 90) {
+        let request = root.appendingPathComponent(requestMarkerName, isDirectory: false)
+        let acknowledgement = root.appendingPathComponent(acknowledgementMarkerName,
+                                                           isDirectory: false)
+        Task { @MainActor in
+            // Re-validate so this poll can never be pointed at a non-test path.
+            guard RecordingStore.isValidUITestRoot(root) else { return }
+            let deadline = Date().addingTimeInterval(max(0, timeout))
+            while !FileManager.default.fileExists(atPath: request.path) {
+                if Date() >= deadline { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            // The request exists, so a real copy is settling. Post once; the
+            // app's registered observer decides what to cancel.
+            NSWorkspace.shared.notificationCenter.post(
+                name: NSWorkspace.willSleepNotification,
+                object: nil)
+            // The observer enqueues its @MainActor cancellation as soon as the
+            // post returns. Yield to it (bounded) so the acknowledgement proves
+            // the production handler ran, not merely that a notification was
+            // posted.
+            let confirmationDeadline = Date().addingTimeInterval(5)
+            while location.phase != .stopping && Date() < confirmationDeadline {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            let trace = "posted NSWorkspace.willSleepNotification\n"
+                + "coordinator phase: \(location.phase)\n"
+            _ = FileManager.default.createFile(atPath: acknowledgement.path,
+                                               contents: Data(trace.utf8))
+        }
+    }
+}
+#endif
 
 /// Owns the graceful shutdown sequence.
 ///

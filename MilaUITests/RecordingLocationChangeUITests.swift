@@ -273,6 +273,48 @@ final class RecordingLocationChangeUITests: XCTestCase {
         _ = FileManager.default.createFile(atPath: url.path, contents: Data())
     }
 
+    /// Must match `FolderSleepUITestTrigger` markers in the app target
+    /// (DEBUG-only and not linked here), mirrored with the same literals.
+    private static let copySleepRequestMarkerName = "Mila-UITest-copy-sleep-request"
+    private static let copySleepAcknowledgementMarkerName = "Mila-UITest-copy-sleep-ack"
+
+    /// The test-owned request marker. The DEBUG app trigger polls this inside
+    /// the validated UUID clean root and posts the real workspace sleep
+    /// notification only after it appears.
+    private var copySleepRequestURL: URL {
+        root.appendingPathComponent(Self.copySleepRequestMarkerName, isDirectory: false)
+    }
+
+    /// The app-owned acknowledgement, written only after the notification post
+    /// and the production handler's transition to `.stopping`.
+    private var copySleepAcknowledgementURL: URL {
+        root.appendingPathComponent(Self.copySleepAcknowledgementMarkerName, isDirectory: false)
+    }
+
+    /// Created only after real nonzero copy progress is visible, so the
+    /// synthetic notification never races ahead of the held copy.
+    private func requestSyntheticCopySleep() {
+        let url = copySleepRequestURL
+        if FileManager.default.fileExists(atPath: url.path) { return }
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: Data()),
+                      "The test-owned sleep request marker must be creatable inside the validated root")
+    }
+
+    /// Bounded wait for the app-owned acknowledgement. Returns its trace text,
+    /// so the caller can assert the notification was posted AND the production
+    /// handler cancelled the settling copy before releasing the worker.
+    private func waitForCopySleepAcknowledgement(timeout: TimeInterval = 30) -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let data = try? Data(contentsOf: copySleepAcknowledgementURL),
+               let text = String(data: data, encoding: .utf8) {
+                return text
+            }
+            _ = RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        return nil
+    }
+
     /// Must match `RecordingLocationInspectionUITestGate` markers (DEBUG-only
     /// app target, not linked here), mirrored with the same literals.
     private static let inspectionGateEnteredMarkerName = "Mila-UITest-inspection-gate-entered"
@@ -1293,6 +1335,97 @@ final class RecordingLocationChangeUITests: XCTestCase {
         let retainedStages = incompleteStageDirectories(in: destination)
         guard retainedStages.count == 1, let retainedStage = retainedStages.first else {
             return XCTFail("A canceled copy whose ownership is unproven must stay on disk as exactly one stage; found \(retainedStages.count)")
+        }
+        XCTAssertGreaterThan(stagedFileSize(retainedStage, named: "seed.wav"), 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: retainedStage.appendingPathComponent(".mila-receipt.json").path),
+                      "The retained stage must keep its real receipt")
+    }
+
+    /// The accepted sleep-cancellation approximation: a DEBUG-only synthetic
+    /// `willSleepNotification`, posted by the app's own bounded trigger through
+    /// the LOCAL workspace notification center while the REAL copy worker is
+    /// held. This is not a real system-sleep claim. The test never calls the
+    /// coordinator: the production `handleWillSleep` observer must perform the
+    /// cancellation, and the app acknowledges only after it does.
+    func test_synthetic_sleep_during_copy_cancels_retains_incomplete_copy_and_keeps_originals() throws {
+        let sourceRecordings = root.appendingPathComponent("Recordings")
+        let sourceAudio = sourceRecordings.appendingPathComponent("seed.wav")
+        let sourceIndex = root.appendingPathComponent("recordings.json")
+        try growSeedWAV(frames: 1_500_000)
+        let originalAudio = try Data(contentsOf: sourceAudio)
+
+        let app = launch(extraArguments: ["--ui-test-folder-scenario=slow-copy-sleep"])
+        defer { app.terminate() }
+        // Fail-safe: release the held worker even if the acknowledgement or a
+        // later assertion fails, so teardown never waits on the gate.
+        defer { releaseCopyGate() }
+        _ = openStorage(app)
+        waitUntilEnabled(app.buttons["storage.chooseFolder.button"], timeout: 10,
+                         "The chooser must become available after launch work settles")
+        let originalIndex = try Data(contentsOf: sourceIndex)
+        chooseDestination(app)
+        let copy = app.radioButtons["Copy recordings and switch"]
+        XCTAssertTrue(copy.waitForExistence(timeout: 5))
+        copy.click()
+        app.buttons["storage.changeSheet.continue"].click()
+
+        try waitForRealCopyProgress(app)
+        settingsWindowScreenshot(app, named: "Copying with real byte progress before synthetic sleep")
+        let midStages = incompleteStageDirectories(in: destination)
+        guard midStages.count == 1, let midStage = midStages.first else {
+            return XCTFail("The held copy must own exactly one hidden stage; found \(midStages.count)")
+        }
+        XCTAssertGreaterThan(stagedFileSize(midStage, named: "seed.wav"), 0,
+                             "The stage must contain real copied bytes before the synthetic sleep")
+
+        // Ready: create the request only now. The app trigger posts the real
+        // NSWorkspace.willSleepNotification to its own notification center.
+        requestSyntheticCopySleep()
+        guard let sleepTrace = waitForCopySleepAcknowledgement() else {
+            return XCTFail("The app never acknowledged the synthetic will-sleep notification")
+        }
+        let traceAttachment = XCTAttachment(string: sleepTrace)
+        traceAttachment.name = "Synthetic sleep notification trace acknowledgement"
+        traceAttachment.lifetime = .keepAlways
+        add(traceAttachment)
+        XCTAssertTrue(sleepTrace.contains("posted NSWorkspace.willSleepNotification"),
+                      "The app must post the actual workspace sleep notification; trace was: \(sleepTrace)")
+        XCTAssertTrue(sleepTrace.contains("coordinator phase: stopping"),
+                      "The production sleep handler must cancel the settling copy; trace was: \(sleepTrace)")
+        // The handler has registered cancellation; only now let the held
+        // worker settle. This ordering is what keeps the worker from hanging.
+        releaseCopyGate()
+
+        let outcome = app.staticTexts["storage.changeSheet.outcome"]
+        XCTAssertTrue(outcome.waitForExistence(timeout: 30), "Sleep cancellation must settle")
+        let text = visibleText(outcome)
+        XCTAssertTrue(text.contains("Copy canceled"), "Sleep cancellation must not claim success")
+        XCTAssertTrue(text.contains("original recordings are unchanged"))
+        XCTAssertTrue(text.contains("retained the incomplete copy"),
+                      "Unproven staged bytes must be retained, not claimed cleaned up")
+        XCTAssertTrue(text.contains("verify safe removal"))
+        appWindowScreenshot(app, named: "Sleep during copy retained the incomplete copy")
+        app.buttons["Close"].click()
+
+        let currentPath = app.descendants(matching: .any)
+            .matching(identifier: "storage.currentFolder.path").firstMatch
+        XCTAssertTrue(currentPath.waitForExistence(timeout: 5))
+        XCTAssertEqual(currentPath.value as? String, sourceRecordings.path,
+                       "Sleep cancellation must keep the original folder selected")
+        XCTAssertEqual(try Data(contentsOf: sourceAudio), originalAudio,
+                       "Sleep cancellation must not touch the original audio")
+        XCTAssertEqual(try Data(contentsOf: sourceIndex), originalIndex,
+                       "Sleep cancellation must not touch the original index")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("recordings.json").path),
+                       "Sleep cancellation must not publish a destination library")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("seed.wav").path),
+                       "Sleep cancellation must not publish destination audio")
+        let retainedStages = incompleteStageDirectories(in: destination)
+        guard retainedStages.count == 1, let retainedStage = retainedStages.first else {
+            return XCTFail("A sleep-canceled copy whose ownership is unproven must stay on disk as exactly one stage; found \(retainedStages.count)")
         }
         XCTAssertGreaterThan(stagedFileSize(retainedStage, named: "seed.wav"), 0)
         XCTAssertTrue(FileManager.default.fileExists(
