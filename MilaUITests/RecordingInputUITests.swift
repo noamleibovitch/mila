@@ -390,7 +390,7 @@ final class RecordingInputUITests: XCTestCase {
         waitForMeter(micMeter, nonzero: true)
         appWindowScreenshot(app, named: "App audio permission failure rolled back")
 
-        let dismiss = app.buttons["Dismiss input message"]
+        let dismiss = app.links["Dismiss input message"]
         XCTAssertTrue(dismiss.waitForExistence(timeout: 5))
         dismiss.click()
         waitForNonExistence(error)
