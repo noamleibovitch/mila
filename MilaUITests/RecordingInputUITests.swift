@@ -206,10 +206,13 @@ final class RecordingInputUITests: XCTestCase {
     /// that alert and cancel it so the inline, persistent Unavailable state
     /// can be inspected; never open System Settings.
     private func dismissPermissionAlertIfPresent(_ app: XCUIApplication) {
-        let alert = app.dialogs.firstMatch
-        guard alert.waitForExistence(timeout: 8) else { return }
+        // SwiftUI presents this permission alert as a sheet on macOS.
+        // Cancel the actual modal before interacting with its parent window.
+        let sheet = app.sheets.firstMatch
+        let alert = sheet.waitForExistence(timeout: 5) ? sheet : app.dialogs.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 3), "Permission alert must be located before testing its parent")
         let cancel = alert.buttons["Cancel"]
-        guard cancel.waitForExistence(timeout: 5) else { return }
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5), "Permission alert must offer Cancel")
         cancel.click()
         waitForNonExistence(alert)
     }
