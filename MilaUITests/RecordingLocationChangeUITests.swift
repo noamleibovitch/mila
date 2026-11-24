@@ -327,7 +327,8 @@ final class RecordingLocationChangeUITests: XCTestCase {
                       "The native \(menuTitle) menu must exist")
         barItem.click()
         let item = barItem.menuItems
-            .matching(NSPredicate(format: "label BEGINSWITH %@", itemLabelPrefix))
+            .matching(NSPredicate(format: "label BEGINSWITH %@ OR title BEGINSWITH %@",
+                                  itemLabelPrefix, itemLabelPrefix))
             .firstMatch
         XCTAssertTrue(item.waitForExistence(timeout: 5),
                       "The native \(itemLabelPrefix) command must be present")
@@ -1175,17 +1176,17 @@ final class RecordingLocationChangeUITests: XCTestCase {
         XCTAssertTrue(fresh.waitForExistence(timeout: 10),
                       "The BiDi destination must be inspected and present its choices")
 
-        let expectedCurrent = "Current folder: \(sourceRecordings.path)"
         let currentPath = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", expectedCurrent)).firstMatch
+            .matching(identifier: "storage.changeSheet.path.Current folder").firstMatch
         XCTAssertTrue(currentPath.waitForExistence(timeout: 5),
                       "The full current-folder path must be exposed as one label")
-        let expectedNew = "New folder: \(bidiDestination.path)"
+        XCTAssertEqual(currentPath.value as? String, sourceRecordings.path)
         let newPath = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", expectedNew)).firstMatch
+            .matching(identifier: "storage.changeSheet.path.New folder").firstMatch
         XCTAssertTrue(newPath.waitForExistence(timeout: 5),
                       "The full Hebrew/Arabic destination path must be exposed as one label")
-        XCTAssertTrue(newPath.label.contains(longName),
+        XCTAssertEqual(newPath.value as? String, bidiDestination.path)
+        XCTAssertTrue((newPath.value as? String ?? "").contains(longName),
                       "The destination label must retain the complete mixed-direction name")
         XCTAssertTrue(visibleText(fresh).contains("Start fresh"),
                       "The full action label must not be abbreviated")

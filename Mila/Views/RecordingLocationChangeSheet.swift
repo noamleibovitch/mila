@@ -205,6 +205,10 @@ struct RecordingLocationChangeSheet: View {
                 .environment(\.layoutDirection, .leftToRight)
                 .accessibilityLabel("\(label): \(path)")
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("storage.changeSheet.path.\(label)")
+        .accessibilityLabel("\(label): \(path)")
+        .accessibilityValue(path)
     }
 
     @ViewBuilder
