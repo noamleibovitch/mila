@@ -1185,7 +1185,9 @@ final class RecordingLocationChangeUITests: XCTestCase {
             .matching(identifier: "storage.changeSheet.path.New folder").firstMatch
         XCTAssertTrue(newPath.waitForExistence(timeout: 5),
                       "The full Hebrew/Arabic destination path must be exposed as one label")
-        XCTAssertEqual(newPath.label, "New folder: \(bidiDestination.path)")
+        // SwiftUI isolates the interpolated mixed-direction path for AX.
+        // Require the exact complete path and the exact FSI/PDI envelope.
+        XCTAssertEqual(newPath.label, "New folder: \u{2068}\(bidiDestination.path)\u{2069}")
         XCTAssertTrue(newPath.label.contains(longName),
                       "The destination label must retain the complete mixed-direction name")
         XCTAssertTrue(visibleText(fresh).contains("Start fresh"),
