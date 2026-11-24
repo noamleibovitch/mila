@@ -1,12 +1,11 @@
 import XCTest
 import AVFoundation
-import Carbon
 
 /// Native copy/start-fresh/adopt flow. Every test launches with a clean
 /// UUID-owned store root and UUID-owned preferences suite, seeds a synthetic
 /// recording, and never asks for microphone or screen-recording permission.
 @MainActor
-final class RecordingLocationChangeUITests: XCTestCase {
+final class RecordingLocationChangeUITests: XCTestCase, RecordingUITestSupport {
     private var root: URL!
     private var destination: URL!
     private var suiteID: UUID!
@@ -14,12 +13,10 @@ final class RecordingLocationChangeUITests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         try selectLiteralKeyboardLayout()
-        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
-        root = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
-        destination = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         suiteID = UUID()
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
-                                                attributes: [.posixPermissions: 0o700])
+        root = try makeRecordingUITestRoot()
+        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        destination = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("Recordings"),
                                                 withIntermediateDirectories: false)
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
@@ -34,29 +31,6 @@ final class RecordingLocationChangeUITests: XCTestCase {
             buffer.floatChannelData![0][frame] = Float(sin(Double(frame) * 2 * .pi * 440 / 16_000)) * 0.05
         }
         try file.write(from: buffer)
-    }
-
-    private func selectLiteralKeyboardLayout() throws {
-        func inputID(_ source: TISInputSource) -> String {
-            guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "unknown" }
-            return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
-        }
-        let original = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-        let originalID = inputID(original)
-        let enabled = TISCreateInputSourceList(nil, false).takeRetainedValue() as! [TISInputSource]
-        let literal = try XCTUnwrap(enabled.first {
-            ["com.apple.keylayout.ABC", "com.apple.keylayout.US"].contains(inputID($0))
-        }, "Native literal shortcuts require an already-enabled ABC or US layout")
-        // Register restoration before selection, including assertion failures.
-        // Never enable a layout or write persistent input-source preferences.
-        addTeardownBlock {
-            XCTAssertEqual(TISSelectInputSource(original), noErr, "Restore original input source")
-            XCTAssertEqual(inputID(TISCopyCurrentKeyboardInputSource().takeRetainedValue()), originalID)
-            print("Picker keyboard restoration verified")
-        }
-        XCTAssertEqual(TISSelectInputSource(literal), noErr)
-        XCTAssertEqual(inputID(TISCopyCurrentKeyboardInputSource().takeRetainedValue()), inputID(literal))
-        print("Picker literal input verified:", inputID(literal))
     }
 
     override func tearDown() async throws {
@@ -77,10 +51,6 @@ final class RecordingLocationChangeUITests: XCTestCase {
         ] + extraArguments
         app.launch()
         return app
-    }
-
-    private func visibleText(_ element: XCUIElement) -> String {
-        [element.label, element.value as? String ?? ""].joined(separator: "\n")
     }
 
     private func openStorage(_ app: XCUIApplication, expectedDirectory: URL? = nil) -> XCUIElement {

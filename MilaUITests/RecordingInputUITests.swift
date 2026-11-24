@@ -9,7 +9,7 @@ import XCTest
 /// routing. No microphone, ScreenCaptureKit stream, TCC prompt, live model,
 /// LLM or remote backend is opened; every screenshot is of the app window.
 @MainActor
-final class RecordingInputUITests: XCTestCase {
+final class RecordingInputUITests: XCTestCase, RecordingUITestSupport {
     private var root: URL!
     private var suiteID: UUID!
 
@@ -21,11 +21,8 @@ final class RecordingInputUITests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         continueAfterFailure = false
-        let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
-        root = base.appendingPathComponent("Mila-UITest-\(UUID().uuidString)", isDirectory: true)
         suiteID = UUID()
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
-                                                attributes: [.posixPermissions: 0o700])
+        root = try makeRecordingUITestRoot()
     }
 
     override func tearDown() async throws {
@@ -51,22 +48,12 @@ final class RecordingInputUITests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
     }
 
-    private func meter(_ app: XCUIApplication, labeled label: String) -> XCUIElement {
-        app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", label, label + ", "))
-            .firstMatch
-    }
-
     private func toggle(_ app: XCUIApplication, _ leg: String) -> XCUIElement {
         element(app, "recording.inputs.\(leg).toggle")
     }
 
     private func state(_ app: XCUIApplication, _ leg: String) -> XCUIElement {
         element(app, "recording.inputs.\(leg).state")
-    }
-
-    private func visibleText(_ element: XCUIElement) -> String {
-        [element.label, element.value as? String ?? ""].joined(separator: "\n")
     }
 
     private func waitForInputs(_ app: XCUIApplication) {
@@ -119,16 +106,6 @@ final class RecordingInputUITests: XCTestCase {
                       file: file, line: line)
     }
 
-    private func waitForNonExistence(_ element: XCUIElement,
-                                     timeout: TimeInterval = 10,
-                                     file: StaticString = #filePath,
-                                     line: UInt = #line) {
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == false"), object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
-                       "Element must disappear", file: file, line: line)
-    }
-
     private func assertToggle(_ element: XCUIElement,
                               on expected: Bool,
                               _ message: String,
@@ -147,42 +124,6 @@ final class RecordingInputUITests: XCTestCase {
                        message, file: file, line: line)
     }
 
-    private func meterPercent(_ element: XCUIElement) -> Int? {
-        Self.meterPercent(value: element.value as? String, label: element.label)
-    }
-
-    private static func meterPercent(value: String?, label: String) -> Int? {
-        // The real meter publishes the same reading as both AXValue and
-        // part of AXLabel because macOS omits AXValue on some Other nodes.
-        for text in [value ?? "", label.components(separatedBy: ", ").last ?? ""] {
-            if text == "off" { return 0 }
-            guard text.hasSuffix(" percent"),
-                  let percent = Int(text.dropLast(" percent".count)) else { continue }
-            return percent
-        }
-        return nil
-    }
-
-    private func waitForMeter(_ element: XCUIElement,
-                              nonzero: Bool,
-                              file: StaticString = #filePath,
-                              line: UInt = #line) {
-        XCTAssertTrue(element.waitForExistence(timeout: 10),
-                      "Meter element missing", file: file, line: line)
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate { object, _ in
-                guard let element = object as? XCUIElement else { return false }
-                guard let percent = Self.meterPercent(value: element.value as? String,
-                                                     label: element.label) else { return false }
-                return nonzero ? percent > 0 : percent == 0
-            },
-            object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 15), .completed,
-                       nonzero ? "Meter must show a live nonzero level"
-                               : "Meter must show no stale live level",
-                       file: file, line: line)
-    }
-
     private func waitForWAVFile(timeout: TimeInterval = 15) -> Bool {
         let directory = root.appendingPathComponent("Recordings", isDirectory: true)
         let deadline = Date().addingTimeInterval(timeout)
@@ -199,22 +140,6 @@ final class RecordingInputUITests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         } while Date() < deadline
         return false
-    }
-
-    /// The controller maps a live app-audio permission failure onto the
-    /// existing system permission alert as well as the inline message. Read
-    /// that alert and cancel it so the inline, persistent Unavailable state
-    /// can be inspected; never open System Settings.
-    private func dismissPermissionAlertIfPresent(_ app: XCUIApplication) {
-        // SwiftUI presents this permission alert as a sheet on macOS.
-        // Cancel the actual modal before interacting with its parent window.
-        let sheet = app.sheets.firstMatch
-        let alert = sheet.waitForExistence(timeout: 5) ? sheet : app.dialogs.firstMatch
-        XCTAssertTrue(alert.waitForExistence(timeout: 3), "Permission alert must be located before testing its parent")
-        let cancel = alert.buttons["Cancel"]
-        XCTAssertTrue(cancel.waitForExistence(timeout: 5), "Permission alert must offer Cancel")
-        cancel.click()
-        waitForNonExistence(alert)
     }
 
     private func markerURL(_ name: String) -> URL {
