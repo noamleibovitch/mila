@@ -33,13 +33,20 @@ struct LevelMeterView: View {
                 }
             }
             .frame(height: geo.size.height)
-            .accessibilityElement()
-            .accessibilityLabel(label)
-            .accessibilityValue(isLive ? "\(Int(level * 100)) percent" : "off")
         }
         .frame(height: 14)
+        // Expose the complete meter, rather than GeometryReader's child.
+        // macOS can omit AXValue on an Other element, so the same reading
+        // also belongs in its spoken label.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label), \(reading)")
+        .accessibilityValue(reading)
         .opacity(isLive ? 1.0 : 0.45)
         .animation(.linear(duration: 0.08), value: level)
+    }
+
+    private var reading: String {
+        isLive ? "\(Int(level * 100)) percent" : "off"
     }
 
     private func color(for index: Int) -> Color {

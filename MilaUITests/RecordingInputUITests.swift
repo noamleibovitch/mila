@@ -53,7 +53,7 @@ final class RecordingInputUITests: XCTestCase {
 
     private func meter(_ app: XCUIApplication, labeled label: String) -> XCUIElement {
         app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label == %@", label))
+            .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", label, label + ", "))
             .firstMatch
     }
 
@@ -148,10 +148,19 @@ final class RecordingInputUITests: XCTestCase {
     }
 
     private func meterPercent(_ element: XCUIElement) -> Int? {
-        let value = (element.value as? String) ?? ""
-        if value == "off" { return 0 }
-        guard let suffix = value.range(of: " percent") else { return nil }
-        return Int(value[..<suffix.lowerBound])
+        Self.meterPercent(value: element.value as? String, label: element.label)
+    }
+
+    private static func meterPercent(value: String?, label: String) -> Int? {
+        // The real meter publishes the same reading as both AXValue and
+        // part of AXLabel because macOS omits AXValue on some Other nodes.
+        for text in [value ?? "", label.components(separatedBy: ", ").last ?? ""] {
+            if text == "off" { return 0 }
+            guard text.hasSuffix(" percent"),
+                  let percent = Int(text.dropLast(" percent".count)) else { continue }
+            return percent
+        }
+        return nil
     }
 
     private func waitForMeter(_ element: XCUIElement,
@@ -163,12 +172,9 @@ final class RecordingInputUITests: XCTestCase {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate { object, _ in
                 guard let element = object as? XCUIElement else { return false }
-                let value = (element.value as? String) ?? ""
-                if nonzero {
-                    guard let suffix = value.range(of: " percent") else { return false }
-                    return (Int(value[..<suffix.lowerBound]) ?? 0) > 0
-                }
-                return value == "off" || value == "0 percent"
+                guard let percent = Self.meterPercent(value: element.value as? String,
+                                                     label: element.label) else { return false }
+                return nonzero ? percent > 0 : percent == 0
             },
             object: element)
         XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 15), .completed,
