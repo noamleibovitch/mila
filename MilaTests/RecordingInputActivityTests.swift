@@ -116,9 +116,8 @@ final class RecordingInputActivityTests: XCTestCase {
                 history.append(session.meters.displayLevels())
             }
             if paused { await session.pause() }
-            let content = RecordingInputActivityView(seededHistory: history)
+            let content = RecordingInputActivityView(seededHistory: history, reduceMotion: reduced)
                 .environmentObject(session)
-                .environment(\.accessibilityReduceMotion, reduced)
                 .padding(12)
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 190),
                                   styleMask: [.titled], backing: .buffered, defer: false)

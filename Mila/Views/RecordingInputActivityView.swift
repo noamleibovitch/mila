@@ -8,14 +8,20 @@ struct RecordingInputActivityView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var history = RecordingInputHistory()
     private var usesSeededHistory = false
+    private var seededReduceMotion = false
+
+    private var effectiveReduceMotion: Bool {
+        usesSeededHistory ? seededReduceMotion : reduceMotion
+    }
 
     init() {}
 
     #if DEBUG
     /// Deterministic component renders without depending on view/task timing.
-    init(seededHistory: RecordingInputHistory) {
+    init(seededHistory: RecordingInputHistory, reduceMotion: Bool = false) {
         _history = State(initialValue: seededHistory)
         usesSeededHistory = true
+        seededReduceMotion = reduceMotion
     }
     #endif
 
@@ -42,7 +48,7 @@ struct RecordingInputActivityView: View {
         // it catches a quick stop/start even if SwiftUI coalesces away .idle.
         .task(id: SamplingID(epoch: session.captureEpoch,
                              recording: session.state == .recording,
-                             reduceMotion: reduceMotion)) {
+                             reduceMotion: effectiveReduceMotion)) {
             guard !usesSeededHistory else { return }
             history = RecordingInputHistory()
             guard session.state == .recording else { return }
@@ -76,7 +82,7 @@ struct RecordingInputActivityView: View {
             .lineLimit(1)
             InputAmplitudeTrace(values: history.values(for: channel),
                                 currentLevel: channel.level(in: levels),
-                                isCapturing: capturing, reduceMotion: reduceMotion, tint: tint)
+                                isCapturing: capturing, reduceMotion: effectiveReduceMotion, tint: tint)
                 .frame(height: 28)
                 .accessibilityHidden(true)
         }
